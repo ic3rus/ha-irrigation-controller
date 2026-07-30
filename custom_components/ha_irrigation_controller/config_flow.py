@@ -25,6 +25,7 @@ from homeassistant.const import (
     __version__ as HA_VERSION,  # noqa: N812
 )
 from homeassistant.core import callback
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.selector import (
     BooleanSelector,
     EntitySelector,
@@ -114,14 +115,34 @@ def build_controller_schema() -> vol.Schema:
     )
 
 
+def _normalize_start_times(user_input: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy with both start times as canonical `HH:MM:SS` strings.
+
+    `cv.time` (the validator behind `TimeSelector`) accepts `"20:00"` and
+    `"20:0:0"` as well as `"20:00:00"`, so a non-frontend submission could
+    otherwise store a string violating the documented options contract — or
+    sneak two representations of the same instant past the equality check.
+    """
+    return {
+        **user_input,
+        CONF_MORNING_START: cv.time(user_input[CONF_MORNING_START]).isoformat(),
+        CONF_EVENING_START: cv.time(user_input[CONF_EVENING_START]).isoformat(),
+    }
+
+
 def validate_controller_input(user_input: Mapping[str, Any]) -> dict[str, str]:
-    """Return form errors for a submitted controller form, empty when valid."""
+    """Return form errors for a submitted controller form, empty when valid.
+
+    Expects start times already canonicalized by `_normalize_start_times`, which
+    is what makes the string equality below a comparison of instants.
+    """
     if not user_input.get(CONF_MORNING_ENABLED):
         # A disabled morning cycle cannot collide with anything.
         return {}
     if user_input.get(CONF_MORNING_START) == user_input.get(CONF_EVENING_START):
         # Two enabled cycles at the same instant would double-fire the pump.
-        return {"base": ERROR_START_TIMES_CONFLICT}
+        # Attached to the morning field so the form highlights what to change.
+        return {CONF_MORNING_START: ERROR_START_TIMES_CONFLICT}
     return {}
 
 
@@ -158,6 +179,7 @@ class HaIrrigationControllerConfigFlow(ConfigFlow, domain=DOMAIN):
 
         errors: dict[str, str] = {}
         if user_input is not None:
+            user_input = _normalize_start_times(user_input)
             errors = validate_controller_input(user_input)
             if not errors:
                 # data={} on purpose: nothing about this controller is immutable,
@@ -193,6 +215,7 @@ class HaIrrigationControllerOptionsFlow(OptionsFlowWithReload):
         """Show the controller form prefilled and store the edited options."""
         errors: dict[str, str] = {}
         if user_input is not None:
+            user_input = _normalize_start_times(user_input)
             errors = validate_controller_input(user_input)
             if not errors:
                 return self.async_create_entry(title="", data=user_input)

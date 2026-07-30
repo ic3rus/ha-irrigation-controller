@@ -2,51 +2,26 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceEntryType
-from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ha_irrigation_controller import HaIrrigationRuntimeData
 from custom_components.ha_irrigation_controller.const import (
-    CONF_EVENING_START,
-    CONF_MORNING_ENABLED,
-    CONF_MORNING_START,
-    CONF_PUMP_SWITCH,
-    CONF_RAIN_SENSOR,
     DOMAIN,
     MIN_HA_MAJOR,
     MIN_HA_MINOR,
     MIN_HA_VERSION,
 )
+from tests.common import controller_entry
 
 if TYPE_CHECKING:
     import pytest
     from homeassistant.core import HomeAssistant
 
 _MODULE = "custom_components.ha_irrigation_controller"
-
-# Representative controller options — every entry now carries its configuration
-# in options (entry.data is empty by design).
-_OPTIONS: dict[str, Any] = {
-    CONF_PUMP_SWITCH: "switch.pool_pump",
-    CONF_RAIN_SENSOR: "sensor.rain_gauge",
-    CONF_MORNING_ENABLED: False,
-    CONF_MORNING_START: "07:00:00",
-    CONF_EVENING_START: "20:00:00",
-}
-
-
-def _entry() -> MockConfigEntry:
-    """Build a controller entry configured the way the config flow creates it."""
-    return MockConfigEntry(
-        domain=DOMAIN,
-        title="Irrigation Controller",
-        data={},
-        options=dict(_OPTIONS),
-    )
 
 
 def _patch_ha_version(
@@ -63,7 +38,7 @@ def _patch_ha_version(
 
 async def test_setup_and_unload_entry(hass: HomeAssistant) -> None:
     """A config entry sets up, exposes runtime_data, and unloads cleanly."""
-    entry = _entry()
+    entry = controller_entry()
     entry.add_to_hass(hass)
 
     assert await hass.config_entries.async_setup(entry.entry_id)
@@ -80,7 +55,7 @@ async def test_setup_and_unload_entry(hass: HomeAssistant) -> None:
 
 async def test_setup_creates_the_controller_device(hass: HomeAssistant) -> None:
     """Setup registers the controller device zones will hang off later (AC 3)."""
-    entry = _entry()
+    entry = controller_entry()
     entry.add_to_hass(hass)
 
     assert await hass.config_entries.async_setup(entry.entry_id)
@@ -102,7 +77,7 @@ async def test_setup_fails_loudly_below_min_ha_version(
 ) -> None:
     """Below the minimum HA version, setup raises ConfigEntryError (AC 3)."""
     _patch_ha_version(monkeypatch, 2026, 6, "2026.6.4")
-    entry = _entry()
+    entry = controller_entry()
     entry.add_to_hass(hass)
 
     assert not await hass.config_entries.async_setup(entry.entry_id)
@@ -120,7 +95,7 @@ async def test_setup_succeeds_at_exact_min_ha_version(
 ) -> None:
     """At exactly the minimum HA version, setup succeeds (boundary check)."""
     _patch_ha_version(monkeypatch, MIN_HA_MAJOR, MIN_HA_MINOR, MIN_HA_VERSION)
-    entry = _entry()
+    entry = controller_entry()
     entry.add_to_hass(hass)
 
     assert await hass.config_entries.async_setup(entry.entry_id)
@@ -143,7 +118,7 @@ async def test_setup_succeeds_on_prerelease_of_min_ha_version(
         MIN_HA_MINOR,
         f"{MIN_HA_MAJOR}.{MIN_HA_MINOR}.0b5",
     )
-    entry = _entry()
+    entry = controller_entry()
     entry.add_to_hass(hass)
 
     assert await hass.config_entries.async_setup(entry.entry_id)

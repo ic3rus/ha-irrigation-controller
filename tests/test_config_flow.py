@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.data_entry_flow import FlowResultType
-from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ha_irrigation_controller.const import (
     CONF_EVENING_START,
@@ -19,22 +19,13 @@ from custom_components.ha_irrigation_controller.const import (
     CONF_TEMPERATURE_SENSOR,
     DOMAIN,
 )
+from tests.common import CONTROLLER_OPTIONS, controller_entry
 
 if TYPE_CHECKING:
     import pytest
     from homeassistant.core import HomeAssistant
 
 _FLOW_MODULE = "custom_components.ha_irrigation_controller.config_flow"
-
-_FULL_INPUT: dict[str, Any] = {
-    CONF_PUMP_SWITCH: "switch.pool_pump",
-    CONF_RAIN_SENSOR: "sensor.rain_gauge",
-    CONF_TEMPERATURE_SENSOR: "sensor.outdoor_temp",
-    CONF_HUMIDITY_SENSOR: "sensor.outdoor_hum",
-    CONF_MORNING_ENABLED: True,
-    CONF_MORNING_START: "07:00:00",
-    CONF_EVENING_START: "20:00:00",
-}
 
 _MINIMAL_INPUT: dict[str, Any] = {
     CONF_PUMP_SWITCH: "switch.pool_pump",
@@ -43,16 +34,6 @@ _MINIMAL_INPUT: dict[str, Any] = {
     CONF_MORNING_START: "07:00:00",
     CONF_EVENING_START: "20:00:00",
 }
-
-
-def _entry(options: dict[str, Any] | None = None) -> MockConfigEntry:
-    """Build a controller entry whose configuration lives entirely in options."""
-    return MockConfigEntry(
-        domain=DOMAIN,
-        title="Irrigation Controller",
-        data={},
-        options=dict(options if options is not None else _FULL_INPUT),
-    )
 
 
 async def test_user_flow_creates_entry_with_all_fields(hass: HomeAssistant) -> None:
@@ -66,14 +47,38 @@ async def test_user_flow_creates_entry_with_all_fields(hass: HomeAssistant) -> N
 
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
-        user_input=dict(_FULL_INPUT),
+        user_input=dict(CONTROLLER_OPTIONS),
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == "Irrigation Controller"
     # Everything editable lives in options — data stays empty so the options flow
     # is the single source of truth (no data/options fallback duplication).
     assert result["data"] == {}
-    assert result["options"] == _FULL_INPUT
+    assert result["options"] == CONTROLLER_OPTIONS
+
+
+async def test_user_form_defaults_are_evening_only(hass: HomeAssistant) -> None:
+    """The first-shown form defaults to the evening-only spring configuration.
+
+    Pins the product decision: morning cycle off by default, 07:00:00/20:00:00
+    start times — a schema refactor cannot quietly change them.
+    """
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_USER},
+    )
+    schema = result["data_schema"]
+    assert schema is not None
+    defaults = {
+        key.schema: key.default()
+        for key in schema.schema
+        if key.default is not vol.UNDEFINED
+    }
+    assert defaults == {
+        CONF_MORNING_ENABLED: False,
+        CONF_MORNING_START: "07:00:00",
+        CONF_EVENING_START: "20:00:00",
+    }
 
 
 async def test_user_flow_creates_entry_without_optional_sensors(
@@ -102,19 +107,67 @@ async def test_user_flow_rejects_identical_start_times(hass: HomeAssistant) -> N
     )
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
-        user_input={**_FULL_INPUT, CONF_MORNING_START: "20:00:00"},
+        user_input={**CONTROLLER_OPTIONS, CONF_MORNING_START: "20:00:00"},
     )
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "user"
-    assert result["errors"] == {"base": "start_times_conflict"}
+    assert result["errors"] == {CONF_MORNING_START: "start_times_conflict"}
 
     # Recovery: correcting the time on the re-shown form creates the entry.
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"],
-        user_input=dict(_FULL_INPUT),
+        user_input=dict(CONTROLLER_OPTIONS),
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["options"] == _FULL_INPUT
+    assert result["options"] == CONTROLLER_OPTIONS
+
+
+async def test_user_flow_rejects_equivalent_start_time_representations(
+    hass: HomeAssistant,
+) -> None:
+    """Morning "20:00" and evening "20:00:00" are the same instant — rejected.
+
+    The frontend widget always sends HH:MM:SS, but a websocket-driven flow can
+    submit any string `cv.time` accepts — normalization keeps the conflict
+    check honest for those too.
+    """
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={
+            **CONTROLLER_OPTIONS,
+            CONF_MORNING_START: "20:00",
+            CONF_EVENING_START: "20:00:00",
+        },
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_MORNING_START: "start_times_conflict"}
+
+
+async def test_start_times_are_stored_normalized(hass: HomeAssistant) -> None:
+    """Non-canonical time strings are stored canonicalized to HH:MM:SS.
+
+    The options contract (and Story 1.4's parser) documents HH:MM:SS strings;
+    `cv.time` alone would let "7:05" through verbatim.
+    """
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={
+            **_MINIMAL_INPUT,
+            CONF_MORNING_START: "7:05",
+            CONF_EVENING_START: "20:00",
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["options"][CONF_MORNING_START] == "07:05:00"
+    assert result["options"][CONF_EVENING_START] == "20:00:00"
 
 
 async def test_user_flow_allows_identical_times_when_morning_disabled(
@@ -138,7 +191,7 @@ async def test_user_flow_aborts_when_already_configured(hass: HomeAssistant) -> 
     Enforced by `single_config_entry` in manifest.json, which makes HA hide the
     entry point rather than offering "create" and aborting afterwards.
     """
-    _entry().add_to_hass(hass)
+    controller_entry().add_to_hass(hass)
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
@@ -171,7 +224,7 @@ async def test_user_flow_aborts_below_min_ha_version(
 
 async def test_options_flow_shows_prefilled_form(hass: HomeAssistant) -> None:
     """The options form opens prefilled from the current options (AC 4)."""
-    entry = _entry()
+    entry = controller_entry()
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
@@ -187,12 +240,12 @@ async def test_options_flow_shows_prefilled_form(hass: HomeAssistant) -> None:
         for key in schema.schema
         if key.description is not None and "suggested_value" in key.description
     }
-    assert suggested == _FULL_INPUT
+    assert suggested == CONTROLLER_OPTIONS
 
 
 async def test_options_flow_edit_applies_without_restart(hass: HomeAssistant) -> None:
     """Editing options updates the entry and reloads it in place (AC 4, FR8)."""
-    entry = _entry()
+    entry = controller_entry()
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
@@ -202,7 +255,7 @@ async def test_options_flow_edit_applies_without_restart(hass: HomeAssistant) ->
     result = await hass.config_entries.options.async_init(entry.entry_id)
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
-        user_input={**_FULL_INPUT, CONF_EVENING_START: "21:30:00"},
+        user_input={**CONTROLLER_OPTIONS, CONF_EVENING_START: "21:30:00"},
     )
     await hass.async_block_till_done()
 
@@ -216,7 +269,7 @@ async def test_options_flow_edit_applies_without_restart(hass: HomeAssistant) ->
 
 async def test_options_flow_clears_optional_sensor(hass: HomeAssistant) -> None:
     """An optional sensor, once set, can be cleared by emptying its picker."""
-    entry = _entry()
+    entry = controller_entry()
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
@@ -224,7 +277,7 @@ async def test_options_flow_clears_optional_sensor(hass: HomeAssistant) -> None:
     result = await hass.config_entries.options.async_init(entry.entry_id)
     cleared = {
         key: value
-        for key, value in _FULL_INPUT.items()
+        for key, value in CONTROLLER_OPTIONS.items()
         if key != CONF_TEMPERATURE_SENSOR
     }
     result = await hass.config_entries.options.async_configure(
@@ -240,7 +293,7 @@ async def test_options_flow_clears_optional_sensor(hass: HomeAssistant) -> None:
 
 async def test_options_flow_rejects_identical_start_times(hass: HomeAssistant) -> None:
     """The start-time rule is enforced on edits too, not just on creation."""
-    entry = _entry()
+    entry = controller_entry()
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
@@ -248,16 +301,16 @@ async def test_options_flow_rejects_identical_start_times(hass: HomeAssistant) -
     result = await hass.config_entries.options.async_init(entry.entry_id)
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
-        user_input={**_FULL_INPUT, CONF_MORNING_START: "20:00:00"},
+        user_input={**CONTROLLER_OPTIONS, CONF_MORNING_START: "20:00:00"},
     )
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "init"
-    assert result["errors"] == {"base": "start_times_conflict"}
+    assert result["errors"] == {CONF_MORNING_START: "start_times_conflict"}
     assert entry.options[CONF_MORNING_START] == "07:00:00"
 
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
-        user_input={**_FULL_INPUT, CONF_MORNING_START: "06:15:00"},
+        user_input={**CONTROLLER_OPTIONS, CONF_MORNING_START: "06:15:00"},
     )
     await hass.async_block_till_done()
     assert result["type"] is FlowResultType.CREATE_ENTRY
