@@ -1,0 +1,48 @@
+name: Test
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * *" # nightly guard against HA breakage
+  push:
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (HA ${{ matrix.ha-channel }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ha-channel: [stable, beta]
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: "pip"
+          cache-dependency-path: requirements_test.txt
+
+      - name: Install requirements (stable)
+        if: matrix.ha-channel == 'stable'
+        run: python3 -m pip install -r requirements_test.txt
+
+      - name: Install requirements (beta)
+        if: matrix.ha-channel == 'beta'
+        # PHCC is auto-released daily tracking HA dev/beta; --pre pulls the
+        # newest (pre-)release so the suite runs against upcoming HA.
+        run: python3 -m pip install --pre --upgrade pytest-homeassistant-custom-component
+
+      - name: Run tests
+        run: python3 -m pytest tests/ -p no:sugar

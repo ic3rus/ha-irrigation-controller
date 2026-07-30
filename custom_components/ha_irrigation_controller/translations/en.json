@@ -1,0 +1,13 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "title": "HA Irrigation Controller",
+                "description": "Confirm to create the irrigation controller. Zones and schedules are configured afterwards."
+            }
+        },
+        "abort": {
+            "already_configured": "This controller is already configured."
+        }
+    }
+}

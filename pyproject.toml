@@ -1,0 +1,43 @@
+[project]
+name = "ha-irrigation-controller"
+version = "0.1.0"
+description = "Deterministic irrigation scheduling for Home Assistant (integration + Lovelace card)."
+requires-python = ">=3.14.2"
+license = "MIT"
+readme = "README.md"
+
+[tool.ruff]
+target-version = "py314"
+
+[tool.ruff.lint]
+select = [
+    "ALL",
+]
+ignore = [
+    "ANN401", # Dynamically typed expressions (typing.Any) are disallowed
+    "D203",   # no-blank-line-before-class (incompatible with formatter)
+    "D213",   # multi-line-summary-second-line (HA core style: summary on first line)
+    "COM812", # incompatible with formatter
+    "ISC001", # incompatible with formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101",    # assert is the pytest idiom
+    "S603",    # subprocess call in the hass-free import proof is intentional
+    "ARG001",  # pytest fixture dependency injection looks like unused arguments
+    "PLR2004", # magic values in assertions are fine in tests
+]
+
+[tool.ruff.lint.flake8-pytest-style]
+fixture-parentheses = false
+
+[tool.ruff.lint.pyupgrade]
+keep-runtime-typing = true
+
+[tool.ruff.lint.mccabe]
+max-complexity = 25
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

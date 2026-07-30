@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+
+# Dev loop: local Home Assistant with the integration loaded + Rollup watch
+# rebuilding the card bundle on change.
+#
+# NOTE: a config-entry reload does NOT pick up Python code changes —
+# restart this script (full HA restart) after editing integration code.
+# Card changes only need a browser hard-refresh (watch rebuilds the bundle).
+
+set -e
+
+cd "$(dirname "$0")/.."
+
+# Create config dir if not present
+if [[ ! -d "${PWD}/config" ]]; then
+    mkdir -p "${PWD}/config"
+    hass --config "${PWD}/config" --script ensure_config
+fi
+
+# Rollup watch in the background; stop it when HA exits
+(cd card && npm run watch) &
+ROLLUP_PID=$!
+trap 'kill "${ROLLUP_PID}" 2>/dev/null || true' EXIT
+
+# Expose <root>/custom_components to HA without symlinks
+export PYTHONPATH="${PYTHONPATH}:${PWD}/custom_components"
+
+# Start Home Assistant
+hass --config "${PWD}/config" --debug
