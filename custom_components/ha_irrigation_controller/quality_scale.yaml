@@ -10,12 +10,10 @@ rules:
     status: todo
   common-modules:
     status: todo
-  config-flow:
-    status: todo
-    comment: Minimal confirm step only; pickers and options flow arrive with Story 1.2.
+  config-flow: done
   config-flow-test-coverage:
     status: done
-    comment: Full-coverage tests for the placeholder flow (create, single-entry abort, version abort).
+    comment: 100% of config_flow.py — user step (create, optional sensors omitted, start-time conflict and recovery, both aborts) and options flow (prefill, reload-on-edit, clearing an optional sensor, conflict and recovery).
   dependency-transparency:
     status: done
   docs-actions:

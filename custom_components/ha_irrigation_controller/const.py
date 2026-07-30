@@ -16,3 +16,19 @@ MIN_HA_VERSION = "2026.7.0"
 _MIN_HA_PARTS = MIN_HA_VERSION.split(".")
 MIN_HA_MAJOR = int(_MIN_HA_PARTS[0])
 MIN_HA_MINOR = int(_MIN_HA_PARTS[1])
+
+# Controller configuration keys. Every one of them is operator-editable, so they
+# all live in `entry.options` (entry.data stays empty) — one home, no data/options
+# fallback duplication. Zone parameters are config subentries (Story 1.3).
+CONF_PUMP_SWITCH = "pump_switch"
+CONF_RAIN_SENSOR = "rain_sensor"
+CONF_TEMPERATURE_SENSOR = "temperature_sensor"
+CONF_HUMIDITY_SENSOR = "humidity_sensor"
+CONF_MORNING_ENABLED = "morning_enabled"
+CONF_MORNING_START = "morning_start"
+CONF_EVENING_START = "evening_start"
+
+# TimeSelector serializes "HH:MM:SS" strings; store them verbatim and let the
+# engine parse them (Story 1.4). Times are Home Assistant local at UI surfaces.
+DEFAULT_MORNING_START = "07:00:00"
+DEFAULT_EVENING_START = "20:00:00"
