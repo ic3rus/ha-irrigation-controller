@@ -29,6 +29,11 @@ ignore = [
     "PLR2004", # magic values in assertions are fine in tests
 ]
 
+[tool.ruff.lint.isort]
+# Keep aliased imports from one module in a single statement instead of exploding
+# `from homeassistant.const import X as Y` into one block per name.
+combine-as-imports = true
+
 [tool.ruff.lint.flake8-pytest-style]
 fixture-parentheses = false
 
@@ -41,3 +46,23 @@ max-complexity = 25
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Home Assistant announces removals via DeprecationWarning months before they
+# become fatal. Turning warnings into errors is what lets the nightly cron catch
+# breakage while it is still a warning, which is the whole point of that cron.
+filterwarnings = [
+    "error",
+]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+# custom_components/ has no __init__.py (HA convention), so mypy needs to be told
+# where package roots begin or it sees every engine module twice.
+explicit_package_bases = true
+namespace_packages = true
+mypy_path = "."
+
+[[tool.mypy.overrides]]
+# PHCC ships no py.typed marker.
+module = ["pytest_homeassistant_custom_component.*"]
+ignore_missing_imports = true

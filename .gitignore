@@ -31,6 +31,8 @@ node_modules/
 # is COMMITTED on purpose (HACS ships it) — do not ignore it.
 
 # --- Home Assistant dev instance (scripts/develop) ---
+# Everything HA generates at runtime is ignored; configuration.yaml is committed
+# on purpose so a fresh clone gets a working dev instance with no setup step.
 config/*
 !config/configuration.yaml
 

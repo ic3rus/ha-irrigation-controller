@@ -16,6 +16,7 @@
             "extensions": [
                 "charliermarsh.ruff",
                 "github.vscode-pull-request-github",
+                "ms-python.mypy-type-checker",
                 "ms-python.python",
                 "ms-python.vscode-pylance",
                 "ryanluker.vscode-coverage-gutters",
@@ -39,6 +40,7 @@
     "remoteUser": "vscode",
     "features": {
         "ghcr.io/devcontainers/features/python:1": {
+            "comment": "Resolves to the newest 3.14.x. The pyproject floor (>= 3.14.2) is enforced at install time: the pinned homeassistant refuses to install below it.",
             "version": "3.14"
         },
         "ghcr.io/devcontainers/features/node:1": {

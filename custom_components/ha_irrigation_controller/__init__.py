@@ -9,11 +9,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from awesomeversion import AwesomeVersion
-from homeassistant.const import __version__ as HA_VERSION  # noqa: N812
+from homeassistant.const import (
+    MAJOR_VERSION as HA_MAJOR_VERSION,
+    MINOR_VERSION as HA_MINOR_VERSION,
+    __version__ as HA_VERSION,  # noqa: N812
+)
 from homeassistant.exceptions import ConfigEntryError
 
-from .const import MIN_HA_VERSION
+from .const import DOMAIN, MIN_HA_MAJOR, MIN_HA_MINOR, MIN_HA_VERSION
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -32,13 +35,18 @@ async def async_setup_entry(
     entry: HaIrrigationConfigEntry,
 ) -> bool:
     """Set up HA Irrigation Controller from a config entry."""
-    if AwesomeVersion(HA_VERSION) < AwesomeVersion(MIN_HA_VERSION):
-        msg = (
-            f"HA Irrigation Controller requires Home Assistant {MIN_HA_VERSION} "
-            f"or newer; this instance runs {HA_VERSION}. "
-            "Please update Home Assistant before setting up this integration."
+    # Compared on (major, minor) so prereleases of the minimum month release are
+    # accepted; passing no message lets HA render the English text from
+    # translations/en.json, so entry.reason stays informative AND translatable.
+    if (HA_MAJOR_VERSION, HA_MINOR_VERSION) < (MIN_HA_MAJOR, MIN_HA_MINOR):
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="unsupported_ha_version",
+            translation_placeholders={
+                "required": MIN_HA_VERSION,
+                "running": HA_VERSION,
+            },
         )
-        raise ConfigEntryError(msg)
 
     entry.runtime_data = HaIrrigationRuntimeData()
     return True

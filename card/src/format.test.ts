@@ -22,4 +22,13 @@ describe("formatDuration", () => {
     expect(formatDuration(-5)).toBe("0:00");
     expect(formatDuration(61.9)).toBe("1:01");
   });
+
+  it("never renders NaN for non-finite input", () => {
+    // HA state attributes coerce `unknown`/`unavailable` to NaN, so this is the
+    // input class the real timeline will actually receive.
+    expect(formatDuration(Number.NaN)).toBe("0:00");
+    expect(formatDuration(Number.POSITIVE_INFINITY)).toBe("0:00");
+    expect(formatDuration(Number.NEGATIVE_INFINITY)).toBe("0:00");
+    expect(formatDuration(Number("unavailable"))).toBe("0:00");
+  });
 });

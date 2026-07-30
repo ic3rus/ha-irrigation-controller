@@ -1,14 +1,18 @@
 name: Card
 
 on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * *" # nightly: catches upstream Lit/Rollup/browser breakage
   push:
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
 concurrency:
-  group: card-${{ github.ref }}
+  group: card-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -34,11 +38,31 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build card bundle
-        run: npm run build
+      # vitest strips types via esbuild without checking them, so this is the only
+      # thing that type-checks the card — test files included.
+      - name: Type check
+        run: npm run typecheck
 
-      - name: Committed bundle is up to date
-        run: git diff --exit-code -- ../custom_components/ha_irrigation_controller/frontend/
+      - name: Install the browser vitest renders in
+        run: npx playwright install --with-deps chromium
 
       - name: Run vitest
         run: npm test
+
+      - name: Build card bundle
+        run: npm run build
+
+      # `git diff` inspects TRACKED paths only, so an extra chunk, a sourcemap or a
+      # renamed entry point would leave this gate green while the HACS payload went
+      # stale. --untracked-files=all is what closes that hole.
+      - name: Committed bundle is up to date
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          target=custom_components/ha_irrigation_controller/frontend
+          if [[ -n "$(git status --porcelain --untracked-files=all -- "$target")" ]]; then
+            echo "::error::The committed card bundle does not match a fresh build."
+            git status --porcelain --untracked-files=all -- "$target"
+            git diff -- "$target"
+            exit 1
+          fi

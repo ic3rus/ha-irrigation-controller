@@ -14,6 +14,8 @@
     "declaration": false,
     "sourceMap": false
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["src/**/*.test.ts"]
+  // Test files are included on purpose: vitest strips types via esbuild without
+  // checking them, so `tsc --noEmit` is the only thing that type-checks them.
+  // Rollup excludes them from the bundle via the typescript plugin's own option.
+  "include": ["src/**/*.ts", "*.config.ts", "*.config.mjs"]
 }

@@ -7,11 +7,31 @@ from typing import TYPE_CHECKING
 from homeassistant.config_entries import ConfigEntryState
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.ha_irrigation_controller.const import DOMAIN, MIN_HA_VERSION
+from custom_components.ha_irrigation_controller import HaIrrigationRuntimeData
+from custom_components.ha_irrigation_controller.const import (
+    DOMAIN,
+    MIN_HA_MAJOR,
+    MIN_HA_MINOR,
+    MIN_HA_VERSION,
+)
 
 if TYPE_CHECKING:
     import pytest
     from homeassistant.core import HomeAssistant
+
+_MODULE = "custom_components.ha_irrigation_controller"
+
+
+def _patch_ha_version(
+    monkeypatch: pytest.MonkeyPatch,
+    major: int,
+    minor: int,
+    version: str,
+) -> None:
+    """Pin the HA version the setup guard sees."""
+    monkeypatch.setattr(f"{_MODULE}.HA_MAJOR_VERSION", major)
+    monkeypatch.setattr(f"{_MODULE}.HA_MINOR_VERSION", minor)
+    monkeypatch.setattr(f"{_MODULE}.HA_VERSION", version)
 
 
 async def test_setup_and_unload_entry(hass: HomeAssistant) -> None:
@@ -22,11 +42,13 @@ async def test_setup_and_unload_entry(hass: HomeAssistant) -> None:
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
     assert entry.state is ConfigEntryState.LOADED
-    assert entry.runtime_data is not None
+    assert isinstance(entry.runtime_data, HaIrrigationRuntimeData)
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
-    assert entry.state is ConfigEntryState.NOT_LOADED
+    # mypy narrowed entry.state to LOADED above and cannot see that async_unload
+    # mutates it, hence the ignore.
+    assert entry.state is ConfigEntryState.NOT_LOADED  # type: ignore[comparison-overlap]
 
 
 async def test_setup_fails_loudly_below_min_ha_version(
@@ -34,10 +56,7 @@ async def test_setup_fails_loudly_below_min_ha_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Below the minimum HA version, setup raises ConfigEntryError (AC 3)."""
-    monkeypatch.setattr(
-        "custom_components.ha_irrigation_controller.HA_VERSION",
-        "2026.6.4",
-    )
+    _patch_ha_version(monkeypatch, 2026, 6, "2026.6.4")
     entry = MockConfigEntry(domain=DOMAIN, title="Irrigation Controller", data={})
     entry.add_to_hass(hass)
 
@@ -55,9 +74,29 @@ async def test_setup_succeeds_at_exact_min_ha_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """At exactly the minimum HA version, setup succeeds (boundary check)."""
-    monkeypatch.setattr(
-        "custom_components.ha_irrigation_controller.HA_VERSION",
-        MIN_HA_VERSION,
+    _patch_ha_version(monkeypatch, MIN_HA_MAJOR, MIN_HA_MINOR, MIN_HA_VERSION)
+    entry = MockConfigEntry(domain=DOMAIN, title="Irrigation Controller", data={})
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+
+
+async def test_setup_succeeds_on_prerelease_of_min_ha_version(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A beta of the minimum month release is supported, not rejected.
+
+    Regression guard: a full-string comparison sorts 2026.7.0b5 BELOW 2026.7.0
+    and locked beta-channel users out of the exact minimum release.
+    """
+    _patch_ha_version(
+        monkeypatch,
+        MIN_HA_MAJOR,
+        MIN_HA_MINOR,
+        f"{MIN_HA_MAJOR}.{MIN_HA_MINOR}.0b5",
     )
     entry = MockConfigEntry(domain=DOMAIN, title="Irrigation Controller", data={})
     entry.add_to_hass(hass)

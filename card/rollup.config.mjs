@@ -14,7 +14,9 @@ export default {
   },
   plugins: [
     nodeResolve(),
-    typescript(),
+    // tsconfig includes the test files so `tsc --noEmit` checks them; they must
+    // not reach the bundle.
+    typescript({ exclude: ["src/**/*.test.ts"] }),
     // ES2022 output — no ES5 transpilation (it breaks Lit 3 native classes).
     terser({ ecma: 2022, format: { comments: false } }),
   ],

@@ -10,15 +10,23 @@ rules:
     status: todo
   common-modules:
     status: todo
-  config-flow: todo
-  config-flow-test-coverage: todo
-  dependency-transparency: done
+  config-flow:
+    status: todo
+    comment: Minimal confirm step only; pickers and options flow arrive with Story 1.2.
+  config-flow-test-coverage:
+    status: done
+    comment: Full-coverage tests for the placeholder flow (create, single-entry abort, version abort).
+  dependency-transparency:
+    status: done
   docs-actions:
     status: exempt
     comment: No services yet; services arrive with Story 1.6.
-  docs-high-level-description: done
-  docs-installation-instructions: done
-  docs-removal-instructions: todo
+  docs-high-level-description:
+    status: done
+  docs-installation-instructions:
+    status: done
+  docs-removal-instructions:
+    status: todo
   entity-event-setup:
     status: exempt
     comment: No entities yet; entity platforms arrive in later stories.

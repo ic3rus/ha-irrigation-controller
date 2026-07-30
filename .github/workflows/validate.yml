@@ -5,14 +5,16 @@ on:
   schedule:
     - cron: "0 4 * * *"
   push:
+    branches: [main]
   pull_request:
 
-# contents:read is required to check out / query a private repository
+# The default GITHUB_TOKEN permissions are narrowed to the minimum, but not to
+# nothing: actions/checkout and the HACS API calls both need contents:read.
 permissions:
   contents: read
 
 concurrency:
-  group: validate-${{ github.workflow }}-${{ github.ref }}
+  group: validate-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -32,6 +34,8 @@ jobs:
     name: HACS validation
     runs-on: ubuntu-latest
     steps:
+      # The action fetches hacs.json/manifest.json over the network rather than
+      # from the workspace, so no checkout step is needed here.
       - name: Run HACS validation
         uses: hacs/action@main
         with:
