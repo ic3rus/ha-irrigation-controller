@@ -1,0 +1,68 @@
+[project]
+name = "ha-irrigation-controller"
+version = "0.1.0"
+description = "Deterministic irrigation scheduling for Home Assistant (integration + Lovelace card)."
+requires-python = ">=3.14.2"
+license = "MIT"
+readme = "README.md"
+
+[tool.ruff]
+target-version = "py314"
+
+[tool.ruff.lint]
+select = [
+    "ALL",
+]
+ignore = [
+    "ANN401", # Dynamically typed expressions (typing.Any) are disallowed
+    "D203",   # no-blank-line-before-class (incompatible with formatter)
+    "D213",   # multi-line-summary-second-line (HA core style: summary on first line)
+    "COM812", # incompatible with formatter
+    "ISC001", # incompatible with formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101",    # assert is the pytest idiom
+    "S603",    # subprocess call in the hass-free import proof is intentional
+    "ARG001",  # pytest fixture dependency injection looks like unused arguments
+    "PLR2004", # magic values in assertions are fine in tests
+]
+
+[tool.ruff.lint.isort]
+# Keep aliased imports from one module in a single statement instead of exploding
+# `from homeassistant.const import X as Y` into one block per name.
+combine-as-imports = true
+
+[tool.ruff.lint.flake8-pytest-style]
+fixture-parentheses = false
+
+[tool.ruff.lint.pyupgrade]
+keep-runtime-typing = true
+
+[tool.ruff.lint.mccabe]
+max-complexity = 25
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Home Assistant announces removals via DeprecationWarning months before they
+# become fatal. Turning warnings into errors is what lets the nightly cron catch
+# breakage while it is still a warning, which is the whole point of that cron.
+filterwarnings = [
+    "error",
+]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+# custom_components/ has no __init__.py (HA convention), so mypy needs to be told
+# where package roots begin or it sees every engine module twice.
+explicit_package_bases = true
+namespace_packages = true
+mypy_path = "."
+
+[[tool.mypy.overrides]]
+# PHCC ships no py.typed marker.
+module = ["pytest_homeassistant_custom_component.*"]
+ignore_missing_imports = true

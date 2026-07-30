@@ -1,0 +1,96 @@
+name: Test
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * *" # nightly guard against HA breakage
+  # Scoped to main: a PR from a same-repo branch would otherwise run this
+  # workflow twice, and the two runs cannot cancel each other because the
+  # push and pull_request contexts report different github.ref values.
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  # github.event_name is part of the key so a push to main cannot cancel the
+  # nightly cron — both run on refs/heads/main.
+  group: test-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (HA ${{ matrix.ha-channel }})
+    runs-on: ubuntu-latest
+    # A broken upstream HA beta must not block unrelated merges: the beta leg is
+    # an early-warning signal, the stable leg is the gate.
+    continue-on-error: ${{ matrix.ha-channel == 'beta' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ha-channel: [stable, beta]
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          # requires-python (>= 3.14.2) is enforced at install time: the pinned
+          # homeassistant refuses to install on an older patch release.
+          python-version: "3.14"
+          cache: "pip"
+          cache-dependency-path: requirements_test.txt
+
+      # Both legs install this, so the beta leg gets any test-only dependency too
+      # and its pip cache key matches what it actually installs.
+      - name: Install requirements
+        run: python3 -m pip install -r requirements_test.txt
+
+      # requirements_test.txt pins HA explicitly, so the stable leg genuinely
+      # runs HA stable. Only the beta leg overrides that, by taking the newest
+      # PHCC prerelease and whatever upcoming HA it hard-pins.
+      - name: Move to the HA beta channel
+        if: matrix.ha-channel == 'beta'
+        run: python3 -m pip install --pre --upgrade pytest-homeassistant-custom-component
+
+      - name: Report the Home Assistant version under test
+        run: python3 -c "from homeassistant.const import __version__ as v; print('Home Assistant', v)"
+
+      - name: Run tests
+        run: python3 -m pytest tests/ -p no:sugar
+
+  engine-hass-free:
+    name: Engine suite without Home Assistant (AD-1)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      # Deliberately NOT requirements_test.txt: homeassistant must be ABSENT so
+      # this job proves the engine suite needs nothing but a test runner. The
+      # in-suite probe blocks hass imports, but only an environment without HA
+      # proves the suite itself is free of it.
+      - name: Install a bare test runner
+        run: python3 -m pip install pytest pytest-asyncio
+
+      - name: Home Assistant must not be installed
+        run: |
+          if python3 -c "import homeassistant" 2>/dev/null; then
+            echo "::error::homeassistant is installed — this job cannot prove AD-1"
+            exit 1
+          fi
+
+      - name: Run the engine suite
+        run: python3 -m pytest tests/engine

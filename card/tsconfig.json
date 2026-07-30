@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "strict": true,
+    "noImplicitOverride": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "experimentalDecorators": true,
+    "useDefineForClassFields": false,
+    "skipLibCheck": true,
+    "declaration": false,
+    "sourceMap": false
+  },
+  // Test files are included on purpose: vitest strips types via esbuild without
+  // checking them, so `tsc --noEmit` is the only thing that type-checks them.
+  // Rollup excludes them from the bundle via the typescript plugin's own option.
+  "include": ["src/**/*.ts", "*.config.ts", "*.config.mjs"]
+}

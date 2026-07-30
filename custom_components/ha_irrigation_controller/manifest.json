@@ -1,0 +1,14 @@
+{
+  "domain": "ha_irrigation_controller",
+  "name": "HA Irrigation Controller",
+  "codeowners": [
+    "@ic3rus"
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/ic3rus/ha-irrigation-controller",
+  "integration_type": "helper",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/ic3rus/ha-irrigation-controller/issues",
+  "single_config_entry": true,
+  "version": "0.1.0"
+}

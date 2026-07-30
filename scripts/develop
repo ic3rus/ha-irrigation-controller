@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+
+# Dev loop: local Home Assistant with the integration loaded + Rollup watch
+# rebuilding the card bundle on change.
+#
+# NOTE: a config-entry reload does NOT pick up Python code changes —
+# restart this script (full HA restart) after editing integration code.
+# Card changes only need a browser hard-refresh (watch rebuilds the bundle).
+
+set -e
+
+cd "$(dirname "$0")/.."
+
+# Seed the dev HA config dir. config/configuration.yaml is committed, so this only
+# fires if it was deleted; the rest of the dir is gitignored.
+if [[ ! -f "${PWD}/config/configuration.yaml" ]]; then
+    mkdir -p "${PWD}/config"
+    hass --config "${PWD}/config" --script ensure_config
+fi
+
+# Expose the integration to HA. It discovers custom integrations by importing the
+# `custom_components` PACKAGE, so the repo ROOT goes on the path — not
+# custom_components/ itself, which would only make `ha_irrigation_controller`
+# importable as a top-level module and leave HA with nothing to load. Appending
+# rather than clobbering, and never emitting an empty path entry (which would put
+# the CWD on sys.path and let repo files shadow stdlib modules).
+export PYTHONPATH="${PWD}${PYTHONPATH:+:${PYTHONPATH}}"
+
+# Rollup watch in the background; stop it and its children when HA exits.
+# `npm` spawns rollup as a grandchild, so killing $! alone orphans the watcher —
+# it would keep rewriting the committed bundle after HA is gone. A process group
+# kill (set -m puts the subshell in its own group) takes the whole tree down.
+set -m
+(cd card && npm run watch) &
+ROLLUP_PGID=$!
+set +m
+trap 'kill -- -"${ROLLUP_PGID}" 2>/dev/null || kill "${ROLLUP_PGID}" 2>/dev/null || true' EXIT
+
+# Fail fast if the watcher died immediately (missing node_modules, rollup error):
+# otherwise HA comes up serving a stale bundle while this script reports success.
+sleep 2
+if ! kill -0 "${ROLLUP_PGID}" 2>/dev/null; then
+    echo "error: the card watch process exited immediately — run scripts/setup?" >&2
+    exit 1
+fi
+
+# Start Home Assistant
+hass --config "${PWD}/config" --debug

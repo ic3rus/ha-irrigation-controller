@@ -25,6 +25,17 @@ htmlcov/
 dist/
 build/
 
+# --- Node / card build ---
+node_modules/
+# NOTE: the built card bundle in custom_components/ha_irrigation_controller/frontend/
+# is COMMITTED on purpose (HACS ships it) — do not ignore it.
+
+# --- Home Assistant dev instance (scripts/develop) ---
+# Everything HA generates at runtime is ignored; configuration.yaml is committed
+# on purpose so a fresh clone gets a working dev instance with no setup step.
+config/*
+!config/configuration.yaml
+
 # --- Home Assistant / ESPHome (artefacts locaux) ---
 .esphome/
 *.db

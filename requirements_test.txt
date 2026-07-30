@@ -1,0 +1,10 @@
+# Home Assistant is pinned EXPLICITLY. pytest-homeassistant-custom-component
+# hard-pins a homeassistant version, and its 0.13.x line has already moved on to
+# HA betas (0.13.349 pins 2026.8.0b0) — so the PHCC range alone does NOT keep
+# this leg on HA stable. Pinning HA here makes the resolver pick the matching
+# PHCC release, and dependabot bumps this one line (it skips prereleases while
+# the current pin is not one), so "stable" stays stable.
+homeassistant==2026.7.4
+pytest-homeassistant-custom-component>=0.13.346,<0.14
+# Type checking needs the HA type stubs, so it lives with the test deps.
+mypy==2.3.0

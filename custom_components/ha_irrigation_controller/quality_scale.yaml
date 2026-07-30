@@ -1,0 +1,44 @@
+rules:
+  # Bronze
+  action-setup:
+    status: exempt
+    comment: No services yet; services arrive with Story 1.6.
+  appropriate-polling:
+    status: exempt
+    comment: iot_class is calculated — the integration does not poll.
+  brands:
+    status: todo
+  common-modules:
+    status: todo
+  config-flow:
+    status: todo
+    comment: Minimal confirm step only; pickers and options flow arrive with Story 1.2.
+  config-flow-test-coverage:
+    status: done
+    comment: Full-coverage tests for the placeholder flow (create, single-entry abort, version abort).
+  dependency-transparency:
+    status: done
+  docs-actions:
+    status: exempt
+    comment: No services yet; services arrive with Story 1.6.
+  docs-high-level-description:
+    status: done
+  docs-installation-instructions:
+    status: done
+  docs-removal-instructions:
+    status: todo
+  entity-event-setup:
+    status: exempt
+    comment: No entities yet; entity platforms arrive in later stories.
+  entity-unique-id:
+    status: exempt
+    comment: No entities yet; entity platforms arrive in later stories.
+  has-entity-name:
+    status: exempt
+    comment: No entities yet; entity platforms arrive in later stories.
+  runtime-data: done
+  test-before-configure:
+    status: exempt
+    comment: No device/service connection to test — local calculated helper.
+  test-before-setup: done
+  unique-config-entry: done

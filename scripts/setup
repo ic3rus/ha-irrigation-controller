@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+
+set -e
+
+cd "$(dirname "$0")/.."
+
+# Python deps (HA + test + lint tooling)
+python3 -m pip install --upgrade pip
+python3 -m pip install --requirement requirements_dev.txt
+
+# Card deps. `npm ci` (not `npm install`) so the installed tree matches the
+# committed lockfile exactly — CI rebuilds the bundle and fails if it differs
+# from the committed one, and a floated caret range is enough to cause that.
+cd card
+npm ci
+
+# The browser vitest renders the card in.
+npx playwright install --with-deps chromium

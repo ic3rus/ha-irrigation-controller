@@ -1,0 +1,57 @@
+version: 2
+
+# Every version in this repo is exactly pinned, in an ecosystem that breaks on a
+# monthly cadence — so the pins need an owner. Dependabot opens the PR, CI decides
+# whether the bump is safe. Note it cannot touch hassfest@master / hacs/action@main:
+# a mutable ref is not a version.
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      # homeassistant and PHCC are one decision: PHCC hard-pins a HA version, so
+      # bumping either alone produces an unresolvable requirement set.
+      home-assistant:
+        patterns:
+          - homeassistant
+          - pytest-homeassistant-custom-component
+      python-tooling:
+        patterns:
+          - ruff
+          - mypy
+          - colorlog
+
+  - package-ecosystem: npm
+    directory: /card
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      card-runtime:
+        patterns:
+          - lit
+          - custom-card-helpers
+          - home-assistant-js-websocket
+      card-tooling:
+        patterns:
+          - "@rollup/*"
+          - rollup
+          - typescript
+          - tslib
+          - vitest
+          - "@vitest/*"
+          - playwright
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      github-actions:
+        patterns:
+          - "*"

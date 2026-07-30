@@ -1,93 +1,101 @@
-# Ha Irrigation Controller
+# HA Irrigation Controller
 
+[![Validate](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/validate.yml/badge.svg)](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/validate.yml)
+[![Test](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/test.yml/badge.svg)](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/test.yml)
+[![Lint](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/lint.yml/badge.svg)](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/lint.yml)
+[![Card](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/card.yml/badge.svg)](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/card.yml)
 
+A Home Assistant custom integration for deterministic irrigation scheduling — a
+hass-free sequencer engine driving your valves, plus a bundled Lovelace timeline
+card (`ha-irrigation-timeline-card`) delivered in the same install.
 
-## Getting started
+**Requires Home Assistant 2026.7.0 or newer** (setup fails with a clear error on
+older versions).
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## Installation (HACS custom repository)
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+1. In HACS, open **⋮ → Custom repositories**.
+2. Add `https://github.com/ic3rus/ha-irrigation-controller` with category
+   **Integration**.
+3. Install **HA Irrigation Controller**, then restart Home Assistant.
+4. Go to **Settings → Devices & services → Helpers** and choose
+   **Create helper → HA Irrigation Controller**.
 
-## Add your files
+> This integration declares `integration_type: helper`, so Home Assistant lists
+> it under **Helpers** — it does *not* appear in the "Add integration" dialog.
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+Only one controller can be configured (`single_config_entry`).
 
+The built card ships inside `custom_components/`, so a HACS install delivers it
+in the same payload — no separate card install or download. Serving it to
+Lovelace (static path + resource registration) arrives with Story 4.2, so the
+card is not yet selectable in the dashboard editor.
+
+## Development
+
+The repo ships a devcontainer (Python 3.14 + Node 22). Open it in VS Code and
+the `scripts/setup` post-create hook installs everything. Then:
+
+```bash
+scripts/develop
 ```
-cd existing_repo
-git remote add origin https://gitlab.yka.ovh/HomeLab/home-assistant/ha-irrigation-controller.git
-git branch -M main
-git push -uf origin main
+
+This starts a local Home Assistant instance (http://localhost:8123) with the
+integration loaded **and** a Rollup watch that rebuilds the card bundle to
+`custom_components/ha_irrigation_controller/frontend/` on change.
+
+> **Note:** reloading the config entry does *not* pick up Python code changes —
+> restart `scripts/develop` (full HA restart) after editing integration code.
+> Card changes only need a browser hard-refresh.
+
+Other loops:
+
+```bash
+scripts/lint                 # Ruff format + lint (autofix), then mypy
+python3 -m pytest tests/     # backend + engine test suites
+python3 -m pytest tests/engine  # engine only — must pass with HA uninstalled (AD-1)
+cd card && npm run typecheck # tsc --noEmit (vitest does NOT type-check)
+cd card && npm test          # card tests (vitest, headless Chromium)
+cd card && npm run build     # rebuild the committed card bundle
 ```
 
-## Integrate with your tools
+> **Running hassfest locally:** exclude `card/node_modules` from the mount.
+> `@vitest/browser` ships a Vite build manifest at
+> `node_modules/@vitest/browser/dist/client/.vite/manifest.json`, which hassfest
+> mistakes for a second integration and then crashes on. CI is unaffected — the
+> hassfest job checks out the repo without installing card dependencies.
 
-* [Set up project integrations](https://gitlab.yka.ovh/HomeLab/home-assistant/ha-irrigation-controller/-/settings/integrations)
+### Layout
 
-## Collaborate with your team
+```text
+custom_components/ha_irrigation_controller/
+  engine/     # hass-free scheduling core (imports NOTHING from homeassistant.*)
+  adapters/   # HA <-> engine adapters
+  entities/   # entity platforms
+  frontend/   # BUILT card bundle (committed; shipped by HACS)
+card/         # card TypeScript source (Lit 3 + Rollup + vitest)
+tests/        # pytest-homeassistant-custom-component harness + engine tests
+```
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+The built card bundle is committed on purpose: HACS installs
+`custom_components/` as-is, so the card must live inside it (single-repo,
+single-install design).
 
-## Test and Deploy
+## CI
 
-Use the built-in continuous integration in GitLab.
+Every pull request (and every push to `main`) runs hassfest, HACS validation,
+Ruff (format + lint), mypy, `tsc`, pytest against HA **stable and beta**, the
+engine suite in an environment with **no Home Assistant installed** (the AD-1
+gate), and the card build + vitest in headless Chromium. A nightly cron re-runs
+all four workflows to catch Home Assistant's monthly breakage early;
+`filterwarnings = ["error"]` means a `DeprecationWarning` fails the build while
+the removal is still months away.
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+The HA beta leg is `continue-on-error`: it is an early-warning signal, not a
+merge gate. Dependency bumps arrive as grouped dependabot PRs — note that
+dependabot cannot bump `hassfest@master` or `hacs/action@main`, since a mutable
+ref is not a version.
 
 ## License
-For open source projects, say how it is licensed.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+MIT
