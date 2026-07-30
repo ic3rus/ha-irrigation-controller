@@ -50,9 +50,16 @@ async def async_setup_entry(
             },
         )
 
-    # The controller is a virtual service device; zone devices will link to it
-    # via_device once zones become config subentries (Story 1.3).
-    dr.async_get(hass).async_get_or_create(
+    # The ONE update listener of this integration: every config change —
+    # options edit, zone subentry add/edit/remove (including UI deletion, which
+    # never touches flow code) — fires it, and it schedules a reload so the
+    # change applies without restarting HA (FR8). No flow performs its own
+    # reload; Story 1.7 will teach this seam to defer while a cycle runs.
+    entry.async_on_unload(entry.add_update_listener(_async_entry_updated))
+
+    device_registry = dr.async_get(hass)
+    # The controller is a virtual service device; zone devices link to it below.
+    device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, entry.entry_id)},
         entry_type=DeviceEntryType.SERVICE,
@@ -60,8 +67,29 @@ async def async_setup_entry(
         name="Irrigation Controller",
     )
 
+    # One device per zone subentry, keyed by the subentry id (the zone key
+    # everywhere, AD-8). Removal needs no manual cleanup: async_remove_subentry
+    # clears the subentry's devices and entities from both registries itself.
+    for subentry in entry.subentries.values():
+        device_registry.async_get_or_create(
+            config_entry_id=entry.entry_id,
+            config_subentry_id=subentry.subentry_id,
+            identifiers={(DOMAIN, subentry.subentry_id)},
+            via_device=(DOMAIN, entry.entry_id),
+            manufacturer="ha-irrigation-controller",
+            name=subentry.title,
+        )
+
     entry.runtime_data = HaIrrigationRuntimeData()
     return True
+
+
+async def _async_entry_updated(
+    hass: HomeAssistant,
+    entry: HaIrrigationConfigEntry,
+) -> None:
+    """Reload the entry on any config change — the restart-free half of FR8."""
+    hass.config_entries.async_schedule_reload(entry.entry_id)
 
 
 async def async_unload_entry(

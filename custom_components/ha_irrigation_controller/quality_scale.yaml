@@ -13,7 +13,7 @@ rules:
   config-flow: done
   config-flow-test-coverage:
     status: done
-    comment: 100% of config_flow.py — user step (create, optional sensors omitted, start-time conflict and recovery, both aborts) and options flow (prefill, reload-on-edit, clearing an optional sensor, conflict and recovery).
+    comment: 100% of config_flow.py — user step (create, optional sensors omitted, start-time conflict and recovery, both aborts), options flow (prefill, reload-on-edit, clearing an optional sensor, conflict and recovery) and the zone subentry flow (add with defaults pinned, valve-is-pump and duplicate-valve errors with recovery, reconfigure incl. the exclude-self branch, removal, reload-on-change).
   dependency-transparency:
     status: done
   docs-actions:

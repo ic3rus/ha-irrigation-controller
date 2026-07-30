@@ -33,6 +33,64 @@
             "unsupported_ha_version": "HA Irrigation Controller requires Home Assistant {required} or newer; this instance runs {running}. Please update Home Assistant first."
         }
     },
+    "config_subentries": {
+        "zone": {
+            "entry_type": "Zone",
+            "initiate_flow": {
+                "user": "Add zone",
+                "reconfigure": "Reconfigure zone"
+            },
+            "step": {
+                "user": {
+                    "title": "Add zone",
+                    "description": "Model one physical irrigation zone: the valve that feeds it, how long it waters per cycle, and how rain affects it.",
+                    "data": {
+                        "name": "Zone name",
+                        "valve_switch": "Valve switch",
+                        "morning_duration": "Morning duration",
+                        "evening_duration": "Evening duration",
+                        "rain_exposed": "Exposed to rain",
+                        "rain_factor": "Rain factor"
+                    },
+                    "data_description": {
+                        "name": "How this zone appears everywhere: its device, the dashboard card, notifications.",
+                        "valve_switch": "The switch that opens this zone's valve. Each zone needs its own valve — not the pump switch.",
+                        "morning_duration": "Minutes this zone waters during the morning cycle.",
+                        "evening_duration": "Minutes this zone waters during the evening cycle.",
+                        "rain_exposed": "On for zones that receive rainfall. Sheltered zones (greenhouse, covered beds) are never rain-reduced.",
+                        "rain_factor": "Minutes of watering credited per millimetre of rain, applied only to rain-exposed zones. 0 disables the reduction. The default of 1 min/mm is deliberately conservative — tune it across the season."
+                    }
+                },
+                "reconfigure": {
+                    "title": "Reconfigure zone",
+                    "description": "Changes apply immediately — Home Assistant does not need to be restarted.",
+                    "data": {
+                        "name": "Zone name",
+                        "valve_switch": "Valve switch",
+                        "morning_duration": "Morning duration",
+                        "evening_duration": "Evening duration",
+                        "rain_exposed": "Exposed to rain",
+                        "rain_factor": "Rain factor"
+                    },
+                    "data_description": {
+                        "name": "How this zone appears everywhere: its device, the dashboard card, notifications.",
+                        "valve_switch": "The switch that opens this zone's valve. Each zone needs its own valve — not the pump switch.",
+                        "morning_duration": "Minutes this zone waters during the morning cycle.",
+                        "evening_duration": "Minutes this zone waters during the evening cycle.",
+                        "rain_exposed": "On for zones that receive rainfall. Sheltered zones (greenhouse, covered beds) are never rain-reduced.",
+                        "rain_factor": "Minutes of watering credited per millimetre of rain, applied only to rain-exposed zones. 0 disables the reduction. The default of 1 min/mm is deliberately conservative — tune it across the season."
+                    }
+                }
+            },
+            "error": {
+                "valve_is_pump": "This is the pump switch, not a zone valve. Pick the switch that opens this zone's own valve.",
+                "valve_already_configured": "Another zone already uses this valve. Each zone needs its own valve switch."
+            },
+            "abort": {
+                "reconfigure_successful": "The zone has been updated."
+            }
+        }
+    },
     "options": {
         "step": {
             "init": {

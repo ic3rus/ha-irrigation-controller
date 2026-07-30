@@ -261,7 +261,7 @@ async def test_options_flow_edit_applies_without_restart(hass: HomeAssistant) ->
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert entry.options[CONF_EVENING_START] == "21:30:00"
-    # OptionsFlowWithReload reloaded the entry in place: it is LOADED again and
+    # The update listener reloaded the entry in place: it is LOADED again and
     # async_setup_entry really ran again (fresh runtime_data), no HA restart.
     assert entry.state is ConfigEntryState.LOADED
     assert entry.runtime_data is not runtime_data_before
