@@ -7,7 +7,9 @@ on:
   push:
   pull_request:
 
-permissions: {}
+# contents:read is required to check out / query a private repository
+permissions:
+  contents: read
 
 concurrency:
   group: validate-${{ github.workflow }}-${{ github.ref }}
