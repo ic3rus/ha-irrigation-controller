@@ -1,0 +1,41 @@
+"""Shared base class pinning the entity conventions for every platform.
+
+No platform is forwarded yet — the first concrete entities are the state
+projections (Story 1.5) and the season switch (Story 1.6). This class exists now
+so those platforms inherit the conventions instead of each restating them.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity import Entity
+
+from ..const import DOMAIN  # noqa: TID252
+
+if TYPE_CHECKING:
+    from homeassistant.config_entries import ConfigEntry
+
+
+class HaIrrigationControllerEntity(Entity):
+    """Base entity attached to the controller device.
+
+    `has_entity_name` lets the frontend compose "<device name> <entity name>", and
+    the name itself comes from `translation_key` — so no entity hardcodes a
+    user-visible string. The unique_id is derived from the entry id and a stable
+    key, never from a name the operator can change.
+    """
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+
+    def __init__(self, entry: ConfigEntry, key: str) -> None:
+        """Bind the entity to its config entry under a stable key."""
+        self._entry = entry
+        self._key = key
+        self._attr_unique_id = f"{entry.entry_id}_{key}"
+        self._attr_translation_key = key
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+        )

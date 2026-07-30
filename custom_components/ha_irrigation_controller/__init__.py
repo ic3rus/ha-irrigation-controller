@@ -15,6 +15,8 @@ from homeassistant.const import (
     __version__ as HA_VERSION,  # noqa: N812
 )
 from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.device_registry import DeviceEntryType
 
 from .const import DOMAIN, MIN_HA_MAJOR, MIN_HA_MINOR, MIN_HA_VERSION
 
@@ -31,7 +33,7 @@ class HaIrrigationRuntimeData:
 
 
 async def async_setup_entry(
-    hass: HomeAssistant,  # noqa: ARG001
+    hass: HomeAssistant,
     entry: HaIrrigationConfigEntry,
 ) -> bool:
     """Set up HA Irrigation Controller from a config entry."""
@@ -47,6 +49,16 @@ async def async_setup_entry(
                 "running": HA_VERSION,
             },
         )
+
+    # The controller is a virtual service device; zone devices will link to it
+    # via_device once zones become config subentries (Story 1.3).
+    dr.async_get(hass).async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, entry.entry_id)},
+        entry_type=DeviceEntryType.SERVICE,
+        manufacturer="ha-irrigation-controller",
+        name="Irrigation Controller",
+    )
 
     entry.runtime_data = HaIrrigationRuntimeData()
     return True
