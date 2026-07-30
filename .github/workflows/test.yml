@@ -38,7 +38,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           # requires-python (>= 3.14.2) is enforced at install time: the pinned
           # homeassistant refuses to install on an older patch release.
@@ -74,7 +74,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.14"
 
