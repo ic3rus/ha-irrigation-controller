@@ -1,0 +1,40 @@
+# --- Secrets / config sensible ---
+secrets.yaml
+*.pem
+*.key
+.env
+.env.*
+
+# --- Claude Code --- + Bmad
+.claude/*
+_bmad*
+_bmad-output/*
+
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# --- Home Assistant / ESPHome (artefacts locaux) ---
+.esphome/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# --- Éditeurs / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
