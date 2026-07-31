@@ -18,7 +18,13 @@ from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceEntryType
 
-from .const import DOMAIN, MIN_HA_MAJOR, MIN_HA_MINOR, MIN_HA_VERSION
+from .const import (
+    DOMAIN,
+    MIN_HA_MAJOR,
+    MIN_HA_MINOR,
+    MIN_HA_VERSION,
+    SUBENTRY_TYPE_ZONE,
+)
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -50,9 +56,16 @@ async def async_setup_entry(
             },
         )
 
-    # The controller is a virtual service device; zone devices will link to it
-    # via_device once zones become config subentries (Story 1.3).
-    dr.async_get(hass).async_get_or_create(
+    # The ONE update listener of this integration: every config change —
+    # options edit, zone subentry add/edit/remove (including UI deletion, which
+    # never touches flow code) — fires it, and it schedules a reload so the
+    # change applies without restarting HA (FR8). No flow performs its own
+    # reload; Story 1.7 will teach this seam to defer while a cycle runs.
+    entry.async_on_unload(entry.add_update_listener(_async_entry_updated))
+
+    device_registry = dr.async_get(hass)
+    # The controller is a virtual service device; zone devices link to it below.
+    device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, entry.entry_id)},
         entry_type=DeviceEntryType.SERVICE,
@@ -60,8 +73,40 @@ async def async_setup_entry(
         name="Irrigation Controller",
     )
 
+    # One device per zone subentry, keyed by the subentry id (the zone key
+    # everywhere, AD-8). Removal needs no manual cleanup: async_remove_subentry
+    # clears the subentry's devices and entities from both registries itself.
+    #
+    # Filtered by type rather than assuming every subentry is a zone: `zone` is
+    # the only type registered today, but a stored subentry of another type
+    # (restored backup, future type added without revisiting this loop) would
+    # otherwise silently acquire a zone device wired to the controller.
+    #
+    # ORDER CONTRACT: `entry.subentries` is insertion-ordered and persisted as
+    # an ordered list, and `get_subentries_of_type` preserves that order. THIS
+    # iteration order IS the watering order Story 1.4's sequencer consumes —
+    # it is the "explicit" zone order AC 2 requires. Editing a zone keeps its
+    # position; removing and re-adding one appends it at the end.
+    for subentry in entry.get_subentries_of_type(SUBENTRY_TYPE_ZONE):
+        device_registry.async_get_or_create(
+            config_entry_id=entry.entry_id,
+            config_subentry_id=subentry.subentry_id,
+            identifiers={(DOMAIN, subentry.subentry_id)},
+            via_device=(DOMAIN, entry.entry_id),
+            manufacturer="ha-irrigation-controller",
+            name=subentry.title,
+        )
+
     entry.runtime_data = HaIrrigationRuntimeData()
     return True
+
+
+async def _async_entry_updated(
+    hass: HomeAssistant,
+    entry: HaIrrigationConfigEntry,
+) -> None:
+    """Reload the entry on any config change — the restart-free half of FR8."""
+    hass.config_entries.async_schedule_reload(entry.entry_id)
 
 
 async def async_unload_entry(

@@ -8,7 +8,10 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceEntryType
 
-from custom_components.ha_irrigation_controller import HaIrrigationRuntimeData
+from custom_components.ha_irrigation_controller import (
+    HaIrrigationRuntimeData,
+    _async_entry_updated,
+)
 from custom_components.ha_irrigation_controller.const import (
     DOMAIN,
     MIN_HA_MAJOR,
@@ -51,6 +54,25 @@ async def test_setup_and_unload_entry(hass: HomeAssistant) -> None:
     # mypy narrowed entry.state to LOADED above and cannot see that async_unload
     # mutates it, hence the ignore.
     assert entry.state is ConfigEntryState.NOT_LOADED  # type: ignore[comparison-overlap]
+
+
+async def test_setup_registers_the_reload_listener(hass: HomeAssistant) -> None:
+    """Setup registers exactly one update listener: the reload-on-change seam.
+
+    Subentry add/edit/remove (including the UI delete button) only fire update
+    listeners — this listener is the ONLY path by which those changes take
+    effect without a restart (AC 5). It is unregistered on unload.
+    """
+    entry = controller_entry()
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.update_listeners == [_async_entry_updated]
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.update_listeners == []
 
 
 async def test_setup_creates_the_controller_device(hass: HomeAssistant) -> None:
