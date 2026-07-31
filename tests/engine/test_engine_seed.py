@@ -1,6 +1,9 @@
 """AD-1 seed tests: the engine package is importable without Home Assistant.
 
-The real engine suite (virtual clock, sequencer) arrives with Story 1.4.
+These three guards are structural and apply to every module ever added under
+`engine/` — the import-blocker walk and the AST scan pick up new modules with
+no edit here. The behavioural engine suite lives beside them in
+`test_plan.py`, `test_builder.py` and `test_sequencer.py`.
 """
 
 from __future__ import annotations
@@ -12,6 +15,8 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from tests.engine.common import VirtualClock
 
 if TYPE_CHECKING:
     from custom_components.ha_irrigation_controller.engine.ports import Clock
@@ -105,22 +110,13 @@ def test_engine_sources_never_import_homeassistant() -> None:
 
 
 def test_clock_port_accepts_virtual_clock() -> None:
-    """A trivial virtual clock satisfies the Clock port — time is injected.
+    """The suite's own virtual clock satisfies the Clock port — time is injected.
 
     Protocol conformance is a static claim: mypy (CI `Lint` workflow) is what
-    actually enforces the annotation below.
+    actually enforces the annotation below. It type-checks the ONE clock the
+    behavioural suites drive, so a change to that double cannot silently stop
+    satisfying the port.
     """
-
-    class VirtualClock:
-        def __init__(self, start: datetime) -> None:
-            self._now = start
-
-        def now(self) -> datetime:
-            return self._now
-
-        def advance_to(self, moment: datetime) -> None:
-            self._now = moment
-
     start = datetime(2026, 7, 30, 6, 0, tzinfo=UTC)
     clock: Clock = VirtualClock(start)
     assert clock.now() == start

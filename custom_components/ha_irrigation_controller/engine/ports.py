@@ -54,12 +54,21 @@ class JournalPort(Protocol):
 
 
 class AnomalyKind(StrEnum):
-    """What went wrong — the vocabulary the anomaly seam speaks (seed of AD-9)."""
+    """What went wrong — the vocabulary the anomaly seam speaks (seed of AD-9).
+
+    The four *_UNCONFIRMED kinds cover a port that reported failure AND a port
+    that raised: an adapter is supposed to translate its own exceptions into a
+    False outcome, but the engine cannot let a leaked one abort a cycle (AD-4),
+    so it treats a raise as "not confirmed" and adds an `error` key to the
+    context. JOURNAL_SAVE_FAILED has no confirmation equivalent — a journal
+    write either happened or did not.
+    """
 
     PUMP_ON_UNCONFIRMED = "pump_on_unconfirmed"
     PUMP_OFF_UNCONFIRMED = "pump_off_unconfirmed"
     VALVE_OPEN_UNCONFIRMED = "valve_open_unconfirmed"
     VALVE_CLOSE_UNCONFIRMED = "valve_close_unconfirmed"
+    JOURNAL_SAVE_FAILED = "journal_save_failed"
 
 
 class AnomalyPort(Protocol):

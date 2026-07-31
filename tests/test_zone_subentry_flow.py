@@ -430,6 +430,88 @@ async def test_reconfigure_rejects_cycle_overlap(hass: HomeAssistant) -> None:
     assert zone.data[CONF_MORNING_DURATION] == 25
 
 
+async def test_add_zone_blames_the_evening_duration_when_it_is_the_offender(
+    hass: HomeAssistant,
+) -> None:
+    """With the evening cycle first, its duration is the field to shrink.
+
+    The morning duration is at the schema minimum here, so flagging it would
+    hand the operator an error no edit of that field could ever clear.
+    """
+    entry = controller_entry(
+        {**CONTROLLER_OPTIONS, CONF_EVENING_START: "06:00:00"},
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_ZONE),
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={
+            **ZONE_INPUT,
+            CONF_MORNING_DURATION: 1,
+            CONF_EVENING_DURATION: 90,
+        },
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_EVENING_DURATION: "evening_cycle_overlap"}
+    assert not entry.subentries
+
+    # Recovery: an evening window closing before 07:00 creates the zone.
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={
+            **ZONE_INPUT,
+            CONF_MORNING_DURATION: 1,
+            CONF_EVENING_DURATION: 55,
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+    assert len(entry.subentries) == 1
+
+
+async def test_add_zone_still_works_when_a_sibling_zone_is_malformed(
+    hass: HomeAssistant,
+) -> None:
+    """One bad stored zone must not lock the operator out of the zone flows.
+
+    The proposal merges the new zone over its siblings, so a sibling the engine
+    cannot parse used to raise straight out of the step ("Unknown error
+    occurred") — leaving deletion, which bypasses flow code, as the only way
+    out.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[
+            zone_subentry_data("Zone A", "switch.zone_a_valve", morning_duration="ten"),
+        ],
+    )
+    entry.add_to_hass(hass)
+    assert not await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_ZONE),
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input=dict(ZONE_INPUT),
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+    assert len(entry.subentries) == 2
+
+
 async def test_options_flow_rejects_a_zone_valve_as_the_pump(
     hass: HomeAssistant,
 ) -> None:

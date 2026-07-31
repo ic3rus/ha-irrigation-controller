@@ -331,6 +331,82 @@ async def test_options_flow_rejects_overlapping_cycles(hass: HomeAssistant) -> N
     assert entry.options[CONF_EVENING_START] == "07:20:00"
 
 
+async def test_options_flow_blames_the_evening_cycle_when_it_is_the_offender(
+    hass: HomeAssistant,
+) -> None:
+    """The overlap rule is symmetric, so the error must follow the guilty cycle.
+
+    With the evening cycle starting first, its window is the one still watering
+    when the morning cycle is due. Flagging the morning start here would give
+    the operator a field no edit could clear.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[
+            # 15 evening minutes: an evening cycle at 06:50 runs to 07:05.
+            zone_subentry_data("Zone A", "switch.zone_a_valve"),
+        ],
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={**CONTROLLER_OPTIONS, CONF_EVENING_START: "06:50:00"},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_EVENING_START: "evening_cycle_overlap"}
+
+    # Recovery: an evening window that closes before the morning start saves.
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={**CONTROLLER_OPTIONS, CONF_EVENING_START: "06:45:00"},
+    )
+    await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_EVENING_START] == "06:45:00"
+
+
+async def test_options_flow_still_works_when_a_stored_zone_is_malformed(
+    hass: HomeAssistant,
+) -> None:
+    """The repair path must survive the data that broke the setup.
+
+    Malformed `.storage` data fails the setup loudly and the message tells the
+    operator to fix the reported field — through this very form. Letting the
+    engine's validation error escape the validator turned that into "Unknown
+    error occurred", making a recoverable bad zone unrecoverable.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[
+            zone_subentry_data("Zone A", "switch.zone_a_valve", rain_factor="wet"),
+        ],
+    )
+    entry.add_to_hass(hass)
+    assert not await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.SETUP_ERROR
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={**CONTROLLER_OPTIONS, CONF_MORNING_START: "07:30:00"},
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_MORNING_START] == "07:30:00"
+
+
 async def test_options_flow_rejects_identical_start_times(hass: HomeAssistant) -> None:
     """The start-time rule is enforced on edits too, not just on creation."""
     entry = controller_entry()

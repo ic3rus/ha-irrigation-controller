@@ -45,11 +45,12 @@ class ZoneRunStatus(StrEnum):
     FAILED = "failed"
 
 
-def _utc_iso(moment: datetime | None) -> str | None:
+def utc_iso(moment: datetime | None) -> str | None:
     """Serialize an aware datetime as a UTC ISO-8601 string (conventions).
 
     The engine works in HA-local time; UTC conversion happens ONLY here, at
-    the serialization boundary.
+    the serialization boundary. Public because the sequencer's own snapshot
+    (the deferred queue's reference instants) serializes through it too.
     """
     return None if moment is None else moment.astimezone(UTC).isoformat()
 
@@ -80,11 +81,11 @@ class ZoneRun:
             "name": self.name,
             "valve_entity_id": self.valve_entity_id,
             "duration_s": self.duration_s,
-            "planned_start": _utc_iso(self.planned_start),
-            "planned_end": _utc_iso(self.planned_end),
+            "planned_start": utc_iso(self.planned_start),
+            "planned_end": utc_iso(self.planned_end),
             "status": self.status.value,
-            "actual_start": _utc_iso(self.actual_start),
-            "actual_end": _utc_iso(self.actual_end),
+            "actual_start": utc_iso(self.actual_start),
+            "actual_end": utc_iso(self.actual_end),
             "open_confirmed": self.open_confirmed,
             "close_confirmed": self.close_confirmed,
         }
@@ -92,10 +93,24 @@ class ZoneRun:
 
 @dataclass(slots=True)
 class CycleRun:
-    """One cycle run: stable id, snapshotted parameters, per-zone runs."""
+    """One cycle run: stable id, snapshotted parameters, per-zone runs.
+
+    Two start instants, deliberately distinct:
+
+    - `configured_start` is the plan's derived start for this cycle on its
+      reference day — the operator's intent. It NEVER moves, so it is what
+      the cycle id and the irrigation day key off.
+    - `scheduled_start` is when this run is actually dispatched. It equals
+      `configured_start` for a cycle that starts on time, and the completion
+      instant of the preceding cycle for a deferred one (AD-4: delayed, never
+      skipped). Collapsing the two would either make a deferred cycle wait for
+      tomorrow's configured start or file a past-midnight cycle under the
+      wrong irrigation day.
+    """
 
     cycle_id: str
     kind: CycleKind
+    configured_start: datetime
     scheduled_start: datetime
     pump_entity_id: str
     zone_runs: tuple[ZoneRun, ...]
@@ -108,7 +123,8 @@ class CycleRun:
         return {
             "cycle_id": self.cycle_id,
             "kind": self.kind.value,
-            "scheduled_start": _utc_iso(self.scheduled_start),
+            "configured_start": utc_iso(self.configured_start),
+            "scheduled_start": utc_iso(self.scheduled_start),
             "pump_entity_id": self.pump_entity_id,
             "status": self.status.value,
             "pump_on_confirmed": self.pump_on_confirmed,
@@ -117,10 +133,19 @@ class CycleRun:
         }
 
 
-def cycle_id_for(kind: CycleKind, scheduled_start: datetime) -> str:
-    """Return the stable cycle id: irrigation day + kind, e.g. 2026-07-31-evening.
+def cycle_id_for(
+    kind: CycleKind,
+    configured_start: datetime,
+    occurrence: int = 1,
+) -> str:
+    """Return the cycle id: irrigation day + kind, e.g. 2026-07-31-evening.
 
     Deterministic on purpose so Epic 2's settlement can key idempotent writes
-    off it (AD-5); a run-now variant joins in Epic 2.
+    off it (AD-5) — which requires it to be UNIQUE as well. The deferral queue
+    accepts repeated requests for the same kind, so the second and later runs
+    of a kind on one irrigation day carry an occurrence suffix
+    (`2026-07-31-morning-2`). The first run of a kind keeps the bare id, so the
+    scheduled cycle every other feature keys off never changes shape.
     """
-    return f"{irrigation_day(scheduled_start).isoformat()}-{kind.value}"
+    base = f"{irrigation_day(configured_start).isoformat()}-{kind.value}"
+    return base if occurrence <= 1 else f"{base}-{occurrence}"

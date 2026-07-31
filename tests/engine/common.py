@@ -17,6 +17,8 @@ from custom_components.ha_irrigation_controller.engine.plan import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from custom_components.ha_irrigation_controller.engine.ports import AnomalyKind
 
 # The engine contract says "aware, HA-local". A fixed offset keeps the suite
@@ -30,9 +32,10 @@ def aware(
     second: int = 0,
     *,
     day: int = 31,
+    month: int = 7,
 ) -> datetime:
-    """Return an aware HA-local datetime on 2026-07-`day`."""
-    return datetime(2026, 7, day, hour, minute, second, tzinfo=TZ)
+    """Return an aware HA-local datetime on 2026-`month`-`day`."""
+    return datetime(2026, month, day, hour, minute, second, tzinfo=TZ)
 
 
 class VirtualClock:
@@ -51,35 +54,62 @@ class VirtualClock:
         self._now = moment
 
 
+class PortError(Exception):
+    """What a misbehaving adapter leaks instead of reporting failure."""
+
+
 class FakeSwitchPort:
-    """Records every command; commands listed in `failing` never confirm."""
+    """Records every command.
+
+    Commands listed in `failing` report not-confirmed; commands listed in
+    `raising` leak a `PortError` instead — a real adapter is supposed to
+    translate its own failures, and the engine must survive one that does not.
+    """
 
     def __init__(self) -> None:
         """Start with an empty command log and nothing failing."""
         self.commands: list[tuple[str, str]] = []
         self.failing: set[tuple[str, str]] = set()
+        self.raising: set[tuple[str, str]] = set()
 
     async def async_turn_on(self, entity_id: str) -> bool:
         """Record the on command and report its confirmation outcome."""
-        self.commands.append(("on", entity_id))
-        return ("on", entity_id) not in self.failing
+        return self._command("on", entity_id)
 
     async def async_turn_off(self, entity_id: str) -> bool:
         """Record the off command and report its confirmation outcome."""
-        self.commands.append(("off", entity_id))
-        return ("off", entity_id) not in self.failing
+        return self._command("off", entity_id)
+
+    def _command(self, action: str, entity_id: str) -> bool:
+        self.commands.append((action, entity_id))
+        if (action, entity_id) in self.raising:
+            msg = f"adapter blew up commanding {action} {entity_id}"
+            raise PortError(msg)
+        return (action, entity_id) not in self.failing
 
 
 class FakeJournalPort:
-    """Records a deep copy of every saved snapshot (the engine mutates state)."""
+    """Records a deep copy of every saved snapshot (the engine mutates state).
+
+    `observer`, when set, is called after each save — the seam a Story 1.5
+    adapter uses to re-arm its timer, and therefore the moment `next_wakeup()`
+    must be safe to call.
+    """
 
     def __init__(self) -> None:
         """Start with an empty snapshot log."""
         self.snapshots: list[dict[str, object]] = []
+        self.raising = False
+        self.observer: Callable[[], object] | None = None
 
     async def async_save(self, snapshot: dict[str, object]) -> None:
         """Record the snapshot as it was at save time."""
         self.snapshots.append(copy.deepcopy(snapshot))
+        if self.observer is not None:
+            self.observer()
+        if self.raising:
+            msg = "journal storage is unavailable"
+            raise PortError(msg)
 
 
 class FakeAnomalyPort:

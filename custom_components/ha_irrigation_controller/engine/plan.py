@@ -13,7 +13,7 @@ timezone-database lookups.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
@@ -102,12 +102,25 @@ def zone_windows(
     Each zone's start is the previous zone's end — the accumulation IS the
     "no start-time arithmetic for the operator" behavior (FR1). Zone order is
     the plan's order, exactly as given.
+
+    Durations are ELAPSED seconds, so the accumulation runs in UTC and the
+    windows are converted back to `start`'s timezone. Adding a `timedelta` to a
+    `ZoneInfo`-aware datetime is wall-clock arithmetic: across a spring-forward
+    a 3600 s zone would span 02:30+01:00 → 03:30+02:00 and receive no water at
+    all, and across a fall-back it would water twice as long.
     """
     windows: list[ZoneWindow] = []
-    cursor = start
+    local_tz = start.tzinfo
+    cursor = start.astimezone(UTC)
     for zone in plan.zones:
         end = cursor + timedelta(seconds=zone.duration_s(kind))
-        windows.append(ZoneWindow(zone_id=zone.zone_id, start=cursor, end=end))
+        windows.append(
+            ZoneWindow(
+                zone_id=zone.zone_id,
+                start=cursor.astimezone(local_tz),
+                end=end.astimezone(local_tz),
+            ),
+        )
         cursor = end
     return tuple(windows)
 
@@ -137,8 +150,8 @@ def _seconds_since_midnight(moment: time) -> int:
     return moment.hour * 3600 + moment.minute * 60 + moment.second
 
 
-def cycles_overlap(plan: ControllerPlan) -> bool:
-    """Report whether the two cycles' derived windows collide.
+def overlap_offender(plan: ControllerPlan) -> CycleKind | None:
+    """Return the cycle that runs into the other one, or None when they fit.
 
     Pinned rule (the contract, consumed by the config flows and pinned by
     tests for both orderings): compute BOTH cycle windows on the SAME calendar
@@ -146,14 +159,27 @@ def cycles_overlap(plan: ControllerPlan) -> bool:
     intervals intersect. This handles an evening start earlier than the
     morning start symmetrically, which the flows accept today (they only
     reject equality). A plan without a morning cycle never overlaps.
+
+    The offender is the cycle that starts EARLIER: its window is the one still
+    watering when the other one is due. Naming it is what lets the flows
+    attach the error to a field the operator can actually change — flagging
+    the morning duration when the evening window is the offender produces a
+    form no edit can clear.
     """
     if not plan.morning_enabled:
-        return False
+        return None
     morning_start = _seconds_since_midnight(plan.morning_start)
     evening_start = _seconds_since_midnight(plan.evening_start)
     morning_end = morning_start + plan.total_duration_s(CycleKind.MORNING)
     evening_end = evening_start + plan.total_duration_s(CycleKind.EVENING)
-    return max(morning_start, evening_start) < min(morning_end, evening_end)
+    if max(morning_start, evening_start) >= min(morning_end, evening_end):
+        return None
+    return CycleKind.MORNING if morning_start <= evening_start else CycleKind.EVENING
+
+
+def cycles_overlap(plan: ControllerPlan) -> bool:
+    """Report whether the two cycles' derived windows collide."""
+    return overlap_offender(plan) is not None
 
 
 def irrigation_day(scheduled_start: datetime) -> date:

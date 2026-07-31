@@ -9,16 +9,23 @@ stored derived state to invalidate.
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from custom_components.ha_irrigation_controller.engine.plan import (
     CycleKind,
     cycles_overlap,
     derive_schedule,
     irrigation_day,
+    overlap_offender,
     zone_windows,
 )
 from tests.engine.common import TZ, aware, make_plan, make_zone
+
+# A real tz database zone, used ONLY by the DST tests below: the rest of the
+# suite runs on a fixed offset, which by construction cannot expose wall-clock
+# vs elapsed-time bugs.
+PARIS = ZoneInfo("Europe/Paris")
 
 
 def test_zone_starts_accumulate_from_global_start() -> None:
@@ -173,6 +180,85 @@ def test_empty_plan_never_overlaps() -> None:
     """Zero zones means zero-length windows — no collision even at equal starts."""
     plan = make_plan(morning_start=time(7, 0), evening_start=time(7, 0))
     assert cycles_overlap(plan) is False
+
+
+def test_overlap_offender_is_the_cycle_that_starts_first() -> None:
+    """The offender is the window still watering when the other cycle is due.
+
+    The flows attach the error to the offender's field; naming the wrong one
+    produces a form the operator cannot clear by editing the flagged value.
+    """
+    morning_first = make_plan(
+        make_zone("zone-1", morning_s=1200),
+        make_zone("zone-2", valve="switch.zone_2_valve", morning_s=1200),
+        morning_start=time(7, 0),
+        evening_start=time(7, 30),
+    )
+    assert overlap_offender(morning_first) is CycleKind.MORNING
+
+    evening_first = make_plan(
+        make_zone(morning_s=600, evening_s=5400),
+        morning_start=time(7, 0),
+        evening_start=time(6, 0),
+    )
+    assert overlap_offender(evening_first) is CycleKind.EVENING
+
+    assert overlap_offender(make_plan(make_zone(morning_s=600))) is None
+
+
+def elapsed(start: datetime, end: datetime) -> timedelta:
+    """Return the REAL time between two aware datetimes.
+
+    Subtracting two datetimes that share one `tzinfo` object is wall-clock
+    arithmetic — Python ignores the common tzinfo — which is precisely the
+    trap these tests exist to catch, so they compare UTC instants instead.
+    """
+    return end.astimezone(UTC) - start.astimezone(UTC)
+
+
+def test_zone_windows_water_for_elapsed_time_across_spring_forward() -> None:
+    """A DST gap must not shorten watering — durations are elapsed seconds.
+
+    Wall-clock accumulation would make this 3600 s zone span 02:30+01:00 →
+    03:30+02:00, an elapsed time of ZERO: the zone would receive no water at
+    all on that one morning of the year.
+    """
+    plan = make_plan(make_zone(morning_s=3600))
+    start = datetime(2026, 3, 29, 2, 30, tzinfo=PARIS)
+
+    window = zone_windows(plan, CycleKind.MORNING, start)[0]
+
+    assert elapsed(window.start, window.end) == timedelta(seconds=3600)
+    # The wall clock legitimately shows a two-hour jump — that is the DST gap,
+    # not extra watering.
+    assert window.end.hour == 4  # 04:30 CEST — one real hour after 02:30 CET
+
+
+def test_zone_windows_water_for_elapsed_time_across_fall_back() -> None:
+    """The mirror case: a repeated hour must not double a zone's watering."""
+    plan = make_plan(make_zone(morning_s=3600))
+    start = datetime(2026, 10, 25, 2, 30, tzinfo=PARIS)
+
+    window = zone_windows(plan, CycleKind.MORNING, start)[0]
+
+    assert elapsed(window.start, window.end) == timedelta(seconds=3600)
+
+
+def test_zone_windows_stay_back_to_back_across_a_dst_boundary() -> None:
+    """Accumulation is unbroken: every zone still starts at the previous end."""
+    plan = make_plan(
+        make_zone("zone-1", morning_s=1800),
+        make_zone("zone-2", valve="switch.zone_2_valve", morning_s=1800),
+        make_zone("zone-3", valve="switch.zone_3_valve", morning_s=1800),
+    )
+    start = datetime(2026, 3, 29, 1, 45, tzinfo=PARIS)
+
+    windows = zone_windows(plan, CycleKind.MORNING, start)
+
+    assert windows[0].start == start
+    assert windows[1].start == windows[0].end
+    assert windows[2].start == windows[1].end
+    assert elapsed(start, windows[-1].end) == timedelta(seconds=5400)
 
 
 def test_irrigation_day_is_the_local_date_of_the_scheduled_start() -> None:

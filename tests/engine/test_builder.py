@@ -174,3 +174,48 @@ def test_empty_valve_fails_loud() -> None:
     """An empty valve entity id would hand the sequencer a dangling command."""
     with pytest.raises(PlanValidationError, match="valve_switch"):
         build_plan(OPTIONS, [zone_item(valve_switch="")])
+
+
+@pytest.mark.parametrize("blank", ["   ", "\t", " \n "])
+def test_whitespace_only_valve_fails_loud(blank: str) -> None:
+    """A blank-but-truthy string is storage drift, not a valid entity id."""
+    with pytest.raises(PlanValidationError, match="valve_switch"):
+        build_plan(OPTIONS, [zone_item(valve_switch=blank)])
+
+
+@pytest.mark.parametrize(
+    "malformed", ["zone_1_valve", "switch.", ".valve", "Switch.Zone", "switch.a.b"]
+)
+def test_malformed_entity_id_fails_loud(malformed: str) -> None:
+    """The valve must look like an entity id — the sequencer commands it verbatim."""
+    with pytest.raises(PlanValidationError, match="valve_switch"):
+        build_plan(OPTIONS, [zone_item(valve_switch=malformed)])
+
+
+def test_malformed_pump_entity_id_fails_loud() -> None:
+    """The pump goes through the same shape check as the valves."""
+    with pytest.raises(PlanValidationError, match="pump_switch"):
+        build_plan({**OPTIONS, "pump_switch": "pool_pump"}, [])
+
+
+def test_zone_valve_equal_to_the_pump_fails_loud() -> None:
+    """A zone driven by the pump switch breaks sequencing (FR2/FR3).
+
+    Flow-time guards catch this for data written through the UI; a restored
+    backup or a hand edit reaches the builder without ever passing one, and
+    the sequencer would switch the pump off as if it were a valve at the first
+    zone boundary — no pressure for the rest of the cycle, silently.
+    """
+    with pytest.raises(PlanValidationError, match="pump") as excinfo:
+        build_plan(OPTIONS, [zone_item(valve_switch="switch.pool_pump")])
+    assert "zone-1" in str(excinfo.value)
+
+
+def test_two_zones_sharing_one_valve_fails_loud() -> None:
+    """One valve per zone: two zones on one valve cannot sequence."""
+    with pytest.raises(PlanValidationError, match="already used") as excinfo:
+        build_plan(
+            OPTIONS,
+            [zone_item(), zone_item("zone-2", "Back Beds")],
+        )
+    assert "zone-2" in str(excinfo.value)

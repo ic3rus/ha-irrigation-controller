@@ -7,8 +7,10 @@ await engine.advance(clock.now())` — no sleeps, no wall clock, no HA.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
+from datetime import time
 
 from custom_components.ha_irrigation_controller.engine.plan import (
     ControllerPlan,
@@ -208,8 +210,16 @@ async def test_advance_mid_zone_is_a_noop() -> None:
 
 
 async def test_one_late_advance_performs_every_due_transition() -> None:
-    """A single advance far past the end drains the whole cycle (missed wakeups)."""
-    sequencer, switches, _, _ = make_sequencer(three_zone_plan())
+    """A single advance far past the end drains the whole cycle (missed wakeups).
+
+    KNOWN LIMITATION, pinned here deliberately rather than left implicit: every
+    elapsed boundary fires at the same instant, so each zone is opened and
+    closed with `actual_start == actual_end` and the cycle is recorded
+    COMPLETED having watered nothing. On real hardware that is a burst of
+    back-to-back relay commands, and Epic 2's ledger reads these run objects as
+    a completed cycle. Reviewed 2026-07-31 and kept as-is; see deferred-work.md.
+    """
+    sequencer, switches, _, anomalies = make_sequencer(three_zone_plan())
 
     await sequencer.request_cycle(CycleKind.MORNING, aware(7))
     await sequencer.advance(aware(9))
@@ -221,6 +231,12 @@ async def test_one_late_advance_performs_every_due_transition() -> None:
     assert run is not None
     assert run.status is CycleStatus.COMPLETED
     assert sequencer.next_wakeup() is None
+    # The limitation itself: zero elapsed watering, recorded as success.
+    for zone in run.zone_runs:
+        assert zone.status is ZoneRunStatus.COMPLETED
+        assert zone.actual_start == aware(9)
+        assert zone.actual_end == aware(9)
+    assert anomalies.reports == []
 
 
 async def test_failed_pump_on_continues_fail_wet() -> None:
@@ -468,3 +484,213 @@ async def test_snapshot_survives_zone_spec_replacement() -> None:
     assert run is not None
     assert run.zone_runs[0].duration_s == 600
     assert sequencer.next_wakeup() == aware(7)
+
+
+async def test_run_is_anchored_on_the_plans_configured_start() -> None:
+    """The plan's start time drives the schedule, not the caller's instant (FR1).
+
+    Story 1.5 arms `async_track_time_change` on the configured start, so `now`
+    normally coincides with it — but the plan is the single source of the
+    schedule (AD-6), and a timer that fires a little late must not shift every
+    zone window with it.
+    """
+    sequencer, _, _, _ = make_sequencer(three_zone_plan())
+
+    await sequencer.request_cycle(CycleKind.MORNING, aware(7, 0, 12))
+
+    run = sequencer.current_run
+    assert run is not None
+    assert run.configured_start == aware(7)
+    assert run.scheduled_start == aware(7)
+    assert run.zone_runs[0].planned_start == aware(7)
+    assert run.zone_runs[-1].planned_end == aware(7, 30)
+
+
+async def test_next_wakeup_is_safe_at_every_instant_the_engine_yields() -> None:
+    """The re-arm contract holds even mid-transition (no IndexError window).
+
+    A 1.5 adapter that persists then re-arms calls `next_wakeup()` from inside
+    the journal save — including the save issued between the last zone closing
+    and the cycle completing, when the zone index points past the last zone.
+    """
+    sequencer, _, journal, _ = make_sequencer(three_zone_plan())
+    clock = VirtualClock(aware(7))
+    seen: list[object] = []
+    journal.observer = lambda: seen.append(sequencer.next_wakeup())
+
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await run_to_idle(sequencer, clock)
+
+    assert seen  # the observer ran; no call raised
+    assert seen[-1] is None
+
+
+async def test_next_wakeup_is_safe_for_a_running_empty_cycle() -> None:
+    """A zero-zone run reaches RUNNING with no zone to point at."""
+    sequencer, _, journal, _ = make_sequencer(make_plan())
+    seen: list[object] = []
+    journal.observer = lambda: seen.append(sequencer.next_wakeup())
+
+    await sequencer.request_cycle(CycleKind.MORNING, aware(7))
+    await sequencer.advance(aware(7))
+
+    assert seen[-1] is None
+
+
+async def test_concurrent_advance_calls_do_not_interleave() -> None:
+    """Overlapping advances are serialized — no duplicate hardware commands.
+
+    Story 1.5's timer can fire while a previous advance is still awaiting a
+    state-verified service call; without serialization the two calls interleave
+    their mutations and command the same valve twice.
+    """
+    sequencer, switches, _, _ = make_sequencer(three_zone_plan())
+
+    await sequencer.request_cycle(CycleKind.MORNING, aware(7))
+    await asyncio.gather(sequencer.advance(aware(7)), sequencer.advance(aware(7)))
+
+    assert switches.commands == [("on", PUMP), ("on", VALVE_1)]
+    assert sequencer.next_wakeup() == aware(7, 10)
+
+
+async def test_a_switch_port_that_raises_is_treated_as_unconfirmed() -> None:
+    """A leaked adapter exception never aborts the cycle (AD-4).
+
+    Letting it propagate would abandon the run mid-flight with a valve open and
+    no re-arm — the one branch fail-wet forbids.
+    """
+    sequencer, switches, _, anomalies = make_sequencer(three_zone_plan())
+    switches.raising.add(("on", VALVE_1))
+    clock = VirtualClock(aware(7))
+
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await run_to_idle(sequencer, clock)
+
+    run = sequencer.last_run
+    assert run is not None
+    assert run.status is CycleStatus.COMPLETED
+    zone1, zone2, zone3 = run.zone_runs
+    assert zone1.status is ZoneRunStatus.FAILED
+    assert zone1.open_confirmed is False
+    assert zone2.status is ZoneRunStatus.COMPLETED
+    assert zone3.status is ZoneRunStatus.COMPLETED
+    kind, context = anomalies.reports[0]
+    assert kind is AnomalyKind.VALVE_OPEN_UNCONFIRMED
+    assert "PortError" in str(context["error"])
+
+
+async def test_a_journal_port_that_raises_reports_and_keeps_watering() -> None:
+    """A failed save is an anomaly, not a stopped cycle (NFR2 is best-effort)."""
+    sequencer, switches, journal, anomalies = make_sequencer(three_zone_plan())
+    journal.raising = True
+    clock = VirtualClock(aware(7))
+
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await run_to_idle(sequencer, clock)
+
+    run = sequencer.last_run
+    assert run is not None
+    assert run.status is CycleStatus.COMPLETED
+    assert switches.commands[0] == ("on", PUMP)
+    assert switches.commands[-1] == ("off", PUMP)
+    kinds = {kind for kind, _ in anomalies.reports}
+    assert kinds == {AnomalyKind.JOURNAL_SAVE_FAILED}
+
+
+async def test_repeated_requests_get_distinct_cycle_ids() -> None:
+    """Same-day runs of one kind stay distinguishable (AD-5 keys off the id).
+
+    The queue accepts repeats on purpose (Epic 2's run-now), so the id carries
+    an occurrence suffix rather than colliding.
+    """
+    plan = make_plan(make_zone("zone-1", valve=VALVE_1, morning_s=600))
+    sequencer, _, _, _ = make_sequencer(plan)
+    clock = VirtualClock(aware(7))
+
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    assert sequencer.deferred_kinds == (CycleKind.MORNING, CycleKind.MORNING)
+
+    ids: list[str] = []
+    while (moment := sequencer.next_wakeup()) is not None:
+        clock.advance_to(moment)
+        await sequencer.advance(clock.now())
+        run = sequencer.last_run
+        if run is not None and run.cycle_id not in ids:
+            ids.append(run.cycle_id)
+
+    assert ids == [
+        "2026-07-31-morning",
+        "2026-07-31-morning-2",
+        "2026-07-31-morning-3",
+    ]
+
+
+async def test_a_cycle_deferred_across_midnight_keeps_its_irrigation_day() -> None:
+    """Day attribution follows the configured start, never the dispatch instant.
+
+    `irrigation_day` is THE helper FR12's waiver, FR18's resume and FR21's
+    re-run window all key off; a deferred evening cycle that happens to start
+    after midnight still belongs to the day it was scheduled for.
+    """
+    plan = make_plan(
+        make_zone("zone-1", valve=VALVE_1, morning_s=600, evening_s=600),
+        morning_start=time(23, 55),
+        evening_start=time(20, 0),
+    )
+    sequencer, _, _, _ = make_sequencer(plan)
+    clock = VirtualClock(aware(23, 55))
+
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await sequencer.advance(clock.now())
+    await sequencer.request_cycle(CycleKind.EVENING, clock.now())
+
+    await run_to_idle(sequencer, clock)
+
+    run = sequencer.last_run
+    assert run is not None
+    assert run.kind is CycleKind.EVENING
+    # Dispatched after midnight, still filed under the day it was requested for.
+    assert run.scheduled_start == aware(0, 5, day=1, month=8)
+    assert run.configured_start == aware(20)
+    assert run.cycle_id == "2026-07-31-evening"
+
+
+async def test_journal_snapshot_carries_what_a_restore_needs() -> None:
+    """The snapshot must be restorable, not merely displayable.
+
+    `zone_index` is the only thing that says which zone is currently open (a
+    FAILED zone looks identical whether it is the live slot or a finished one),
+    and the completed run must survive the creation of a deferred one.
+    """
+    plan = make_plan(
+        make_zone("zone-1", valve=VALVE_1, morning_s=600, evening_s=600),
+        make_zone("zone-2", valve=VALVE_2, morning_s=600, evening_s=600),
+    )
+    sequencer, _, journal, _ = make_sequencer(plan)
+    clock = VirtualClock(aware(7))
+
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await sequencer.advance(clock.now())
+    await sequencer.request_cycle(CycleKind.EVENING, clock.now())
+
+    pending = journal.snapshots[-1]
+    assert pending["zone_index"] == 0
+    assert pending["deferred"] == [
+        {"kind": "evening", "reference": "2026-07-31T05:00:00+00:00"},
+    ]
+
+    clock.advance_to(aware(7, 10))
+    await sequencer.advance(clock.now())
+    assert journal.snapshots[-1]["zone_index"] == 1
+
+    await run_to_idle(sequencer, clock)
+    final = journal.snapshots[-1]
+    json.dumps(final)  # still serializable with the added fields
+    last_run = final["last_run"]
+    assert isinstance(last_run, dict)
+    assert last_run["cycle_id"] == "2026-07-31-morning"
+    active = final["run"]
+    assert isinstance(active, dict)
+    assert active["cycle_id"] == "2026-07-31-evening"

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import time
 from typing import TYPE_CHECKING, Any
 
+import pytest
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceEntryType
@@ -16,16 +17,22 @@ from custom_components.ha_irrigation_controller import (
 )
 from custom_components.ha_irrigation_controller.const import (
     DOMAIN,
+    MAX_RAIN_FACTOR,
     MAX_ZONE_DURATION_MINUTES,
     MIN_HA_MAJOR,
     MIN_HA_MINOR,
     MIN_HA_VERSION,
+    MIN_RAIN_FACTOR,
+    MIN_ZONE_DURATION_MINUTES,
+)
+from custom_components.ha_irrigation_controller.engine.config import (
+    PlanValidationError,
+    build_plan,
 )
 from custom_components.ha_irrigation_controller.engine.plan import ControllerPlan
 from tests.common import CONTROLLER_OPTIONS, controller_entry, zone_subentry_data
 
 if TYPE_CHECKING:
-    import pytest
     from homeassistant.core import HomeAssistant
 
 _MODULE = "custom_components.ha_irrigation_controller"
@@ -167,12 +174,42 @@ async def test_setup_fails_loudly_on_malformed_stored_zone(
     assert "Zone A" in entry.reason
 
 
-async def test_engine_duration_bounds_agree_with_const(hass: HomeAssistant) -> None:
-    """The engine's own duration bounds match const.py's UI bounds.
+@pytest.mark.parametrize(
+    ("key", "inside", "outside"),
+    [
+        ("morning_duration", MIN_ZONE_DURATION_MINUTES, MIN_ZONE_DURATION_MINUTES - 1),
+        ("morning_duration", MAX_ZONE_DURATION_MINUTES, MAX_ZONE_DURATION_MINUTES + 1),
+        ("evening_duration", MIN_ZONE_DURATION_MINUTES, MIN_ZONE_DURATION_MINUTES - 1),
+        ("evening_duration", MAX_ZONE_DURATION_MINUTES, MAX_ZONE_DURATION_MINUTES + 1),
+        ("rain_factor", MIN_RAIN_FACTOR, MIN_RAIN_FACTOR - 0.1),
+        ("rain_factor", MAX_RAIN_FACTOR, MAX_RAIN_FACTOR + 0.1),
+    ],
+)
+def test_every_engine_bound_agrees_with_const(
+    key: str,
+    inside: float,
+    outside: float,
+) -> None:
+    """Each const.py bound is exactly the engine's own bound, on both edges.
 
     The engine cannot import const.py (it must stay importable hass-free as a
-    standalone package), so the bounds are duplicated — this pins them equal:
-    the const maximum loads, one past it fails.
+    standalone package), so all four bounds are duplicated there. Pinning only
+    one of them — as this suite did until the 1.4 review — leaves the other
+    three free to drift apart from the UI selectors silently.
+    """
+    zone = dict(zone_subentry_data("Zone A", "switch.zone_a_valve")["data"])
+
+    build_plan(CONTROLLER_OPTIONS, [("zone-1", "Zone A", {**zone, key: inside})])
+
+    with pytest.raises(PlanValidationError, match=key):
+        build_plan(CONTROLLER_OPTIONS, [("zone-1", "Zone A", {**zone, key: outside})])
+
+
+async def test_engine_duration_bounds_agree_with_const(hass: HomeAssistant) -> None:
+    """The const maximum loads through the real setup path, one past it fails.
+
+    The bound values themselves are pinned above; this one proves the builder
+    the entry actually goes through is the one carrying them.
     """
     at_max = _entry_with_zones(
         zone_subentry_data(
