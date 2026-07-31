@@ -88,7 +88,13 @@ async def add_zone(
     name: str = "Front Lawn",
     valve: str = "switch.zone_1_valve",
 ) -> ConfigSubentry:
-    """Add a zone through the real subentry flow and return the created subentry."""
+    """Add a zone through the real subentry flow and return the created subentry.
+
+    The returned `ConfigSubentry` is the LIVE object out of `entry.subentries`,
+    and `async_update_subentry` mutates it in place — so any later "unchanged?"
+    assertion must compare against a snapshot (`dict(zone.data)`) taken before
+    the mutation, never against the returned object itself.
+    """
     result = await hass.config_entries.subentries.async_init(
         (entry.entry_id, SUBENTRY_TYPE_ZONE),
         context={"source": config_entries.SOURCE_USER},

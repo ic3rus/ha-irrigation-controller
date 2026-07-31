@@ -36,6 +36,11 @@ DEFAULT_EVENING_START = "20:00:00"
 # Zone configuration — one config subentry per zone (AD-8). The subentry id is
 # the zone key everywhere (journal, payloads, entities); the operator-given name
 # is the subentry TITLE, never stored in data.
+#
+# ORDER CONTRACT: `entry.get_subentries_of_type(SUBENTRY_TYPE_ZONE)` returns
+# zones in insertion order, which persists across restarts (subentries are
+# stored as an ordered list). That order IS the watering order — the sequencer
+# iterates it as-is. Editing keeps a zone's position; remove + re-add appends.
 SUBENTRY_TYPE_ZONE = "zone"
 CONF_VALVE_SWITCH = "valve_switch"
 CONF_MORNING_DURATION = "morning_duration"

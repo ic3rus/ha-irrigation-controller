@@ -84,10 +84,14 @@
             },
             "error": {
                 "valve_is_pump": "This is the pump switch, not a zone valve. Pick the switch that opens this zone's own valve.",
-                "valve_already_configured": "Another zone already uses this valve. Each zone needs its own valve switch."
+                "valve_already_configured": "Another zone already uses this valve. Each zone needs its own valve switch.",
+                "valve_not_found": "That valve no longer exists. Pick a switch that is currently available.",
+                "name_required": "Give this zone a name. It is how the zone appears on its device, the dashboard card and in notifications.",
+                "name_already_configured": "Another zone already has this name. Pick a name that tells the two apart."
             },
             "abort": {
-                "reconfigure_successful": "The zone has been updated."
+                "reconfigure_successful": "The zone has been updated.",
+                "zone_not_found": "This zone no longer exists — it was deleted while you were editing it."
             }
         }
     },
@@ -117,7 +121,8 @@
             }
         },
         "error": {
-            "start_times_conflict": "The morning and evening cycles cannot start at the same time. Change one of them, or turn the morning cycle off."
+            "start_times_conflict": "The morning and evening cycles cannot start at the same time. Change one of them, or turn the morning cycle off.",
+            "pump_is_zone_valve": "This switch is already used as a zone's valve. Pick the switch that powers the pump, not one that opens a valve."
         }
     },
     "exceptions": {

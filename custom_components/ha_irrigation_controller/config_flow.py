@@ -17,6 +17,7 @@ flow code).
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any
 
 import voluptuous as vol
@@ -26,6 +27,7 @@ from homeassistant.config_entries import (
     ConfigSubentryFlow,
     OptionsFlow,
     SubentryFlowResult,
+    UnknownSubEntry,
 )
 from homeassistant.const import (
     CONF_NAME,
@@ -33,8 +35,8 @@ from homeassistant.const import (
     MINOR_VERSION as HA_MINOR_VERSION,
     __version__ as HA_VERSION,  # noqa: N812
 )
-from homeassistant.core import callback
-from homeassistant.helpers import config_validation as cv
+from homeassistant.core import callback, valid_entity_id
+from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.selector import (
     BooleanSelector,
     EntitySelector,
@@ -77,6 +79,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from homeassistant.config_entries import ConfigEntry
+    from homeassistant.core import HomeAssistant
 
 # device_class filter strings. Kept as literals rather than importing
 # SensorDeviceClass so the integration declares no dependency on the sensor
@@ -88,8 +91,29 @@ _DEVICE_CLASS_TEMPERATURE = "temperature"
 _DEVICE_CLASS_HUMIDITY = "humidity"
 
 ERROR_START_TIMES_CONFLICT = "start_times_conflict"
+ERROR_PUMP_IS_ZONE_VALVE = "pump_is_zone_valve"
 ERROR_VALVE_IS_PUMP = "valve_is_pump"
 ERROR_VALVE_ALREADY_CONFIGURED = "valve_already_configured"
+ERROR_VALVE_NOT_FOUND = "valve_not_found"
+ERROR_NAME_REQUIRED = "name_required"
+ERROR_NAME_ALREADY_CONFIGURED = "name_already_configured"
+
+
+def _resolve_entity_id(hass: HomeAssistant, value: str) -> str:
+    """Return `value` as an entity_id, resolving an entity-registry id if needed.
+
+    `EntitySelector` runs `cv.entity_id_or_uuid` and returns a registry id
+    BEFORE it applies the `domain` filter (verified in helpers/selector.py), so
+    a non-frontend submission can carry a registry id that no string comparison
+    in this module would ever match — silently defeating the pump/valve guards.
+    Resolving here keeps the stored contract "entity_ids everywhere" while
+    preserving the rename resilience registry ids exist for. An id that resolves
+    to nothing is left untouched and rejected by the validators below.
+    """
+    if valid_entity_id(value):
+        return value
+    registry_entry = er.async_get(hass).async_get(value)
+    return registry_entry.entity_id if registry_entry is not None else value
 
 
 def build_controller_schema() -> vol.Schema:
@@ -141,35 +165,62 @@ def build_controller_schema() -> vol.Schema:
     )
 
 
-def _normalize_start_times(user_input: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy with both start times as canonical `HH:MM:SS` strings.
+def _normalize_controller_input(
+    hass: HomeAssistant,
+    user_input: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a copy with canonical `HH:MM:SS` times and a resolved pump entity.
 
     `cv.time` (the validator behind `TimeSelector`) accepts `"20:00"` and
     `"20:0:0"` as well as `"20:00:00"`, so a non-frontend submission could
     otherwise store a string violating the documented options contract — or
     sneak two representations of the same instant past the equality check.
+
+    The pump is resolved to an entity_id for the same reason zone valves are:
+    the two are compared as strings by both flows, and a registry id on either
+    side would make that comparison silently miss.
     """
     return {
         **user_input,
+        CONF_PUMP_SWITCH: _resolve_entity_id(hass, user_input[CONF_PUMP_SWITCH]),
         CONF_MORNING_START: cv.time(user_input[CONF_MORNING_START]).isoformat(),
         CONF_EVENING_START: cv.time(user_input[CONF_EVENING_START]).isoformat(),
     }
 
 
-def validate_controller_input(user_input: Mapping[str, Any]) -> dict[str, str]:
+def validate_controller_input(
+    user_input: Mapping[str, Any],
+    *,
+    entry: ConfigEntry | None = None,
+) -> dict[str, str]:
     """Return form errors for a submitted controller form, empty when valid.
 
-    Expects start times already canonicalized by `_normalize_start_times`, which
-    is what makes the string equality below a comparison of instants.
+    Expects input already canonicalized by `_normalize_controller_input`, which
+    is what makes the string equalities below comparisons of instants and of
+    entities.
+
+    `entry` is None during initial setup (no zones can exist yet) and the live
+    entry from the options flow. The pump/valve exclusion is enforced from BOTH
+    sides on purpose: guarding it only in the zone flow would let the options
+    form point the pump at an existing zone valve, which not only breaks
+    sequencing (FR2/FR3) but wedges that zone — its own reconfigure resubmits
+    its valve, which would then trip `valve_is_pump` with no way out.
     """
-    if not user_input.get(CONF_MORNING_ENABLED):
-        # A disabled morning cycle cannot collide with anything.
-        return {}
-    if user_input.get(CONF_MORNING_START) == user_input.get(CONF_EVENING_START):
+    errors: dict[str, str] = {}
+    if entry is not None:
+        pump = user_input.get(CONF_PUMP_SWITCH)
+        for subentry in entry.get_subentries_of_type(SUBENTRY_TYPE_ZONE):
+            if subentry.data.get(CONF_VALVE_SWITCH) == pump:
+                errors[CONF_PUMP_SWITCH] = ERROR_PUMP_IS_ZONE_VALVE
+                break
+    if user_input.get(CONF_MORNING_ENABLED) and user_input.get(
+        CONF_MORNING_START,
+    ) == user_input.get(CONF_EVENING_START):
         # Two enabled cycles at the same instant would double-fire the pump.
         # Attached to the morning field so the form highlights what to change.
-        return {CONF_MORNING_START: ERROR_START_TIMES_CONFLICT}
-    return {}
+        # A disabled morning cycle cannot collide with anything.
+        errors[CONF_MORNING_START] = ERROR_START_TIMES_CONFLICT
+    return errors
 
 
 def build_zone_schema() -> vol.Schema:
@@ -224,17 +275,37 @@ def build_zone_schema() -> vol.Schema:
     )
 
 
-def _normalize_zone_input(user_input: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy honoring the units contract: int minutes, float min/mm.
+def _round_minutes(value: float) -> int:
+    """Return `value` rounded half-UP to whole minutes.
+
+    Bare `round()` is half-to-EVEN, so `10.5` and `11.5` would round in
+    opposite directions — an arbitrary result for a duration the operator can
+    see. The selector has already clamped the value to
+    MIN_ZONE_DURATION_MINUTES..MAX_ZONE_DURATION_MINUTES (both positive), so
+    the `+ 0.5` floor is safe and cannot escape those bounds.
+    """
+    return math.floor(value + 0.5)
+
+
+def _normalize_zone_input(
+    hass: HomeAssistant,
+    user_input: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a copy honoring the stored contracts for every zone field.
 
     `NumberSelector` coerces to float and does not enforce `step` server-side,
     so a frontend submission arrives as `10.0` and a websocket one could carry
     `10.7` — the stored contract (and Story 1.4's parser) wants int minutes.
+    The name is stripped because it becomes the subentry title and the zone
+    device name, and the valve is resolved to an entity_id so the guards in
+    `validate_zone_input` compare like with like.
     """
     return {
         **user_input,
-        CONF_MORNING_DURATION: round(user_input[CONF_MORNING_DURATION]),
-        CONF_EVENING_DURATION: round(user_input[CONF_EVENING_DURATION]),
+        CONF_NAME: str(user_input[CONF_NAME]).strip(),
+        CONF_VALVE_SWITCH: _resolve_entity_id(hass, user_input[CONF_VALVE_SWITCH]),
+        CONF_MORNING_DURATION: _round_minutes(user_input[CONF_MORNING_DURATION]),
+        CONF_EVENING_DURATION: _round_minutes(user_input[CONF_EVENING_DURATION]),
         CONF_RAIN_FACTOR: float(user_input[CONF_RAIN_FACTOR]),
     }
 
@@ -247,20 +318,38 @@ def validate_zone_input(
 ) -> dict[str, str]:
     """Return form errors for a submitted zone form, empty when valid.
 
-    Both guards protect sequencing (FR2/FR3): a "valve" that is actually the
-    pump, or one valve driven by two zones, cannot sequence correctly. Entity
-    ids are compared as stored strings — the WS API can bypass the frontend
-    picker, so no trust in what the selector "would have" offered.
+    The valve guards protect sequencing (FR2/FR3): a "valve" that is actually
+    the pump, or one valve driven by two zones, cannot sequence correctly. The
+    name guards protect identity: the subentry id is the zone key in code, but
+    the name is the ONLY thing that distinguishes two zones for the operator
+    (device list, dashboard card, notifications), so it must be present and
+    unique. Names are compared case-insensitively — "Lawn" and "lawn" are the
+    same zone to a human reading a notification.
+
+    Everything is compared as stored strings: the WS API can bypass the
+    frontend picker, so no trust in what the selector "would have" offered.
+    Expects input already normalized by `_normalize_zone_input`.
     """
+    name = user_input[CONF_NAME]
+    if not name:
+        # `TextSelector` is `vol.Schema(str)`: "" and "   " both validate.
+        return {CONF_NAME: ERROR_NAME_REQUIRED}
     valve = user_input[CONF_VALVE_SWITCH]
+    if not valid_entity_id(valve):
+        # A registry id `_resolve_entity_id` could not resolve — it references
+        # nothing, so storing it would hand Story 1.4 a dangling valve.
+        return {CONF_VALVE_SWITCH: ERROR_VALVE_NOT_FOUND}
     if valve == entry.options.get(CONF_PUMP_SWITCH):
         return {CONF_VALVE_SWITCH: ERROR_VALVE_IS_PUMP}
-    for subentry in entry.subentries.values():
+    for subentry in entry.get_subentries_of_type(SUBENTRY_TYPE_ZONE):
         if subentry.subentry_id == exclude_subentry_id:
-            # A zone keeping its own valve on reconfigure is not a duplicate.
+            # A zone keeping its own valve or name on reconfigure is not a
+            # duplicate of itself.
             continue
         if subentry.data.get(CONF_VALVE_SWITCH) == valve:
             return {CONF_VALVE_SWITCH: ERROR_VALVE_ALREADY_CONFIGURED}
+        if subentry.title.casefold() == name.casefold():
+            return {CONF_NAME: ERROR_NAME_ALREADY_CONFIGURED}
     return {}
 
 
@@ -306,7 +395,8 @@ class HaIrrigationControllerConfigFlow(ConfigFlow, domain=DOMAIN):
 
         errors: dict[str, str] = {}
         if user_input is not None:
-            user_input = _normalize_start_times(user_input)
+            user_input = _normalize_controller_input(self.hass, user_input)
+            # No entry yet, so no zones can exist to cross-check the pump against.
             errors = validate_controller_input(user_input)
             if not errors:
                 # data={} on purpose: nothing about this controller is immutable,
@@ -344,7 +434,7 @@ class ZoneSubentryFlow(ConfigSubentryFlow):
         """Add a zone: collect its configuration and create the subentry."""
         errors: dict[str, str] = {}
         if user_input is not None:
-            user_input = _normalize_zone_input(user_input)
+            user_input = _normalize_zone_input(self.hass, user_input)
             errors = validate_zone_input(self._get_entry(), user_input)
             if not errors:
                 # No unique_id: zones have no natural one — duplicate-valve
@@ -368,10 +458,17 @@ class ZoneSubentryFlow(ConfigSubentryFlow):
         user_input: dict[str, Any] | None = None,
     ) -> SubentryFlowResult:
         """Edit a zone: show its current configuration prefilled, then update it."""
-        subentry = self._get_reconfigure_subentry()
+        try:
+            subentry = self._get_reconfigure_subentry()
+        except UnknownSubEntry:
+            # The zone was deleted while this form was open — the UI delete
+            # button aborts no flow, so this is reachable from a second tab.
+            # Abort cleanly instead of letting UnknownSubEntry escape the step
+            # as an "Unknown error occurred" with a wedged dialog.
+            return self.async_abort(reason="zone_not_found")
         errors: dict[str, str] = {}
         if user_input is not None:
-            user_input = _normalize_zone_input(user_input)
+            user_input = _normalize_zone_input(self.hass, user_input)
             errors = validate_zone_input(
                 self._get_entry(),
                 user_input,
@@ -421,8 +518,8 @@ class HaIrrigationControllerOptionsFlow(OptionsFlow):
         """Show the controller form prefilled and store the edited options."""
         errors: dict[str, str] = {}
         if user_input is not None:
-            user_input = _normalize_start_times(user_input)
-            errors = validate_controller_input(user_input)
+            user_input = _normalize_controller_input(self.hass, user_input)
+            errors = validate_controller_input(user_input, entry=self.config_entry)
             if not errors:
                 return self.async_create_entry(title="", data=user_input)
 

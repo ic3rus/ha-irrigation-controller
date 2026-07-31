@@ -13,12 +13,13 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.const import CONF_NAME
 from homeassistant.data_entry_flow import FlowResultType
-from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ha_irrigation_controller.const import (
     CONF_EVENING_DURATION,
     CONF_MORNING_DURATION,
+    CONF_PUMP_SWITCH,
     CONF_RAIN_EXPOSED,
     CONF_RAIN_FACTOR,
     CONF_VALVE_SWITCH,
@@ -134,6 +135,258 @@ async def test_add_zone_normalizes_durations_to_int_minutes(
     assert isinstance(subentry.data[CONF_EVENING_DURATION], int)
 
 
+async def test_add_zone_rounds_half_minutes_up(hass: HomeAssistant) -> None:
+    """Half minutes round UP, in the same direction every time.
+
+    Bare `round()` is half-to-EVEN, so 10.5 would store 10 while 11.5 stores 12
+    — an arbitrary result for a duration the operator can read back.
+    """
+    entry = await _setup_controller(hass)
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_ZONE),
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={
+            **ZONE_INPUT,
+            CONF_MORNING_DURATION: 10.5,
+            CONF_EVENING_DURATION: 11.5,
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+
+    subentry = next(iter(entry.subentries.values()))
+    assert subentry.data[CONF_MORNING_DURATION] == 11
+    assert subentry.data[CONF_EVENING_DURATION] == 12
+
+
+async def test_add_zone_requires_a_name(hass: HomeAssistant) -> None:
+    """A blank name is rejected — it is the zone's only operator-facing identity.
+
+    `TextSelector` is `vol.Schema(str)`, so "" and "   " both pass the schema; a
+    websocket submission reaches the step with them. Storing one would name the
+    zone device after the config entry ("Irrigation Controller"), colliding with
+    the controller's own device.
+    """
+    entry = await _setup_controller(hass)
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_ZONE),
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={**ZONE_INPUT, CONF_NAME: "   "},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_NAME: "name_required"}
+
+    # Recovery: a real name creates the zone, stored stripped.
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={**ZONE_INPUT, CONF_NAME: "  Front Lawn  "},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+    assert next(iter(entry.subentries.values())).title == "Front Lawn"
+
+
+async def test_add_zone_rejects_duplicate_name(hass: HomeAssistant) -> None:
+    """Two zones cannot share a name — case-insensitively (AC 2).
+
+    The subentry id is the zone key in code, but the name is the ONLY thing
+    distinguishing two zones for the operator (device list, dashboard card,
+    notifications), so it has to be unique to be useful.
+    """
+    entry = await _setup_controller(hass)
+    await add_zone(hass, entry, name="Front Lawn", valve="switch.zone_1_valve")
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_ZONE),
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={
+            **ZONE_INPUT,
+            CONF_NAME: "front lawn",
+            CONF_VALVE_SWITCH: "switch.zone_2_valve",
+        },
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_NAME: "name_already_configured"}
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={
+            **ZONE_INPUT,
+            CONF_NAME: "Back Lawn",
+            CONF_VALVE_SWITCH: "switch.zone_2_valve",
+        },
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+    assert len(entry.subentries) == 2
+
+
+async def test_reconfigure_keeping_own_name_is_allowed(hass: HomeAssistant) -> None:
+    """A zone keeping its own name must not trip the duplicate-name check."""
+    entry = await _setup_controller(hass)
+    await add_zone(hass, entry, name="Zone 1", valve="switch.zone_1_valve")
+    zone2 = await add_zone(hass, entry, name="Zone 2", valve="switch.zone_2_valve")
+
+    result = await entry.start_subentry_reconfigure_flow(hass, zone2.subentry_id)
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={
+            **ZONE_INPUT,
+            CONF_NAME: "Zone 2",
+            CONF_VALVE_SWITCH: "switch.zone_2_valve",
+            CONF_MORNING_DURATION: 30,
+        },
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    await hass.async_block_till_done()
+
+    # Renaming onto the SIBLING's name is still rejected.
+    result = await entry.start_subentry_reconfigure_flow(hass, zone2.subentry_id)
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={
+            **ZONE_INPUT,
+            CONF_NAME: "Zone 1",
+            CONF_VALVE_SWITCH: "switch.zone_2_valve",
+        },
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_NAME: "name_already_configured"}
+
+
+async def test_add_zone_resolves_a_registry_id_to_its_entity_id(
+    hass: HomeAssistant,
+) -> None:
+    """A registry id is resolved before the guards, not stored raw.
+
+    `EntitySelector` runs `cv.entity_id_or_uuid` and returns a registry id
+    BEFORE applying its `domain` filter, so a websocket submission can carry one.
+    Left unresolved it would defeat every string comparison in the flow — and
+    hand Story 1.4 an id `hass.states.get()` knows nothing about.
+    """
+    entry = await _setup_controller(hass)
+    registry = er.async_get(hass)
+    valve = registry.async_get_or_create(
+        "switch", "test", "zone_1", suggested_object_id="zone_1_valve"
+    )
+    pump = registry.async_get_or_create(
+        "switch", "test", "pump", suggested_object_id="pool_pump"
+    )
+    assert pump.entity_id == CONTROLLER_OPTIONS[CONF_PUMP_SWITCH]
+
+    # The pump's registry id must trip valve_is_pump exactly like its entity_id.
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_ZONE),
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={**ZONE_INPUT, CONF_VALVE_SWITCH: pump.id},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_VALVE_SWITCH: "valve_is_pump"}
+
+    # A real valve's registry id is accepted and STORED as its entity_id.
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={**ZONE_INPUT, CONF_VALVE_SWITCH: valve.id},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+    subentry = next(iter(entry.subentries.values()))
+    assert subentry.data[CONF_VALVE_SWITCH] == valve.entity_id
+
+
+async def test_add_zone_rejects_an_unresolvable_registry_id(
+    hass: HomeAssistant,
+) -> None:
+    """A registry id matching no entity is rejected, not stored dangling."""
+    entry = await _setup_controller(hass)
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_ZONE),
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        # A well-formed registry id (32 hex chars) that is in no registry —
+        # `cv.entity_id_or_uuid` accepts it, so it reaches the step.
+        user_input={**ZONE_INPUT, CONF_VALVE_SWITCH: "0" * 32},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_VALVE_SWITCH: "valve_not_found"}
+
+
+async def test_reconfigure_aborts_when_the_zone_was_deleted(
+    hass: HomeAssistant,
+) -> None:
+    """A zone deleted while its form is open aborts cleanly (no traceback).
+
+    The UI delete button calls `async_remove_subentry` over websocket and
+    aborts no in-progress flow, so this is reachable from a second browser tab.
+    Unguarded, `_get_reconfigure_subentry()` raises `UnknownSubEntry` out of the
+    step and the operator gets "Unknown error occurred" with a wedged dialog.
+    """
+    entry = await _setup_controller(hass)
+    zone = await add_zone(hass, entry, name="Zone 1", valve="switch.zone_1_valve")
+
+    result = await entry.start_subentry_reconfigure_flow(hass, zone.subentry_id)
+    assert result["type"] is FlowResultType.FORM
+
+    assert hass.config_entries.async_remove_subentry(entry, zone.subentry_id)
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input=dict(ZONE_INPUT),
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "zone_not_found"
+
+
+async def test_options_flow_rejects_a_zone_valve_as_the_pump(
+    hass: HomeAssistant,
+) -> None:
+    """The pump/valve exclusion holds from the CONTROLLER side too (AC 1).
+
+    Guarding it only in the zone flow leaves the invariant defeatable through
+    the adjacent options form — and wedges the zone: its own reconfigure
+    resubmits its valve, which would then trip `valve_is_pump` with no way out.
+    """
+    entry = await _setup_controller(hass)
+    await add_zone(hass, entry, name="Zone 1", valve="switch.zone_1_valve")
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={**CONTROLLER_OPTIONS, CONF_PUMP_SWITCH: "switch.zone_1_valve"},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_PUMP_SWITCH: "pump_is_zone_valve"}
+    assert entry.options[CONF_PUMP_SWITCH] == CONTROLLER_OPTIONS[CONF_PUMP_SWITCH]
+
+    # Recovery: a switch no zone drives is accepted.
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={**CONTROLLER_OPTIONS, CONF_PUMP_SWITCH: "switch.other_pump"},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+    assert entry.options[CONF_PUMP_SWITCH] == "switch.other_pump"
+
+
 async def test_add_zone_rejects_pump_as_valve(hass: HomeAssistant) -> None:
     """A "valve" that is actually the pump cannot sequence — rejected (AC 1)."""
     entry = await _setup_controller(hass)
@@ -202,6 +455,10 @@ async def test_reconfigure_prefills_and_updates_only_that_zone(
     entry = await _setup_controller(hass)
     zone1 = await add_zone(hass, entry, name="Zone 1", valve="switch.zone_1_valve")
     zone2 = await add_zone(hass, entry, name="Zone 2", valve="switch.zone_2_valve")
+    # `add_zone` returns the LIVE ConfigSubentry and async_update_subentry mutates
+    # it in place, so every "unchanged?" assertion below must compare against a
+    # snapshot taken now — comparing the object with itself always passes.
+    zone1_id = zone1.subentry_id
     zone2_data_before = dict(zone2.data)
 
     result = await entry.start_subentry_reconfigure_flow(hass, zone1.subentry_id)
@@ -233,8 +490,9 @@ async def test_reconfigure_prefills_and_updates_only_that_zone(
     assert result["reason"] == "reconfigure_successful"
     await hass.async_block_till_done()
 
-    updated = entry.subentries[zone1.subentry_id]
-    assert updated.subentry_id == zone1.subentry_id
+    # Edited in place: same subentry id, so the zone key never changes (AC 3).
+    assert list(entry.subentries) == [zone1_id, zone2.subentry_id]
+    updated = entry.subentries[zone1_id]
     assert updated.title == "Zone 1 renamed"
     assert updated.data[CONF_MORNING_DURATION] == 20
     assert updated.data[CONF_EVENING_DURATION] == 25
@@ -242,6 +500,20 @@ async def test_reconfigure_prefills_and_updates_only_that_zone(
     sibling = entry.subentries[zone2.subentry_id]
     assert sibling.data == zone2_data_before
     assert sibling.title == "Zone 2"
+
+    # Renaming the zone renames its device. This rests on async_get_or_create
+    # forwarding `name=` into _async_update_device for an existing device —
+    # non-obvious semantics a refactor to `if device is None:` would break
+    # silently, leaving every renamed zone's device stuck on its old name.
+    registry = dr.async_get(hass)
+    zone1_device = registry.async_get_device(identifiers={(DOMAIN, zone1_id)})
+    assert zone1_device is not None
+    assert zone1_device.name == "Zone 1 renamed"
+    zone2_device = registry.async_get_device(
+        identifiers={(DOMAIN, zone2.subentry_id)},
+    )
+    assert zone2_device is not None
+    assert zone2_device.name == "Zone 2"
 
 
 async def test_reconfigure_keeping_own_valve_is_allowed(hass: HomeAssistant) -> None:
@@ -395,6 +667,15 @@ async def test_zone_count_is_unbounded(hass: HomeAssistant) -> None:
         assert device is not None
         assert device.via_device_id == controller_device.id
 
+    # Snapshot BEFORE the removal: `add_zone` returns the live ConfigSubentry,
+    # so `entry.subentries[id].data == zone.data` would compare the surviving
+    # object with itself and pass no matter what the removal did.
+    before = {
+        zone.subentry_id: (zone.title, dict(zone.data))
+        for zone in zones
+        if zone is not zones[2]
+    }
+
     # Removing a middle zone leaves the other four fully intact.
     middle = zones[2]
     assert hass.config_entries.async_remove_subentry(entry, middle.subentry_id)
@@ -402,11 +683,12 @@ async def test_zone_count_is_unbounded(hass: HomeAssistant) -> None:
 
     remaining = [zone for zone in zones if zone is not middle]
     assert list(entry.subentries) == [zone.subentry_id for zone in remaining]
-    for zone in remaining:
-        assert entry.subentries[zone.subentry_id].data == zone.data
+    for subentry_id, (title, data) in before.items():
+        survivor = entry.subentries[subentry_id]
+        assert survivor.title == title
+        assert survivor.data == data
         assert (
-            registry.async_get_device(identifiers={(DOMAIN, zone.subentry_id)})
-            is not None
+            registry.async_get_device(identifiers={(DOMAIN, subentry_id)}) is not None
         )
 
 
@@ -453,6 +735,7 @@ async def test_setup_creates_devices_for_preexisting_zones(
         subentries_data=[
             zone_subentry_data("Zone 1", "switch.zone_1_valve"),
             zone_subentry_data("Zone 2", "switch.zone_2_valve"),
+            zone_subentry_data("Zone 3", "switch.zone_3_valve"),
         ],
     )
     entry.add_to_hass(hass)
@@ -464,7 +747,7 @@ async def test_setup_creates_devices_for_preexisting_zones(
         identifiers={(DOMAIN, entry.entry_id)},
     )
     assert controller_device is not None
-    assert len(entry.subentries) == 2
+    assert len(entry.subentries) == 3
     for subentry in entry.subentries.values():
         device = registry.async_get_device(
             identifiers={(DOMAIN, subentry.subentry_id)},
@@ -472,3 +755,34 @@ async def test_setup_creates_devices_for_preexisting_zones(
         assert device is not None
         assert device.via_device_id == controller_device.id
         assert device.name == subentry.title
+
+
+async def test_zone_order_survives_the_storage_path(hass: HomeAssistant) -> None:
+    """Zone order is preserved when the entry is built from stored data (AC 2).
+
+    `test_zone_order_is_creation_order` pins the order within one live session;
+    Story 1.4's sequencer needs it to hold after a restart too. This builds the
+    entry from `subentries_data=` — the same shape the config-entry store
+    reloads — and pins that both the raw mapping and the typed accessor the
+    sequencer will call come back in the stored order.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[
+            zone_subentry_data("Zone A", "switch.zone_a_valve"),
+            zone_subentry_data("Zone B", "switch.zone_b_valve"),
+            zone_subentry_data("Zone C", "switch.zone_c_valve"),
+        ],
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    expected = ["Zone A", "Zone B", "Zone C"]
+    assert [s.title for s in entry.subentries.values()] == expected
+    assert [
+        s.title for s in entry.get_subentries_of_type(SUBENTRY_TYPE_ZONE)
+    ] == expected

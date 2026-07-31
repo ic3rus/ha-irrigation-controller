@@ -18,7 +18,13 @@ from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceEntryType
 
-from .const import DOMAIN, MIN_HA_MAJOR, MIN_HA_MINOR, MIN_HA_VERSION
+from .const import (
+    DOMAIN,
+    MIN_HA_MAJOR,
+    MIN_HA_MINOR,
+    MIN_HA_VERSION,
+    SUBENTRY_TYPE_ZONE,
+)
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -70,7 +76,18 @@ async def async_setup_entry(
     # One device per zone subentry, keyed by the subentry id (the zone key
     # everywhere, AD-8). Removal needs no manual cleanup: async_remove_subentry
     # clears the subentry's devices and entities from both registries itself.
-    for subentry in entry.subentries.values():
+    #
+    # Filtered by type rather than assuming every subentry is a zone: `zone` is
+    # the only type registered today, but a stored subentry of another type
+    # (restored backup, future type added without revisiting this loop) would
+    # otherwise silently acquire a zone device wired to the controller.
+    #
+    # ORDER CONTRACT: `entry.subentries` is insertion-ordered and persisted as
+    # an ordered list, and `get_subentries_of_type` preserves that order. THIS
+    # iteration order IS the watering order Story 1.4's sequencer consumes —
+    # it is the "explicit" zone order AC 2 requires. Editing a zone keeps its
+    # position; removing and re-adding one appends it at the end.
+    for subentry in entry.get_subentries_of_type(SUBENTRY_TYPE_ZONE):
         device_registry.async_get_or_create(
             config_entry_id=entry.entry_id,
             config_subentry_id=subentry.subentry_id,
