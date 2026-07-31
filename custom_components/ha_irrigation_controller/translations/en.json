@@ -87,7 +87,8 @@
                 "valve_already_configured": "Another zone already uses this valve. Each zone needs its own valve switch.",
                 "valve_not_found": "That valve no longer exists. Pick a switch that is currently available.",
                 "name_required": "Give this zone a name. It is how the zone appears on its device, the dashboard card and in notifications.",
-                "name_already_configured": "Another zone already has this name. Pick a name that tells the two apart."
+                "name_already_configured": "Another zone already has this name. Pick a name that tells the two apart.",
+                "cycles_overlap": "With this duration the morning cycle would still be watering when the evening cycle starts. Shorten a zone or move the start times apart."
             },
             "abort": {
                 "reconfigure_successful": "The zone has been updated.",
@@ -122,12 +123,16 @@
         },
         "error": {
             "start_times_conflict": "The morning and evening cycles cannot start at the same time. Change one of them, or turn the morning cycle off.",
-            "pump_is_zone_valve": "This switch is already used as a zone's valve. Pick the switch that powers the pump, not one that opens a valve."
+            "pump_is_zone_valve": "This switch is already used as a zone's valve. Pick the switch that powers the pump, not one that opens a valve.",
+            "cycles_overlap": "With these start times the morning cycle would still be watering when the evening cycle starts. Move the start times apart or shorten the zones."
         }
     },
     "exceptions": {
         "unsupported_ha_version": {
             "message": "HA Irrigation Controller requires Home Assistant {required} or newer; this instance runs {running}. Please update Home Assistant before setting up this integration."
+        },
+        "invalid_stored_config": {
+            "message": "The stored configuration is invalid and the schedule cannot be built from it: {detail}. Fix the reported field (or remove and re-add the zone) and reload the integration."
         }
     }
 }

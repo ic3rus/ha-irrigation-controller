@@ -8,6 +8,7 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.data_entry_flow import FlowResultType
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ha_irrigation_controller.const import (
     CONF_EVENING_START,
@@ -19,7 +20,7 @@ from custom_components.ha_irrigation_controller.const import (
     CONF_TEMPERATURE_SENSOR,
     DOMAIN,
 )
-from tests.common import CONTROLLER_OPTIONS, controller_entry
+from tests.common import CONTROLLER_OPTIONS, controller_entry, zone_subentry_data
 
 if TYPE_CHECKING:
     import pytest
@@ -289,6 +290,45 @@ async def test_options_flow_clears_optional_sensor(hass: HomeAssistant) -> None:
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert CONF_TEMPERATURE_SENSOR not in entry.options
     assert entry.options[CONF_HUMIDITY_SENSOR] == "sensor.outdoor_hum"
+
+
+async def test_options_flow_rejects_overlapping_cycles(hass: HomeAssistant) -> None:
+    """Times letting the morning schedule cross the evening start are rejected.
+
+    Uses the engine's overlap rule (Story 1.4, resolves the 1.2 deferral) —
+    the flow never duplicates the sum-of-durations math.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[
+            # Two zones at 10 morning minutes each: morning runs 07:00-07:20.
+            zone_subentry_data("Zone A", "switch.zone_a_valve"),
+            zone_subentry_data("Zone B", "switch.zone_b_valve"),
+        ],
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={**CONTROLLER_OPTIONS, CONF_EVENING_START: "07:15:00"},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_MORNING_START: "cycles_overlap"}
+
+    # Recovery: an evening start clear of the morning window saves.
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={**CONTROLLER_OPTIONS, CONF_EVENING_START: "07:20:00"},
+    )
+    await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_EVENING_START] == "07:20:00"
 
 
 async def test_options_flow_rejects_identical_start_times(hass: HomeAssistant) -> None:

@@ -18,6 +18,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ha_irrigation_controller.const import (
     CONF_EVENING_DURATION,
+    CONF_EVENING_START,
     CONF_MORNING_DURATION,
     CONF_PUMP_SWITCH,
     CONF_RAIN_EXPOSED,
@@ -354,6 +355,79 @@ async def test_reconfigure_aborts_when_the_zone_was_deleted(
     )
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "zone_not_found"
+
+
+async def _setup_tight_gap_controller(hass: HomeAssistant) -> MockConfigEntry:
+    """Set up a controller whose morning→evening gap is only 30 minutes.
+
+    With the morning cycle enabled at 07:00 and the evening at 07:30, any
+    morning-duration total above 30 minutes overlaps the evening window.
+    """
+    entry = controller_entry(
+        {**CONTROLLER_OPTIONS, CONF_EVENING_START: "07:30:00"},
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    return entry
+
+
+async def test_add_zone_rejects_cycle_overlap(hass: HomeAssistant) -> None:
+    """A zone pushing the morning window past the evening start is rejected.
+
+    Uses the engine's overlap rule (Story 1.4, resolves the 1.2 deferral) —
+    the flow never duplicates the sum-of-durations math.
+    """
+    entry = await _setup_tight_gap_controller(hass)
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_ZONE),
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={**ZONE_INPUT, CONF_MORNING_DURATION: 40},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_MORNING_DURATION: "cycles_overlap"}
+    assert not entry.subentries
+
+    # Recovery: a duration fitting the gap creates the zone.
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={**ZONE_INPUT, CONF_MORNING_DURATION: 20},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+    assert len(entry.subentries) == 1
+
+
+async def test_reconfigure_rejects_cycle_overlap(hass: HomeAssistant) -> None:
+    """Growing an existing zone past the evening start is rejected on edit.
+
+    The zone's own stored duration is excluded from the proposal — only the
+    submitted value counts, so shrinking back always remains possible.
+    """
+    entry = await _setup_tight_gap_controller(hass)
+    zone = await add_zone(hass, entry)
+
+    result = await entry.start_subentry_reconfigure_flow(hass, zone.subentry_id)
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={**ZONE_INPUT, CONF_MORNING_DURATION: 40},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_MORNING_DURATION: "cycles_overlap"}
+    assert zone.data[CONF_MORNING_DURATION] == 10
+
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={**ZONE_INPUT, CONF_MORNING_DURATION: 25},
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    await hass.async_block_till_done()
+    assert zone.data[CONF_MORNING_DURATION] == 25
 
 
 async def test_options_flow_rejects_a_zone_valve_as_the_pump(
