@@ -71,10 +71,18 @@ ZONE_DATA: dict[str, Any] = {
 }
 
 
-def zone_subentry_data(title: str, valve: str) -> ConfigSubentryData:
-    """Build setup-time subentry data the way the zone flow stores it."""
+def zone_subentry_data(
+    title: str,
+    valve: str,
+    **overrides: Any,
+) -> ConfigSubentryData:
+    """Build setup-time subentry data the way the zone flow stores it.
+
+    `overrides` land in the data mapping verbatim — including deliberately
+    malformed values for the load-time validation tests (Story 1.4).
+    """
     return ConfigSubentryData(
-        data={**ZONE_DATA, CONF_VALVE_SWITCH: valve},
+        data={**ZONE_DATA, CONF_VALVE_SWITCH: valve, **overrides},
         subentry_type=SUBENTRY_TYPE_ZONE,
         title=title,
         unique_id=None,

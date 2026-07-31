@@ -67,13 +67,21 @@ from .const import (
     DEFAULT_RAIN_FACTOR,
     DEFAULT_ZONE_DURATION_MINUTES,
     DOMAIN,
+    MAX_RAIN_FACTOR,
     MAX_ZONE_DURATION_MINUTES,
     MIN_HA_MAJOR,
     MIN_HA_MINOR,
     MIN_HA_VERSION,
+    MIN_RAIN_FACTOR,
     MIN_ZONE_DURATION_MINUTES,
     SUBENTRY_TYPE_ZONE,
 )
+
+# Importing the engine from the flows is the ALLOWED direction (the forbidden
+# one is engine → homeassistant.*): the overlap rule lives in ONE place and
+# the flows never duplicate its sum-of-durations math.
+from .engine.config import PlanValidationError, build_plan
+from .engine.plan import CycleKind, overlap_offender
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -97,6 +105,52 @@ ERROR_VALVE_ALREADY_CONFIGURED = "valve_already_configured"
 ERROR_VALVE_NOT_FOUND = "valve_not_found"
 ERROR_NAME_REQUIRED = "name_required"
 ERROR_NAME_ALREADY_CONFIGURED = "name_already_configured"
+# Two ids for one rule: the overlap is symmetric, so the offending cycle can be
+# either one, and the operator needs to be told which window to shrink. Same
+# error attached to a field that cannot clear it is an unusable form.
+ERROR_CYCLES_OVERLAP = "cycles_overlap"
+ERROR_EVENING_CYCLE_OVERLAP = "evening_cycle_overlap"
+
+
+def _overlap_error(
+    options: Mapping[str, Any],
+    zones: list[tuple[str, str, Mapping[str, Any]]],
+    *,
+    morning_field: str,
+    evening_field: str,
+) -> dict[str, str]:
+    """Return the overlap error for a proposed config, keyed on the guilty field.
+
+    Returns no error when the stored data cannot be turned into a plan at all.
+    That is not a silent pass: `async_setup_entry` already refused to load the
+    entry loudly, and its message sends the operator to these very forms to
+    repair the offending zone. Raising here instead would wedge the only repair
+    route the integration offers ("Unknown error occurred" on Configure and on
+    Add zone), turning a recoverable bad zone into an unrecoverable one.
+    """
+    try:
+        plan = build_plan(options, zones)
+    except PlanValidationError:
+        return {}
+    offender = overlap_offender(plan)
+    if offender is None:
+        return {}
+    if offender is CycleKind.MORNING:
+        return {morning_field: ERROR_CYCLES_OVERLAP}
+    return {evening_field: ERROR_EVENING_CYCLE_OVERLAP}
+
+
+def _zone_items(
+    entry: ConfigEntry,
+    *,
+    exclude_subentry_id: str | None = None,
+) -> list[tuple[str, str, Mapping[str, Any]]]:
+    """Return the entry's zones as the (id, title, data) items the engine consumes."""
+    return [
+        (subentry.subentry_id, subentry.title, subentry.data)
+        for subentry in entry.get_subentries_of_type(SUBENTRY_TYPE_ZONE)
+        if subentry.subentry_id != exclude_subentry_id
+    ]
 
 
 def _resolve_entity_id(hass: HomeAssistant, value: str) -> str:
@@ -220,6 +274,17 @@ def validate_controller_input(
         # Attached to the morning field so the form highlights what to change.
         # A disabled morning cycle cannot collide with anything.
         errors[CONF_MORNING_START] = ERROR_START_TIMES_CONFLICT
+    # The engine's overlap rule on the PROPOSED options over the stored zones
+    # (Story 1.4, resolves the 1.2 deferral). Initial setup has no zones —
+    # nothing to check (entry is None). When equality already claimed the
+    # morning field, it is the more specific message.
+    if entry is not None and CONF_MORNING_START not in errors:
+        errors |= _overlap_error(
+            user_input,
+            _zone_items(entry),
+            morning_field=CONF_MORNING_START,
+            evening_field=CONF_EVENING_START,
+        )
     return errors
 
 
@@ -264,8 +329,8 @@ def build_zone_schema() -> vol.Schema:
                 default=DEFAULT_RAIN_FACTOR,
             ): NumberSelector(
                 NumberSelectorConfig(
-                    min=0,
-                    max=10,
+                    min=MIN_RAIN_FACTOR,
+                    max=MAX_RAIN_FACTOR,
                     step=0.1,
                     mode=NumberSelectorMode.BOX,
                     unit_of_measurement="min/mm",
@@ -350,7 +415,19 @@ def validate_zone_input(
             return {CONF_VALVE_SWITCH: ERROR_VALVE_ALREADY_CONFIGURED}
         if subentry.title.casefold() == name.casefold():
             return {CONF_NAME: ERROR_NAME_ALREADY_CONFIGURED}
-    return {}
+    # The engine's overlap rule on the PROPOSED zone merged over its siblings
+    # (its own stored values excluded on reconfigure, so shrinking back always
+    # works). The error lands on the duration of whichever cycle runs into the
+    # other one — flagging the morning duration when the evening window is the
+    # offender gives the operator a field no edit can clear.
+    proposed = _zone_items(entry, exclude_subentry_id=exclude_subentry_id)
+    proposed.append(("proposed", name, _without_name(dict(user_input))))
+    return _overlap_error(
+        entry.options,
+        proposed,
+        morning_field=CONF_MORNING_DURATION,
+        evening_field=CONF_EVENING_DURATION,
+    )
 
 
 class HaIrrigationControllerConfigFlow(ConfigFlow, domain=DOMAIN):

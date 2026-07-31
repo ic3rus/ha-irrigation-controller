@@ -25,17 +25,27 @@ from .const import (
     MIN_HA_VERSION,
     SUBENTRY_TYPE_ZONE,
 )
+from .engine.config import PlanValidationError, build_plan
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
+
+    from .engine.plan import ControllerPlan
 
 type HaIrrigationConfigEntry = ConfigEntry[HaIrrigationRuntimeData]
 
 
 @dataclass
 class HaIrrigationRuntimeData:
-    """Runtime data placeholder; real engine wiring arrives in Story 1.4."""
+    """Non-persistent runtime objects for a loaded entry (AD-2).
+
+    Holds the validated engine plan only: the port implementations and the
+    running sequencer are wired by Story 1.5. Rebuilt on every reload, so a
+    config change always yields a fresh plan.
+    """
+
+    plan: ControllerPlan
 
 
 async def async_setup_entry(
@@ -55,6 +65,27 @@ async def async_setup_entry(
                 "running": HA_VERSION,
             },
         )
+
+    # Build and validate the engine plan BEFORE any side effect: data loaded
+    # from .storage (a restored backup, a hand edit, schema drift) is
+    # unvalidated, and a zone the engine cannot water correctly must fail the
+    # setup loudly (AD-4, NFR1) — never be skipped silently. Construction is
+    # cheap and side-effect-free, so the reload-per-config-change regime can
+    # afford it.
+    try:
+        plan = build_plan(
+            entry.options,
+            [
+                (subentry.subentry_id, subentry.title, subentry.data)
+                for subentry in entry.get_subentries_of_type(SUBENTRY_TYPE_ZONE)
+            ],
+        )
+    except PlanValidationError as err:
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="invalid_stored_config",
+            translation_placeholders={"detail": str(err)},
+        ) from err
 
     # The ONE update listener of this integration: every config change —
     # options edit, zone subentry add/edit/remove (including UI deletion, which
@@ -97,7 +128,7 @@ async def async_setup_entry(
             name=subentry.title,
         )
 
-    entry.runtime_data = HaIrrigationRuntimeData()
+    entry.runtime_data = HaIrrigationRuntimeData(plan=plan)
     return True
 
 
