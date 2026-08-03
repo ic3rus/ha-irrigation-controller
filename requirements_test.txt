@@ -5,6 +5,6 @@
 # PHCC release, and dependabot bumps this one line (it skips prereleases while
 # the current pin is not one), so "stable" stays stable.
 homeassistant==2026.7.4
-pytest-homeassistant-custom-component>=0.13.346,<0.14
+pytest-homeassistant-custom-component>=0.13.350,<0.14
 # Type checking needs the HA type stubs, so it lives with the test deps.
 mypy==2.3.0
