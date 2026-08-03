@@ -45,6 +45,7 @@ from custom_components.ha_irrigation_controller.const import (
 )
 from custom_components.ha_irrigation_controller.engine.plan import (
     ControllerPlan,
+    CycleKind,
     ZoneSpec,
 )
 from custom_components.ha_irrigation_controller.engine.ports import AnomalyKind
@@ -569,7 +570,6 @@ async def test_an_unconfirmed_actuation_raises_an_anomaly_and_the_cycle_continue
     Uses the configurable minimum so the wait is short; the hanging handler
     moves the clock past it.
     """
-    calls = register_hanging_valve(hass, freezer)
     freezer.move_to("2026-07-31 06:59:00+02:00")
     events: list[Event] = []
     unsubscribe = hass.bus.async_listen(EVENT_HA_IRRIGATION_CONTROLLER, events.append)
@@ -583,6 +583,9 @@ async def test_an_unconfirmed_actuation_raises_an_anomaly_and_the_cycle_continue
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
+    # After the setup: forwarding Platform.SWITCH registers the REAL switch
+    # services, and `async_register` is last-wins (see `register_switch_domain`).
+    calls = register_hanging_valve(hass, freezer)
 
     await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
     await drain_asyncio_timers(hass)
@@ -608,6 +611,234 @@ async def test_an_unconfirmed_actuation_raises_an_anomaly_and_the_cycle_continue
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
+
+
+async def test_season_off_makes_a_daily_start_arm_nothing_at_all(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    paris: None,
+) -> None:
+    """AC 1/2: the daily tracker stays armed; the engine's gate is what refuses.
+
+    A season toggle must NOT tear down or re-register the daily trackers (a
+    second arming path breaks AD-3), so the proof is on the other side: the
+    start really fires, and it creates no run and arms no point-in-time handle.
+    """
+    live = 0
+    real = getattr(timing, "async_track_point_in_time")  # noqa: B009 — an import, not an export
+
+    def _tracked(*args: Any, **kwargs: Any) -> Callable[[], None]:
+        nonlocal live
+        unsubscribe = real(*args, **kwargs)
+        live += 1
+
+        def _wrapped() -> None:
+            nonlocal live
+            live -= 1
+            unsubscribe()
+
+        return _wrapped
+
+    monkeypatch.setattr(timing, "async_track_point_in_time", _tracked)
+
+    calls = register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, sequencer = make_runner(hass, make_plan())
+    await runner.async_start()
+    await runner.async_set_season(enabled=False)
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+
+    assert sequencer.current_run is None
+    assert calls == []
+    assert live == 0
+    assert sequencer.next_wakeup() is None
+
+    # ...and turning it back on honours the very next daily start — the same
+    # day's evening one, so the assertion needs no clock jump across a second
+    # morning tracker.
+    await runner.async_set_season(enabled=True)
+    await fire_at(hass, freezer, "2026-07-31 20:00:00+02:00")
+
+    run = sequencer.current_run
+    assert run is not None
+    assert run.kind is CycleKind.EVENING
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls] == [
+        ("turn_on", PUMP),
+        ("turn_on", VALVE_1),
+    ]
+
+    runner.async_shutdown()
+
+
+async def test_cancel_drives_the_real_switch_services_and_leaves_nothing_armed(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    paris: None,
+) -> None:
+    """AC 4 end to end: live valve then pump, through the real service calls.
+
+    The re-arm half is asserted with the registration counter rather than
+    assumed: after a cancel `next_wakeup()` is `None`, so `_rearm` must cancel
+    the point-in-time handle — "re-armed to nothing".
+    """
+    live = 0
+    real = getattr(timing, "async_track_point_in_time")  # noqa: B009 — an import, not an export
+
+    def _tracked(*args: Any, **kwargs: Any) -> Callable[[], None]:
+        nonlocal live
+        unsubscribe = real(*args, **kwargs)
+        live += 1
+
+        def _wrapped() -> None:
+            nonlocal live
+            live -= 1
+            unsubscribe()
+
+        return _wrapped
+
+    monkeypatch.setattr(timing, "async_track_point_in_time", _tracked)
+
+    calls = register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, sequencer = make_runner(hass, make_plan())
+    await runner.async_start()
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    assert live == 1
+
+    freezer.move_to("2026-07-31 07:04:00+02:00")
+    assert await runner.async_cancel_cycle() is True
+
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls] == [
+        ("turn_on", PUMP),
+        ("turn_on", VALVE_1),
+        ("turn_off", VALVE_1),
+        ("turn_off", PUMP),
+    ]
+    assert sequencer.current_run is None
+    run = sequencer.last_run
+    assert run is not None
+    assert run.status is CycleStatus.CANCELLED
+    assert sequencer.next_wakeup() is None
+    assert live == 0
+
+    # The zone boundary the cancelled cycle would have had never fires.
+    commanded = len(calls)
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    assert len(calls) == commanded
+
+    runner.async_shutdown()
+
+
+async def test_cancelling_with_nothing_running_reports_false(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """The runner relays the engine's answer; the SERVICE is what raises."""
+    calls = register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, _ = make_runner(hass, make_plan())
+    await runner.async_start()
+
+    assert await runner.async_cancel_cycle() is False
+
+    assert calls == []
+
+    runner.async_shutdown()
+
+
+async def test_a_command_wrapper_rearms_even_when_the_engine_raises(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """The same `finally` rule the fire callbacks follow (AC 1, AC 4).
+
+    An exception must never be what leaves the engine with no timer: the
+    cancel raising here would otherwise strand the running cycle with its
+    valve and pump energized and nothing armed to close them.
+    """
+    register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, sequencer = make_runner(hass, make_plan())
+    await runner.async_start()
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+
+    async def _boom(now: datetime) -> bool:
+        msg = f"engine blew up cancelling at {now}"
+        raise RuntimeError(msg)
+
+    sequencer.async_cancel_cycle = _boom  # type: ignore[method-assign]
+
+    freezer.move_to("2026-07-31 07:04:00+02:00")
+    with pytest.raises(RuntimeError, match="blew up"):
+        await runner.async_cancel_cycle()
+
+    del sequencer.async_cancel_cycle
+
+    # The surviving registration is what still drains the boundary for real.
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    run = sequencer.current_run
+    assert run is not None
+    assert run.zone_runs[0].actual_end is not None
+
+    runner.async_shutdown()
+
+
+async def test_a_command_wrapper_pushes_the_dispatcher_signal(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Both surfaces feed the passive projections the same way (AD-6)."""
+    register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    entry = MockConfigEntry(domain="ha_irrigation_controller")
+    sequencer = Sequencer(
+        make_plan(),
+        switches=VerifiedSwitchAdapter(
+            hass,
+            timeout_s=5,
+            cycle_id_provider=lambda: None,
+        ),
+        journal=JournalAdapter(hass),
+        anomalies=AnomalyManager(hass),
+    )
+    runner = CycleRunner(hass, entry, sequencer=sequencer, clock=HaClock())
+    pushes = 0
+
+    def _on_signal() -> None:
+        nonlocal pushes
+        pushes += 1
+
+    unsubscribe = async_dispatcher_connect(
+        hass,
+        engine_state_signal(entry.entry_id),
+        _on_signal,
+    )
+    await runner.async_start()
+
+    # `async_dispatcher_send` schedules the non-callback target, so the block
+    # is what actually delivers it — not an assertion timing quirk.
+    await runner.async_set_season(enabled=False)
+    await hass.async_block_till_done()
+    assert pushes == 1
+
+    # Even a no-op set still pushes: the wrapper's `finally` is unconditional,
+    # and an entity that missed a push would be stale until the next step.
+    await runner.async_set_season(enabled=False)
+    await hass.async_block_till_done()
+    assert pushes == 2
+
+    await runner.async_cancel_cycle()
+    await hass.async_block_till_done()
+    assert pushes == 3
+
+    unsubscribe()
+    runner.async_shutdown()
 
 
 def test_ha_clock_returns_aware_local_time(hass: HomeAssistant) -> None:

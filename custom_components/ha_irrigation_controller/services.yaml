@@ -1,1 +1,41 @@
-# Service definitions land with Story 1.6 (season switch and cycle services).
+# Action definitions. Names and descriptions live in translations/en.json —
+# hassfest cross-checks the two in BOTH directions, so a service or a field
+# present here and missing there (or the reverse) fails CI.
+#
+# The selectors below are UI affordances ONLY. Every bound they express is
+# re-checked in the handlers (`services.py`), because the WebSocket API
+# bypasses selectors exactly like it bypasses the config-flow pickers.
+
+cancel_cycle:
+
+set_season:
+  fields:
+    enabled:
+      required: true
+      selector:
+        boolean:
+
+set_zone_duration:
+  fields:
+    zone_id:
+      required: true
+      example: 01JCXYZ0000000000000000000
+      selector:
+        text:
+    cycle:
+      required: true
+      example: morning
+      selector:
+        select:
+          options:
+            - morning
+            - evening
+    duration:
+      required: true
+      example: 15
+      selector:
+        number:
+          min: 1
+          max: 120
+          step: 1
+          unit_of_measurement: min

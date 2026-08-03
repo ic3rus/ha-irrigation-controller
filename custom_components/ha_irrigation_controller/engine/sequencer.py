@@ -58,7 +58,7 @@ class Sequencer:
     skipped (AD-4, runtime half of the overlap defense).
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 — three injected ports plus the two seeds; collapsing them into a config object would hide which are ports and which are state
         self,
         plan: ControllerPlan,
         *,
@@ -66,15 +66,22 @@ class Sequencer:
         journal: JournalPort,
         anomalies: AnomalyPort,
         history: list[dict[str, object]] | None = None,
+        season_enabled: bool = True,
     ) -> None:
-        """Wire the sequencer to its plan, its ports and any prior history.
+        """Wire the sequencer to its plan, its ports and any prior state.
 
-        `history` is the ONLY state this constructor accepts back: outcome
-        records are not machine state, so seeding them is not resuming an
-        in-flight cycle (AD-11's recovery path stays Story 3.2's, and it
-        restores `run`/`last_run`/`deferred`). Without the seed the first
-        `_save` of every reload would overwrite the stored 7-day section with
-        an empty list, and the reload regime runs on every config change.
+        `history` and `season_enabled` are the ONLY state this constructor
+        accepts back, and neither is machine state: outcome records are not,
+        and a season flag is a runtime MODE, not an in-flight cycle. Seeding
+        them is therefore not resuming a cycle (AD-11's recovery path stays
+        Story 3.2's, and it restores `run`/`last_run`/`deferred`). Without the
+        history seed the first `_save` of every reload would overwrite the
+        stored 7-day section with an empty list, and the reload regime runs on
+        every config change.
+
+        `season_enabled` defaults to True — fail-wet (AD-4): doubt about the
+        stored value resolves toward watering, so an absent or unreadable key
+        waters rather than silently ending the season.
         """
         # Public and replaceable on purpose: a new plan applies to the NEXT
         # requested cycle; the running cycle only ever reads its own snapshot
@@ -91,6 +98,11 @@ class Sequencer:
         self._history: list[dict[str, object]] = (
             [] if history is None else list(history)
         )
+        # FR10's one-action season switch. Journalled with the rest of the
+        # state rather than kept in `entry.options`: an options write fires the
+        # update listener, and the reload it schedules would tear down a
+        # running cycle mid-flight — which AC 1 forbids.
+        self._season_enabled = season_enabled
         # Each deferred entry keeps the reference instant of its ORIGINAL
         # request: that is what its configured start (and therefore its
         # irrigation day) is derived from, so a cycle deferred across midnight
@@ -124,14 +136,55 @@ class Sequencer:
         """Return the cycle kinds waiting for the active run to complete."""
         return tuple(kind for kind, _ in self._deferred)
 
+    @property
+    def season_enabled(self) -> bool:
+        """Return whether scheduling is active at all, read-only (AD-6)."""
+        return self._season_enabled
+
+    async def async_set_season(self, *, enabled: bool, now: datetime) -> bool:  # noqa: ARG002
+        """Turn the season on or off; return True iff the value changed.
+
+        Setting it to the value it already has is NOT an error and writes
+        nothing: the switch entity and the service both reach this, and the
+        reload regime must not churn the journal over a no-op.
+
+        Disabling clears the deferred queue — a deferred cycle is scheduled
+        work, and AC 1's "suspends all scheduling in one action" has to be
+        true the instant the operator flips the switch. `self._run` is
+        deliberately NOT touched whatever its status: a cycle in progress
+        completes, and only `async_cancel_cycle` stops one.
+
+        `now` is accepted for symmetry with every other engine entry point and
+        is deliberately unused: the engine never reads a clock of its own
+        (AD-1), and a later season-transition record would take its instant
+        from here rather than from a new parameter.
+        """
+        async with self._lock:
+            if self._season_enabled == enabled:
+                return False
+            self._season_enabled = enabled
+            if not enabled:
+                self._deferred.clear()
+            await self._save()
+            return True
+
     async def request_cycle(self, kind: CycleKind, now: datetime) -> None:
         """Request a cycle start; defers if another run is active.
 
         The actual transitions (pump on, first zone open) happen in
         ``advance`` — this only records the intent, so the caller's next step
         is always the same: re-arm on ``next_wakeup()``.
+
+        Story 2.1's `run_now` must NOT reuse this method as-is: it runs with
+        the season OFF by design, so it needs its own entry point (or a flag
+        added when it finally has a caller) rather than bypassing the guard.
         """
         async with self._lock:
+            if not self._season_enabled:
+                # A permitted non-watering cause (AD-4): no run, no defer, no
+                # save and — the part a watchdog must not mistake for a miss —
+                # no anomaly. The daily tracker stays armed; the gate is here.
+                return
             if self._run is not None:
                 self._deferred.append((kind, now))
             else:
@@ -153,6 +206,79 @@ class Sequencer:
             # call at every instant the engine yields.
             return None
         return run.zone_runs[self._zone_index].planned_end
+
+    async def async_cancel_cycle(self, now: datetime) -> bool:
+        """Cancel the active cycle; return False when there is nothing to cancel.
+
+        The ONLY thing that stops a running cycle (AC 1, AD-4). It leaves the
+        hardware safe and the accounting honest, and it raises NOTHING: the
+        engine must stay importable with no Home Assistant and speaks no
+        user-facing errors, so the caller (the service) is what turns a False
+        into a `ServiceValidationError`.
+        """
+        async with self._lock:
+            run = self._run
+            if run is None:
+                return False
+            # Cancelling "the cycle" must not immediately start the next one:
+            # emptied BEFORE `_complete_cycle`, whose deferral branch is then
+            # a no-op.
+            self._deferred.clear()
+            # PENDING means nothing was ever commanded, so nothing has to be
+            # un-commanded — and the pump was never started.
+            pump_was_on = run.status is CycleStatus.RUNNING
+            if pump_was_on:
+                await self._close_live_zone(run, now)
+            # Through the EXISTING completion path so the pump-off, the
+            # history append, the prune and the release stay in ONE place.
+            await self._complete_cycle(
+                run,
+                now,
+                pump_was_on=pump_was_on,
+                status=CycleStatus.CANCELLED,
+            )
+            return True
+
+    async def _close_live_zone(self, run: CycleRun, now: datetime) -> None:
+        """Close the zone whose slot is open, if any — the cancel's valve half.
+
+        The live zone is found by "started but not finished", never by status:
+        a FAILED zone is indistinguishable by status from a finished one and
+        still owns the open slot (the same rule `entities/sensor.py::_live_zone`
+        encodes for the projection).
+
+        The next zone is deliberately NOT opened and `_zone_index` is NOT
+        bumped: the zones never reached keep PENDING, so `effective_seconds`
+        returns 0 for them and Epic 2's deficit reads the shortfall from the
+        ONE helper that owns the math (AD-5).
+        """
+        zone = next(
+            (
+                candidate
+                for candidate in run.zone_runs
+                if candidate.actual_start is not None and candidate.actual_end is None
+            ),
+            None,
+        )
+        if zone is None:
+            return
+        confirmed, error = await self._command(on=False, entity_id=zone.valve_entity_id)
+        zone.close_confirmed = confirmed
+        zone.actual_end = now
+        if not confirmed:
+            # Exactly what `_finish_zone` does: a failing valve reports and the
+            # sequence proceeds — it must never be what wedges a cancel.
+            self._report(
+                AnomalyKind.VALVE_CLOSE_UNCONFIRMED,
+                {
+                    "cycle_id": run.cycle_id,
+                    "zone_id": zone.zone_id,
+                    "entity_id": zone.valve_entity_id,
+                },
+                error,
+            )
+        if zone.status is not ZoneRunStatus.FAILED:
+            zone.status = ZoneRunStatus.COMPLETED
 
     async def advance(self, now: datetime) -> None:
         """Perform every transition due at `now` (state machine step).
@@ -257,12 +383,22 @@ class Sequencer:
         now: datetime,
         *,
         pump_was_on: bool,
+        status: CycleStatus = CycleStatus.COMPLETED,
     ) -> None:
         """Pump off after the last zone closes (FR3), then release the slot.
 
         A deferred cycle is re-created immediately, dispatched at completion —
         ``advance``'s loop starts it in the same call, so a deferred cycle is
         delayed, never skipped (AD-4).
+
+        `status` is the TERMINAL status to file the run under: COMPLETED for
+        the normal path, CANCELLED for `async_cancel_cycle`. Both go through
+        here so the pump-off, the history append, the prune and the release
+        have exactly one implementation.
+
+        Called from inside the lock by `advance` and directly by
+        `async_cancel_cycle`, which already holds it — this method must NOT
+        acquire the lock itself.
         """
         if pump_was_on:
             confirmed, error = await self._command(
@@ -276,7 +412,7 @@ class Sequencer:
                     {"cycle_id": run.cycle_id, "entity_id": run.pump_entity_id},
                     error,
                 )
-        run.status = CycleStatus.COMPLETED
+        run.status = status
         # Appended BEFORE the save and before the deferral branch below: a
         # deferred cycle is created in this same call, and the snapshot taken
         # then must already carry this cycle's outcome.
@@ -399,6 +535,7 @@ class Sequencer:
                 for kind, reference in self._deferred
             ],
             "history": list(self._history),
+            "season_enabled": self._season_enabled,
         }
         try:
             await self._journal.async_save(snapshot)

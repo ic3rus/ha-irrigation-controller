@@ -31,6 +31,63 @@ in the same payload — no separate card install or download. Serving it to
 Lovelace (static path + resource registration) arrives with Story 4.2, so the
 card is not yet selectable in the dashboard editor.
 
+## Services
+
+Three actions are available to automations, scripts and voice assistants. They
+are registered at component setup, so they stay callable (and editable in an
+automation) even while the integration is reloading — a call made while nothing
+is loaded fails with a clear message rather than disappearing.
+
+### `ha_irrigation_controller.cancel_cycle`
+
+No fields. Stops the cycle running right now: the open valve is closed, then
+the pump, and the run is recorded as **cancelled**. This is the *only* thing
+that stops a running cycle. Zones the cycle never reached are recorded as
+having watered zero seconds.
+
+Calling it with nothing running is an error, not a silent no-op.
+
+### `ha_irrigation_controller.set_season`
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `enabled` | boolean | yes | `true` resumes scheduling, `false` suspends it |
+
+The one-action end of season. With the season off, a daily start creates no
+cycle, queues nothing and raises **no anomaly** — a suspended season is a
+legitimate reason not to water, not a fault. Any cycle already queued behind a
+running one is dropped.
+
+**A cycle already running is not stopped** — it completes normally, pump-off
+included. Use `cancel_cycle` for that.
+
+The same state is exposed as a switch entity on the controller device, so
+`switch.turn_on` / `switch.turn_off` on it does exactly the same thing. The
+setting is stored in the integration's own journal, not in its configuration,
+so it survives a restart and a reload without triggering one.
+
+### `ha_irrigation_controller.set_zone_duration`
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `zone_id` | string | yes | The zone's config subentry id |
+| `cycle` | `morning` \| `evening` | yes | Which daily cycle the duration applies to |
+| `duration` | integer, **minutes** (1–120) | yes | How long that zone waters in that cycle |
+
+`zone_id` is the zone's *identifier*, not its name. If you pass an unknown one,
+the error message lists every configured zone as `id (name)` so you can copy
+the right one.
+
+The change applies without restarting Home Assistant. The call is rejected —
+with a translated error and no write — when the duration is outside 1–120
+minutes, or when it would make the morning and evening cycles overlap.
+
+> **Caveat (fixed in a later release):** applying a duration change reloads the
+> integration, and a reload currently abandons a cycle that is running at that
+> moment, leaving the valve and pump as they were. Avoid calling this action
+> mid-cycle until that is handled. The action deliberately does *not* refuse
+> the call, because durations are meant to be editable at any moment.
+
 ## Development
 
 The repo ships a devcontainer (Python 3.14 + Node 22). Open it in VS Code and

@@ -19,10 +19,8 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.const import UnitOfTime
-from homeassistant.core import callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
-from ..const import SUBENTRY_TYPE_ZONE, engine_state_signal  # noqa: TID252
+from ..const import SUBENTRY_TYPE_ZONE  # noqa: TID252
 from ..engine.runs import CycleStatus, effective_seconds  # noqa: TID252
 from .entity import HaIrrigationControllerEntity, HaIrrigationZoneEntity
 
@@ -61,37 +59,14 @@ async def async_setup_entry(
         )
 
 
-class _EngineStateProjection(SensorEntity):
-    """Mixin: subscribe to the engine-state signal, write state, nothing else.
+class CycleStatusSensor(HaIrrigationControllerEntity, SensorEntity):
+    """What the controller is doing right now: idle, or the run's status.
 
-    `entity-event-setup`: subscriptions are registered in
-    `async_added_to_hass` and released through `async_on_remove`.
+    The dispatcher subscription comes from the shared base (`entities/entity.py`),
+    which every platform inherits — our base is FIRST so its
+    `_attr_should_poll = False` and `__init__` win, while `SensorEntity`'s own
+    overrides still precede `Entity`'s.
     """
-
-    _entry: HaIrrigationConfigEntry
-
-    async def async_added_to_hass(self) -> None:
-        """Connect the entity to the runner's engine-state signal."""
-        await super().async_added_to_hass()
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass,
-                engine_state_signal(self._entry.entry_id),
-                self._async_engine_state_changed,
-            ),
-        )
-
-    @callback
-    def _async_engine_state_changed(self) -> None:
-        """Re-read the engine — the projection owns no state to update."""
-        self.async_write_ha_state()
-
-
-class CycleStatusSensor(
-    _EngineStateProjection,
-    HaIrrigationControllerEntity,
-):
-    """What the controller is doing right now: idle, or the run's status."""
 
     # No state_class and no unit: HA raises on either for an ENUM sensor.
     _attr_device_class = SensorDeviceClass.ENUM
@@ -133,10 +108,7 @@ class CycleStatusSensor(
         }
 
 
-class ZoneLastWateringSensor(
-    _EngineStateProjection,
-    HaIrrigationZoneEntity,
-):
+class ZoneLastWateringSensor(HaIrrigationZoneEntity, SensorEntity):
     """How long this zone last actually watered, in seconds."""
 
     _attr_device_class = SensorDeviceClass.DURATION

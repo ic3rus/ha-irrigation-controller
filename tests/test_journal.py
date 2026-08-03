@@ -120,7 +120,6 @@ async def test_unloading_an_entry_flushes_the_last_transition(
     Drives a real cycle to a zone boundary, then unloads: the debounced write
     is still pending, and only the `async_on_unload` flush persists it.
     """
-    register_switch_domain(hass)
     freezer.move_to("2026-07-31 06:59:00+02:00")
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -132,6 +131,9 @@ async def test_unloading_an_entry_flushes_the_last_transition(
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
+    # After the setup: forwarding Platform.SWITCH registers the REAL switch
+    # services, and `async_register` is last-wins (see `register_switch_domain`).
+    register_switch_domain(hass)
 
     await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
     assert STORAGE_KEY not in hass_storage  # still inside the debounce
@@ -208,11 +210,14 @@ async def test_a_delayed_write_without_a_snapshot_raises(
         adapter._pending_snapshot()  # noqa: SLF001 — defensive branch, no public path
 
 
-async def test_load_history_returns_nothing_when_no_store_exists(
+async def test_load_seed_returns_the_fail_wet_defaults_when_no_store_exists(
     hass: HomeAssistant,
 ) -> None:
-    """A first run has no journal file at all."""
-    assert await JournalAdapter(hass).async_load_history() == []
+    """A first run has no journal file at all — and it must still water."""
+    seed = await JournalAdapter(hass).async_load_seed()
+
+    assert seed.history == []
+    assert seed.season_enabled is True
 
 
 @pytest.mark.parametrize(
@@ -223,7 +228,7 @@ async def test_load_history_returns_nothing_when_no_store_exists(
         {"history": None},
     ],
 )
-async def test_load_history_tolerates_a_missing_or_malformed_section(
+async def test_load_seed_tolerates_a_missing_or_malformed_history_section(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
     stored: dict[str, object],
@@ -235,10 +240,10 @@ async def test_load_history_tolerates_a_missing_or_malformed_section(
         "data": stored,
     }
 
-    assert await JournalAdapter(hass).async_load_history() == []
+    assert (await JournalAdapter(hass).async_load_seed()).history == []
 
 
-async def test_load_history_drops_records_the_engine_cannot_consume(
+async def test_load_seed_drops_records_the_engine_cannot_consume(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
 ) -> None:
@@ -262,7 +267,89 @@ async def test_load_history_drops_records_the_engine_cannot_consume(
         },
     }
 
-    assert await JournalAdapter(hass).async_load_history() == [good]
+    assert (await JournalAdapter(hass).async_load_seed()).history == [good]
+
+
+async def test_the_season_flag_round_trips_through_the_store(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """AC 2: season state survives the reload-per-config-change regime.
+
+    Written by the engine through the one writer, read back by the one reader
+    — and the seed is what the rebuilt sequencer starts from, so the switch
+    entity reports OFF after the reload rather than snapping back to ON.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[zone_subentry_data("Zone A", "switch.zone_1_valve")],
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+
+    await entry.runtime_data.runner.async_set_season(enabled=False)
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass_storage[STORAGE_KEY]["data"]["season_enabled"] is False
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert entry.runtime_data.sequencer.season_enabled is False
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        {"schema_version": JOURNAL_SCHEMA_VERSION},  # the key never existed
+        {"season_enabled": None},
+        {"season_enabled": "false"},
+        {"season_enabled": 0},
+    ],
+)
+async def test_an_absent_or_non_bool_season_seeds_on(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    stored: dict[str, object],
+) -> None:
+    """Fail-wet (AD-4): unreadable storage waters.
+
+    A document written before this story has no `season_enabled` key at all,
+    and `0`/`"false"` are exactly the truthy-looking drift a bare `bool()`
+    coercion would silently honour as "season over".
+    """
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": stored,
+    }
+
+    assert (await JournalAdapter(hass).async_load_seed()).season_enabled is True
+
+
+async def test_a_stored_false_season_is_honoured(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+) -> None:
+    """Only a real `bool` is trusted — and a real False really does suspend."""
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {"season_enabled": False},
+    }
+
+    assert (await JournalAdapter(hass).async_load_seed()).season_enabled is False
 
 
 async def test_a_reload_keeps_the_stored_history(
@@ -276,7 +363,6 @@ async def test_a_reload_keeps_the_stored_history(
     Runs a cycle to completion, unloads, sets the entry up again and drives a
     save: the first cycle's outcome must still be there afterwards.
     """
-    register_switch_domain(hass)
     freezer.move_to("2026-07-31 06:59:00+02:00")
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -288,6 +374,7 @@ async def test_a_reload_keeps_the_stored_history(
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
+    register_switch_domain(hass)
 
     await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
     await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
@@ -299,6 +386,7 @@ async def test_a_reload_keeps_the_stored_history(
 
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
+    register_switch_domain(hass)
     # The next day's start is enough to make the rebuilt engine journal again.
     await fire_at(hass, freezer, "2026-08-01 07:00:00+02:00")
     assert await hass.config_entries.async_unload(entry.entry_id)

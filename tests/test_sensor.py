@@ -7,6 +7,8 @@ engine step.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -31,6 +33,7 @@ from homeassistant.helpers import (
 )
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+import custom_components.ha_irrigation_controller
 from custom_components.ha_irrigation_controller.const import (
     CONF_MORNING_ENABLED,
     CONF_VALVE_SWITCH,
@@ -177,11 +180,18 @@ async def test_cycle_status_is_an_enum_with_a_coarse_summary(
 
     state = state_of(hass, status)
     assert state.attributes[ATTR_DEVICE_CLASS] == SensorDeviceClass.ENUM
+    # `cancelled` (Story 1.6) rides in through the CycleStatus comprehension.
+    # No push point can surface it today — the dispatcher fires after `advance`
+    # returns, by which point `current_run` is released — so what is asserted
+    # is that the sensor DECLARES it (HA raises on an unlisted state) and that
+    # it is translated; `test_cancelled_is_a_declared_and_translated_state`
+    # covers the translation half.
     assert state.attributes[ATTR_OPTIONS] == [
         "idle",
         "pending",
         "running",
         "completed",
+        "cancelled",
     ]
     assert ATTR_STATE_CLASS not in state.attributes
     assert ATTR_UNIT_OF_MEASUREMENT not in state.attributes
@@ -243,6 +253,33 @@ async def test_a_failed_open_zone_reports_zero_seconds(
     await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
 
     assert state_of(hass, duration).state == "0"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_cancelled_is_a_declared_and_translated_state(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+) -> None:
+    """An ENUM state without a translation renders as the raw string.
+
+    `CycleStatus.CANCELLED` lands in `_attr_options` for free through the
+    existing comprehension, so the drift risk is the translation file, not the
+    sensor — and only this assertion would catch it.
+    """
+    status = entity_id_for(hass, f"{entry.entry_id}_cycle_status")
+    assert "cancelled" in state_of(hass, status).attributes[ATTR_OPTIONS]
+
+    translations = json.loads(
+        (
+            Path(custom_components.ha_irrigation_controller.__file__).parent
+            / "translations"
+            / "en.json"
+        ).read_text(encoding="utf-8"),
+    )
+    states = translations["entity"]["sensor"]["cycle_status"]["state"]
+    assert set(states) == set(state_of(hass, status).attributes[ATTR_OPTIONS])
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

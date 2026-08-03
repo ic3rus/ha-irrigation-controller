@@ -103,6 +103,40 @@ class CycleRunner:
                 ),
             )
 
+    async def async_cancel_cycle(self) -> bool:
+        """Cancel the active cycle and re-arm; False when nothing was running.
+
+        Every command goes through the runner rather than reaching the
+        sequencer directly: `_rearm()` and the dispatcher push are the
+        runner's to own, and a mutating call that skipped them would leave the
+        ONE timer pointing at a boundary the engine no longer has.
+
+        After a cancel `next_wakeup()` is `None`, so `_rearm` cancels the
+        point-in-time handle — that IS the "re-armed to nothing" half of AC 4.
+        """
+        try:
+            return await self._sequencer.async_cancel_cycle(self._clock.now())
+        finally:
+            self._rearm()
+            self._async_push_state()
+
+    async def async_set_season(self, *, enabled: bool) -> None:
+        """Turn the season on or off and re-arm (FR10, AC 1).
+
+        The daily `async_track_time_change` trackers are deliberately NOT torn
+        down or re-registered here: they stay armed and the gate lives in the
+        engine. A second arming path would break AD-3 and the "exactly one
+        live registration" invariant the tests measure.
+        """
+        try:
+            await self._sequencer.async_set_season(
+                enabled=enabled,
+                now=self._clock.now(),
+            )
+        finally:
+            self._rearm()
+            self._async_push_state()
+
     @callback
     def async_shutdown(self) -> None:
         """Cancel every timer this runner armed, idempotently.
