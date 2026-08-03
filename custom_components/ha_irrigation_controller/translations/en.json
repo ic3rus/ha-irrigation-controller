@@ -11,7 +11,8 @@
                     "humidity_sensor": "Humidity sensor",
                     "morning_enabled": "Run a morning cycle",
                     "morning_start": "Morning start time",
-                    "evening_start": "Evening start time"
+                    "evening_start": "Evening start time",
+                    "actuation_timeout": "Actuation timeout"
                 },
                 "data_description": {
                     "pump_switch": "The switch that powers the pump feeding your valves.",
@@ -20,7 +21,8 @@
                     "humidity_sensor": "Optional. Stored for future weather coefficients; it is not used in this version.",
                     "morning_enabled": "Off by default: in spring the evening cycle alone is usually enough. The evening cycle always runs.",
                     "morning_start": "Local time the morning cycle starts, when it is enabled.",
-                    "evening_start": "Local time the evening cycle starts."
+                    "evening_start": "Local time the evening cycle starts.",
+                    "actuation_timeout": "Seconds to wait for a pump or valve switch to confirm a command before raising an anomaly. The cycle continues either way."
                 }
             }
         },
@@ -109,7 +111,8 @@
                     "humidity_sensor": "Humidity sensor",
                     "morning_enabled": "Run a morning cycle",
                     "morning_start": "Morning start time",
-                    "evening_start": "Evening start time"
+                    "evening_start": "Evening start time",
+                    "actuation_timeout": "Actuation timeout"
                 },
                 "data_description": {
                     "pump_switch": "The switch that powers the pump feeding your valves.",
@@ -118,7 +121,8 @@
                     "humidity_sensor": "Optional. Stored for future weather coefficients; it is not used in this version. Empty the field to remove it.",
                     "morning_enabled": "Off by default: in spring the evening cycle alone is usually enough. The evening cycle always runs.",
                     "morning_start": "Local time the morning cycle starts, when it is enabled.",
-                    "evening_start": "Local time the evening cycle starts."
+                    "evening_start": "Local time the evening cycle starts.",
+                    "actuation_timeout": "Seconds to wait for a pump or valve switch to confirm a command before raising an anomaly. The cycle continues either way."
                 }
             }
         },
@@ -127,6 +131,22 @@
             "pump_is_zone_valve": "This switch is already used as a zone's valve. Pick the switch that powers the pump, not one that opens a valve.",
             "cycles_overlap": "With these start times the morning cycle would still be watering when the evening cycle starts. Move the start times apart or shorten the zones.",
             "evening_cycle_overlap": "With these start times the evening cycle would still be watering when the morning cycle starts. Move the start times apart or shorten the zones."
+        }
+    },
+    "entity": {
+        "sensor": {
+            "cycle_status": {
+                "name": "Cycle status",
+                "state": {
+                    "idle": "Idle",
+                    "pending": "Pending",
+                    "running": "Running",
+                    "completed": "Completed"
+                }
+            },
+            "last_watering_duration": {
+                "name": "Last watering duration"
+            }
         }
     },
     "exceptions": {

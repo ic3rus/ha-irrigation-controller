@@ -657,6 +657,92 @@ async def test_a_cycle_deferred_across_midnight_keeps_its_irrigation_day() -> No
     assert run.cycle_id == "2026-07-31-evening"
 
 
+async def test_history_gets_one_entry_per_completed_cycle_oldest_first() -> None:
+    """Each completed cycle appends its outcome record, in completion order."""
+    plan = make_plan(make_zone("zone-1", valve=VALVE_1, morning_s=600, evening_s=900))
+    sequencer, _, journal, _ = make_sequencer(plan)
+    clock = VirtualClock(aware(7))
+
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await sequencer.advance(clock.now())
+    await sequencer.request_cycle(CycleKind.EVENING, clock.now())
+    await run_to_idle(sequencer, clock)
+
+    history = journal.snapshots[-1]["history"]
+    assert isinstance(history, list)
+    assert [entry["cycle_id"] for entry in history] == [
+        "2026-07-31-morning",
+        "2026-07-31-evening",
+    ]
+    assert history[0]["zones"] == [
+        {"zone_id": "zone-1", "status": "completed", "effective_s": 600},
+    ]
+    json.dumps(history)  # serializable, or this raises
+
+
+async def test_history_records_zero_effective_seconds_for_a_failed_zone() -> None:
+    """A zone whose open never confirmed watered nothing (Epic 2's input)."""
+    sequencer, switches, journal, _ = make_sequencer(three_zone_plan())
+    switches.failing.add(("on", VALVE_1))
+    clock = VirtualClock(aware(7))
+
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await run_to_idle(sequencer, clock)
+
+    history = journal.snapshots[-1]["history"]
+    assert isinstance(history, list)
+    assert history[-1]["zones"][0] == {
+        "zone_id": "zone-1",
+        "status": "failed",
+        "effective_s": 0,
+    }
+    assert history[-1]["zones"][1]["effective_s"] == 900
+
+
+async def test_history_is_pruned_to_the_retention_window() -> None:
+    """Cycles older than the 7-day window fall out as new ones complete."""
+    plan = make_plan(make_zone("zone-1", valve=VALVE_1, morning_s=600))
+    sequencer, _, journal, _ = make_sequencer(plan)
+
+    for day in (25, 31):
+        clock = VirtualClock(aware(7, day=day, month=7))
+        await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+        await run_to_idle(sequencer, clock)
+
+    # A 3 August cycle is 9 days past the 25 July one (dropped) and 3 days
+    # past the 31 July one (kept).
+    clock = VirtualClock(aware(7, day=3, month=8))
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await run_to_idle(sequencer, clock)
+
+    history = journal.snapshots[-1]["history"]
+    assert isinstance(history, list)
+    assert [entry["irrigation_day"] for entry in history] == [
+        "2026-07-31",
+        "2026-08-03",
+    ]
+
+
+async def test_history_survives_a_deferred_cycle_created_in_the_same_call() -> None:
+    """The append happens before the deferral branch, never after it."""
+    plan = make_plan(make_zone("zone-1", valve=VALVE_1, morning_s=600, evening_s=600))
+    sequencer, _, journal, _ = make_sequencer(plan)
+    clock = VirtualClock(aware(7))
+
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await sequencer.advance(clock.now())
+    await sequencer.request_cycle(CycleKind.EVENING, clock.now())
+
+    clock.advance_to(aware(7, 10))
+    await sequencer.advance(clock.now())
+
+    # The morning cycle completed and the evening one was created in the SAME
+    # advance: the snapshot taken right after must already carry the record.
+    history = journal.snapshots[-1]["history"]
+    assert isinstance(history, list)
+    assert [entry["cycle_id"] for entry in history] == ["2026-07-31-morning"]
+
+
 async def test_journal_snapshot_carries_what_a_restore_needs() -> None:
     """The snapshot must be restorable, not merely displayable.
 

@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import pytest
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.data_entry_flow import FlowResultType, InvalidData
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ha_irrigation_controller.const import (
+    CONF_ACTUATION_TIMEOUT,
     CONF_EVENING_START,
     CONF_HUMIDITY_SENSOR,
     CONF_MORNING_ENABLED,
@@ -23,7 +25,6 @@ from custom_components.ha_irrigation_controller.const import (
 from tests.common import CONTROLLER_OPTIONS, controller_entry, zone_subentry_data
 
 if TYPE_CHECKING:
-    import pytest
     from homeassistant.core import HomeAssistant
 
 _FLOW_MODULE = "custom_components.ha_irrigation_controller.config_flow"
@@ -34,6 +35,7 @@ _MINIMAL_INPUT: dict[str, Any] = {
     CONF_MORNING_ENABLED: False,
     CONF_MORNING_START: "07:00:00",
     CONF_EVENING_START: "20:00:00",
+    CONF_ACTUATION_TIMEOUT: 10,
 }
 
 
@@ -79,6 +81,7 @@ async def test_user_form_defaults_are_evening_only(hass: HomeAssistant) -> None:
         CONF_MORNING_ENABLED: False,
         CONF_MORNING_START: "07:00:00",
         CONF_EVENING_START: "20:00:00",
+        CONF_ACTUATION_TIMEOUT: 10,
     }
 
 
@@ -169,6 +172,44 @@ async def test_start_times_are_stored_normalized(hass: HomeAssistant) -> None:
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["options"][CONF_MORNING_START] == "07:05:00"
     assert result["options"][CONF_EVENING_START] == "20:00:00"
+
+
+async def test_actuation_timeout_is_stored_as_whole_seconds(
+    hass: HomeAssistant,
+) -> None:
+    """A frontend float submission lands as the documented int seconds.
+
+    `NumberSelector` coerces to float, so the frontend sends `10.0` — the
+    stored contract (and the engine parser) wants int seconds.
+    """
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={**_MINIMAL_INPUT, CONF_ACTUATION_TIMEOUT: 15.0},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["options"][CONF_ACTUATION_TIMEOUT] == 15
+    assert isinstance(result["options"][CONF_ACTUATION_TIMEOUT], int)
+
+
+@pytest.mark.parametrize("out_of_range", [0, 121])
+async def test_actuation_timeout_out_of_range_is_rejected_by_the_selector(
+    hass: HomeAssistant,
+    out_of_range: int,
+) -> None:
+    """The selector's own bounds refuse a timeout outside 1..120 seconds."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_USER},
+    )
+    with pytest.raises(InvalidData, match=CONF_ACTUATION_TIMEOUT):
+        await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={**_MINIMAL_INPUT, CONF_ACTUATION_TIMEOUT: out_of_range},
+        )
 
 
 async def test_user_flow_allows_identical_times_when_morning_disabled(

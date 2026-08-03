@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.helpers import device_registry as dr
+from homeassistant.const import STATE_UNAVAILABLE
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.device_registry import DeviceEntryType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -15,10 +16,17 @@ from custom_components.ha_irrigation_controller import (
     HaIrrigationRuntimeData,
     _async_entry_updated,
 )
+from custom_components.ha_irrigation_controller.adapters.anomalies import AnomalyManager
+from custom_components.ha_irrigation_controller.adapters.journal import JournalAdapter
+from custom_components.ha_irrigation_controller.adapters.timing import CycleRunner
 from custom_components.ha_irrigation_controller.const import (
+    CONF_ACTUATION_TIMEOUT,
+    DEFAULT_ACTUATION_TIMEOUT_S,
     DOMAIN,
+    MAX_ACTUATION_TIMEOUT_S,
     MAX_RAIN_FACTOR,
     MAX_ZONE_DURATION_MINUTES,
+    MIN_ACTUATION_TIMEOUT_S,
     MIN_HA_MAJOR,
     MIN_HA_MINOR,
     MIN_HA_VERSION,
@@ -28,8 +36,10 @@ from custom_components.ha_irrigation_controller.const import (
 from custom_components.ha_irrigation_controller.engine.config import (
     PlanValidationError,
     build_plan,
+    parse_actuation_timeout,
 )
 from custom_components.ha_irrigation_controller.engine.plan import ControllerPlan
+from custom_components.ha_irrigation_controller.engine.sequencer import Sequencer
 from tests.common import CONTROLLER_OPTIONS, controller_entry, zone_subentry_data
 
 if TYPE_CHECKING:
@@ -65,6 +75,65 @@ async def test_setup_and_unload_entry(hass: HomeAssistant) -> None:
     # mypy narrowed entry.state to LOADED above and cannot see that async_unload
     # mutates it, hence the ignore.
     assert entry.state is ConfigEntryState.NOT_LOADED  # type: ignore[comparison-overlap]
+
+
+async def test_setup_wires_the_engine_and_its_adapters(hass: HomeAssistant) -> None:
+    """runtime_data carries the engine and the four adapters (Story 1.5, AC 1-5).
+
+    Everything here is rebuilt per load; none of it is a persistence authority
+    (AD-2 — only the journal adapter writes the Store).
+    """
+    entry = _entry_with_zones(zone_subentry_data("Zone A", "switch.zone_a_valve"))
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    data = entry.runtime_data
+    assert isinstance(data.sequencer, Sequencer)
+    assert isinstance(data.runner, CycleRunner)
+    assert isinstance(data.journal, JournalAdapter)
+    assert isinstance(data.anomalies, AnomalyManager)
+    # The engine runs on the plan the setup validated — one plan, one home.
+    assert data.sequencer.plan is data.plan
+    assert data.sequencer.current_run is None
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_unload_removes_the_platform_entities_and_leaves_no_timer(
+    hass: HomeAssistant,
+) -> None:
+    """Unload tears the platform down; PHCC's verify_cleanup covers the timers.
+
+    A surviving daily `async_track_time_change` registration would leak on
+    every reload, and the reload-per-config-change regime runs constantly.
+    """
+    entry = _entry_with_zones(zone_subentry_data("Zone A", "switch.zone_a_valve"))
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    registry = er.async_get(hass)
+    assert registry.async_get_entity_id(
+        "sensor",
+        DOMAIN,
+        f"{entry.entry_id}_cycle_status",
+    )
+    live = hass.states.async_all("sensor")
+    assert len(live) == 2  # controller status + the zone's duration
+    assert all(state.state != STATE_UNAVAILABLE for state in live)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.NOT_LOADED
+    # The registry keeps the entities (a reload restores them); their states
+    # go unavailable, which is what "the platform was torn down" looks like.
+    assert all(
+        state.state == STATE_UNAVAILABLE for state in hass.states.async_all("sensor")
+    )
 
 
 async def test_setup_registers_the_reload_listener(hass: HomeAssistant) -> None:
@@ -203,6 +272,53 @@ def test_every_engine_bound_agrees_with_const(
 
     with pytest.raises(PlanValidationError, match=key):
         build_plan(CONTROLLER_OPTIONS, [("zone-1", "Zone A", {**zone, key: outside})])
+
+
+@pytest.mark.parametrize(
+    ("inside", "outside"),
+    [
+        (MIN_ACTUATION_TIMEOUT_S, MIN_ACTUATION_TIMEOUT_S - 1),
+        (MAX_ACTUATION_TIMEOUT_S, MAX_ACTUATION_TIMEOUT_S + 1),
+    ],
+)
+def test_actuation_timeout_bounds_agree_with_const(inside: int, outside: int) -> None:
+    """The timeout bounds and default duplicated in the engine match const.py.
+
+    Same drift defense as the four zone bounds above: the engine cannot import
+    const.py, so its module-private twins are pinned here on both edges.
+    """
+    options = {**CONTROLLER_OPTIONS, CONF_ACTUATION_TIMEOUT: inside}
+    assert parse_actuation_timeout(options) == inside
+
+    with pytest.raises(PlanValidationError, match=CONF_ACTUATION_TIMEOUT):
+        parse_actuation_timeout({**CONTROLLER_OPTIONS, CONF_ACTUATION_TIMEOUT: outside})
+
+
+def test_actuation_timeout_default_agrees_with_const() -> None:
+    """An absent key parses to exactly the const.py default (legacy entries)."""
+    options = {
+        key: value
+        for key, value in CONTROLLER_OPTIONS.items()
+        if key != CONF_ACTUATION_TIMEOUT
+    }
+    assert parse_actuation_timeout(options) == DEFAULT_ACTUATION_TIMEOUT_S
+
+
+async def test_entry_without_actuation_timeout_still_loads(
+    hass: HomeAssistant,
+) -> None:
+    """An entry created before Story 1.5 has no timeout key and must keep loading."""
+    options = {
+        key: value
+        for key, value in CONTROLLER_OPTIONS.items()
+        if key != CONF_ACTUATION_TIMEOUT
+    }
+    entry = controller_entry(options)
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
 
 
 async def test_engine_duration_bounds_agree_with_const(hass: HomeAssistant) -> None:

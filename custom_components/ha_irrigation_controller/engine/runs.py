@@ -91,6 +91,24 @@ class ZoneRun:
         }
 
 
+def effective_seconds(zone_run: ZoneRun) -> int:
+    """Return the seconds this zone actually watered — THE single helper.
+
+    Zero when the open never confirmed (status FAILED: the valve never opened,
+    so nothing was watered) and zero while either instant is still missing.
+    Otherwise the elapsed open-to-close time — an unconfirmed CLOSE still
+    watered its slot (possibly longer, which fail-wet accepts, AD-4).
+
+    Epic 2's deficit input and Story 1.5's per-zone sensor both read THIS
+    function: AD-5's "no feature re-implements the math" starts here.
+    """
+    if zone_run.status is ZoneRunStatus.FAILED:
+        return 0
+    if zone_run.actual_start is None or zone_run.actual_end is None:
+        return 0
+    return int((zone_run.actual_end - zone_run.actual_start).total_seconds())
+
+
 @dataclass(slots=True)
 class CycleRun:
     """One cycle run: stable id, snapshotted parameters, per-zone runs.

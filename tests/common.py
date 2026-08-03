@@ -11,6 +11,7 @@ from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ha_irrigation_controller.const import (
+    CONF_ACTUATION_TIMEOUT,
     CONF_EVENING_DURATION,
     CONF_EVENING_START,
     CONF_HUMIDITY_SENSOR,
@@ -42,6 +43,7 @@ CONTROLLER_OPTIONS: dict[str, Any] = {
     CONF_MORNING_ENABLED: True,
     CONF_MORNING_START: "07:00:00",
     CONF_EVENING_START: "20:00:00",
+    CONF_ACTUATION_TIMEOUT: 10,
 }
 
 

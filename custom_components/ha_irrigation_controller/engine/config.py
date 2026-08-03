@@ -33,6 +33,12 @@ _MIN_RAIN_FACTOR = 0.0
 _MAX_RAIN_FACTOR = 10.0
 _SECONDS_PER_MINUTE = 60
 
+# Same values as const.py's DEFAULT/MIN/MAX_ACTUATION_TIMEOUT_S, pinned by
+# tests/test_init.py like the four bounds above. Seconds at every surface.
+_DEFAULT_ACTUATION_TIMEOUT_S = 10
+_MIN_ACTUATION_TIMEOUT_S = 1
+_MAX_ACTUATION_TIMEOUT_S = 120
+
 # Home Assistant's entity-id grammar, restated here because the engine cannot
 # import `homeassistant.core.valid_entity_id` (AD-1). Shape only: whether the
 # entity exists is a runtime question the switch port answers.
@@ -137,6 +143,29 @@ def _zone_spec(zone_id: str, title: str, data: Mapping[str, object]) -> ZoneSpec
         rain_exposed=_bool(data, "rain_exposed", context),
         rain_factor=_rain_factor(data, "rain_factor", context),
     )
+
+
+def parse_actuation_timeout(options: Mapping[str, object]) -> int:
+    """Return the stored actuation timeout in seconds, validated, or fail loud.
+
+    Same trust boundary as ``build_plan``: `.storage` data is unvalidated.
+    An ABSENT key is the default, not an error — entries created before the
+    key existed (Story 1.5) must keep loading. A present key is validated for
+    type (bool rejected: it is an int subclass and True seconds is storage
+    drift) and range.
+    """
+    context = "controller options"
+    value = options.get("actuation_timeout", _DEFAULT_ACTUATION_TIMEOUT_S)
+    if isinstance(value, bool) or not isinstance(value, int):
+        msg = f"{context}: 'actuation_timeout' must be whole seconds, got {value!r}"
+        raise PlanValidationError(msg)
+    if not _MIN_ACTUATION_TIMEOUT_S <= value <= _MAX_ACTUATION_TIMEOUT_S:
+        msg = (
+            f"{context}: 'actuation_timeout' must be {_MIN_ACTUATION_TIMEOUT_S}-"
+            f"{_MAX_ACTUATION_TIMEOUT_S} seconds, got {value!r}"
+        )
+        raise PlanValidationError(msg)
+    return value
 
 
 def build_plan(
