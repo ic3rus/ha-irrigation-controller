@@ -6,11 +6,15 @@ from typing import TYPE_CHECKING, Any
 
 from homeassistant import config_entries
 from homeassistant.config_entries import ConfigSubentryData
-from homeassistant.const import CONF_NAME
+from homeassistant.const import ATTR_ENTITY_ID, CONF_NAME, STATE_OFF, STATE_ON
 from homeassistant.data_entry_flow import FlowResultType
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+)
 
 from custom_components.ha_irrigation_controller.const import (
+    CONF_ACTUATION_TIMEOUT,
     CONF_EVENING_DURATION,
     CONF_EVENING_START,
     CONF_HUMIDITY_SENSOR,
@@ -28,8 +32,9 @@ from custom_components.ha_irrigation_controller.const import (
 )
 
 if TYPE_CHECKING:
+    from freezegun.api import FrozenDateTimeFactory
     from homeassistant.config_entries import ConfigSubentry
-    from homeassistant.core import HomeAssistant
+    from homeassistant.core import HomeAssistant, ServiceCall
 
 # Representative controller options — every entry carries its configuration in
 # options (entry.data is empty by design). Story 1.3+ schema changes update this
@@ -42,7 +47,46 @@ CONTROLLER_OPTIONS: dict[str, Any] = {
     CONF_MORNING_ENABLED: True,
     CONF_MORNING_START: "07:00:00",
     CONF_EVENING_START: "20:00:00",
+    CONF_ACTUATION_TIMEOUT: 10,
 }
+
+
+# The switch entities the engine-level suites drive. Kept here rather than in
+# one test module so the modules that share them do not import each other.
+PUMP = "switch.pool_pump"
+VALVE_1 = "switch.zone_1_valve"
+VALVE_2 = "switch.zone_2_valve"
+
+
+def register_switch_domain(hass: HomeAssistant) -> list[ServiceCall]:
+    """Register switch services that actually flip state, and record calls.
+
+    A recorder alone would never confirm: the verified adapter watches for the
+    state change, so the fake has to behave like a real switch.
+    """
+    calls: list[ServiceCall] = []
+
+    async def _handle(call: ServiceCall) -> None:
+        calls.append(call)
+        state = STATE_ON if call.service == "turn_on" else STATE_OFF
+        hass.states.async_set(call.data[ATTR_ENTITY_ID], state, context=call.context)
+
+    hass.services.async_register("switch", "turn_on", _handle)
+    hass.services.async_register("switch", "turn_off", _handle)
+    for entity_id in (PUMP, VALVE_1, VALVE_2):
+        hass.states.async_set(entity_id, STATE_OFF)
+    return calls
+
+
+async def fire_at(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    moment: str,
+) -> None:
+    """Move the freezer to `moment` (local ISO) and fire the due timers."""
+    freezer.move_to(moment)
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
 
 
 def controller_entry(options: dict[str, Any] | None = None) -> MockConfigEntry:

@@ -27,6 +27,32 @@ CONF_HUMIDITY_SENSOR = "humidity_sensor"
 CONF_MORNING_ENABLED = "morning_enabled"
 CONF_MORNING_START = "morning_start"
 CONF_EVENING_START = "evening_start"
+CONF_ACTUATION_TIMEOUT = "actuation_timeout"
+
+# Actuation confirmation timeout — SECONDS at every surface (UI, storage,
+# engine), unlike zone durations (minutes at UI): this bounds how long a switch
+# command waits for its state change, and a minutes-grained wait for a relay
+# confirmation is meaningless. Absent key = the default (entries created before
+# Story 1.5 have no such key and must keep loading).
+DEFAULT_ACTUATION_TIMEOUT_S = 10
+MIN_ACTUATION_TIMEOUT_S = 1
+MAX_ACTUATION_TIMEOUT_S = 120
+
+# The SINGLE bus event type this integration ever fires (conventions table).
+# Payloads carry an "event_type" discriminator ("anomaly" today; more kinds
+# join in later stories) — never a second event type per feature.
+EVENT_HA_IRRIGATION_CONTROLLER = "ha_irrigation_controller_event"
+
+
+def engine_state_signal(entry_id: str) -> str:
+    """Return the dispatcher signal pushed after every engine step (AD-6).
+
+    THE one signal entity projections subscribe to: they never poll and never
+    read a second authority. Entry-scoped so a reload's fresh runner cannot
+    drive the previous entry's (already removed) entities.
+    """
+    return f"{DOMAIN}_{entry_id}_engine_state"
+
 
 # TimeSelector serializes "HH:MM:SS" strings; store them verbatim and let the
 # engine parse them (Story 1.4). Times are Home Assistant local at UI surfaces.

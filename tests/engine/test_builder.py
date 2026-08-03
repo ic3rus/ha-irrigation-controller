@@ -16,6 +16,7 @@ import pytest
 from custom_components.ha_irrigation_controller.engine.config import (
     PlanValidationError,
     build_plan,
+    parse_actuation_timeout,
 )
 
 # Literal keys on purpose: these ARE the stored-contract key strings the
@@ -219,3 +220,27 @@ def test_two_zones_sharing_one_valve_fails_loud() -> None:
             [zone_item(), zone_item("zone-2", "Back Beds")],
         )
     assert "zone-2" in str(excinfo.value)
+
+
+def test_actuation_timeout_valid_value_passes_through() -> None:
+    """A stored in-range int comes back verbatim (valid class)."""
+    assert parse_actuation_timeout({**OPTIONS, "actuation_timeout": 30}) == 30
+
+
+def test_actuation_timeout_absent_key_is_the_default() -> None:
+    """Entries created before the key existed must keep loading (Story 1.5)."""
+    assert parse_actuation_timeout(OPTIONS) == 10
+
+
+@pytest.mark.parametrize("bad_type", ["10", 10.0, None, True])
+def test_actuation_timeout_wrong_type_fails_loud(bad_type: Any) -> None:
+    """Non-int values (incl. bool, an int subclass) are storage drift."""
+    with pytest.raises(PlanValidationError, match="actuation_timeout"):
+        parse_actuation_timeout({**OPTIONS, "actuation_timeout": bad_type})
+
+
+@pytest.mark.parametrize("out_of_range", [0, -5, 121])
+def test_actuation_timeout_out_of_range_fails_loud(out_of_range: int) -> None:
+    """Values outside 1..120 seconds are rejected naming the key."""
+    with pytest.raises(PlanValidationError, match="actuation_timeout"):
+        parse_actuation_timeout({**OPTIONS, "actuation_timeout": out_of_range})

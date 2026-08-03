@@ -49,6 +49,7 @@ from homeassistant.helpers.selector import (
 )
 
 from .const import (
+    CONF_ACTUATION_TIMEOUT,
     CONF_EVENING_DURATION,
     CONF_EVENING_START,
     CONF_HUMIDITY_SENSOR,
@@ -61,14 +62,17 @@ from .const import (
     CONF_RAIN_SENSOR,
     CONF_TEMPERATURE_SENSOR,
     CONF_VALVE_SWITCH,
+    DEFAULT_ACTUATION_TIMEOUT_S,
     DEFAULT_EVENING_START,
     DEFAULT_MORNING_START,
     DEFAULT_RAIN_EXPOSED,
     DEFAULT_RAIN_FACTOR,
     DEFAULT_ZONE_DURATION_MINUTES,
     DOMAIN,
+    MAX_ACTUATION_TIMEOUT_S,
     MAX_RAIN_FACTOR,
     MAX_ZONE_DURATION_MINUTES,
+    MIN_ACTUATION_TIMEOUT_S,
     MIN_HA_MAJOR,
     MIN_HA_MINOR,
     MIN_HA_VERSION,
@@ -215,6 +219,20 @@ def build_controller_schema() -> vol.Schema:
                 CONF_EVENING_START,
                 default=DEFAULT_EVENING_START,
             ): TimeSelector(),
+            # Not clearable, so a plain `default=` is correct (same reasoning
+            # as the zone durations). Seconds at every surface.
+            vol.Required(
+                CONF_ACTUATION_TIMEOUT,
+                default=DEFAULT_ACTUATION_TIMEOUT_S,
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=MIN_ACTUATION_TIMEOUT_S,
+                    max=MAX_ACTUATION_TIMEOUT_S,
+                    step=1,
+                    mode=NumberSelectorMode.BOX,
+                    unit_of_measurement="s",
+                ),
+            ),
         },
     )
 
@@ -233,12 +251,17 @@ def _normalize_controller_input(
     The pump is resolved to an entity_id for the same reason zone valves are:
     the two are compared as strings by both flows, and a registry id on either
     side would make that comparison silently miss.
+
+    The timeout is rounded to int seconds for the same reason zone durations
+    are rounded to int minutes: `NumberSelector` coerces to float, and the
+    stored contract (and the engine parser) wants whole seconds.
     """
     return {
         **user_input,
         CONF_PUMP_SWITCH: _resolve_entity_id(hass, user_input[CONF_PUMP_SWITCH]),
         CONF_MORNING_START: cv.time(user_input[CONF_MORNING_START]).isoformat(),
         CONF_EVENING_START: cv.time(user_input[CONF_EVENING_START]).isoformat(),
+        CONF_ACTUATION_TIMEOUT: _round_whole(user_input[CONF_ACTUATION_TIMEOUT]),
     }
 
 
@@ -340,14 +363,13 @@ def build_zone_schema() -> vol.Schema:
     )
 
 
-def _round_minutes(value: float) -> int:
-    """Return `value` rounded half-UP to whole minutes.
+def _round_whole(value: float) -> int:
+    """Return `value` rounded half-UP to whole units (minutes or seconds).
 
     Bare `round()` is half-to-EVEN, so `10.5` and `11.5` would round in
     opposite directions — an arbitrary result for a duration the operator can
-    see. The selector has already clamped the value to
-    MIN_ZONE_DURATION_MINUTES..MAX_ZONE_DURATION_MINUTES (both positive), so
-    the `+ 0.5` floor is safe and cannot escape those bounds.
+    see. The selector has already clamped the value to its own min/max bounds
+    (all positive), so the `+ 0.5` floor is safe and cannot escape them.
     """
     return math.floor(value + 0.5)
 
@@ -369,8 +391,8 @@ def _normalize_zone_input(
         **user_input,
         CONF_NAME: str(user_input[CONF_NAME]).strip(),
         CONF_VALVE_SWITCH: _resolve_entity_id(hass, user_input[CONF_VALVE_SWITCH]),
-        CONF_MORNING_DURATION: _round_minutes(user_input[CONF_MORNING_DURATION]),
-        CONF_EVENING_DURATION: _round_minutes(user_input[CONF_EVENING_DURATION]),
+        CONF_MORNING_DURATION: _round_whole(user_input[CONF_MORNING_DURATION]),
+        CONF_EVENING_DURATION: _round_whole(user_input[CONF_EVENING_DURATION]),
         CONF_RAIN_FACTOR: float(user_input[CONF_RAIN_FACTOR]),
     }
 

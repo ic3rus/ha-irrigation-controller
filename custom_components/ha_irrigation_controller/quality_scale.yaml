@@ -26,14 +26,14 @@ rules:
   docs-removal-instructions:
     status: todo
   entity-event-setup:
-    status: exempt
-    comment: No entities yet; entity platforms arrive in later stories.
+    status: done
+    comment: The sensor projections subscribe to the engine-state dispatcher signal in async_added_to_hass and release it through async_on_remove; no subscription exists outside that pair.
   entity-unique-id:
-    status: exempt
-    comment: No entities yet; entity platforms arrive in later stories.
+    status: done
+    comment: Unique ids are derived in the shared bases from the entry id (controller entities) or the entry id plus the zone subentry id (zone entities) and a stable key — never from an operator-editable name.
   has-entity-name:
-    status: exempt
-    comment: No entities yet; entity platforms arrive in later stories.
+    status: done
+    comment: Both bases pin _attr_has_entity_name; names come from translation_key, so no entity hardcodes a user-visible string.
   runtime-data: done
   test-before-configure:
     status: exempt

@@ -7,17 +7,23 @@ https://github.com/ic3rus/ha-irrigation-controller
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from homeassistant.const import (
     MAJOR_VERSION as HA_MAJOR_VERSION,
     MINOR_VERSION as HA_MINOR_VERSION,
+    Platform,
     __version__ as HA_VERSION,  # noqa: N812
 )
 from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceEntryType
+from homeassistant.helpers.storage import Store
 
+from .adapters.anomalies import AnomalyManager
+from .adapters.journal import STORAGE_KEY, JournalAdapter
+from .adapters.switches import VerifiedSwitchAdapter
+from .adapters.timing import CycleRunner, HaClock
 from .const import (
     DOMAIN,
     MIN_HA_MAJOR,
@@ -25,7 +31,8 @@ from .const import (
     MIN_HA_VERSION,
     SUBENTRY_TYPE_ZONE,
 )
-from .engine.config import PlanValidationError, build_plan
+from .engine.config import PlanValidationError, build_plan, parse_actuation_timeout
+from .engine.sequencer import JOURNAL_SCHEMA_VERSION, Sequencer
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -35,17 +42,24 @@ if TYPE_CHECKING:
 
 type HaIrrigationConfigEntry = ConfigEntry[HaIrrigationRuntimeData]
 
+# The only platform this integration forwards today; Story 1.6 adds SWITCH.
+PLATFORMS: Final = [Platform.SENSOR]
+
 
 @dataclass
 class HaIrrigationRuntimeData:
     """Non-persistent runtime objects for a loaded entry (AD-2).
 
-    Holds the validated engine plan only: the port implementations and the
-    running sequencer are wired by Story 1.5. Rebuilt on every reload, so a
-    config change always yields a fresh plan.
+    Everything here is rebuilt from scratch on every reload — no object in
+    this dataclass is ever a source of persistent truth (the journal Store is,
+    and only the journal adapter writes it).
     """
 
     plan: ControllerPlan
+    sequencer: Sequencer
+    runner: CycleRunner
+    journal: JournalAdapter
+    anomalies: AnomalyManager
 
 
 async def async_setup_entry(
@@ -80,6 +94,7 @@ async def async_setup_entry(
                 for subentry in entry.get_subentries_of_type(SUBENTRY_TYPE_ZONE)
             ],
         )
+        actuation_timeout_s = parse_actuation_timeout(entry.options)
     except PlanValidationError as err:
         raise ConfigEntryError(
             translation_domain=DOMAIN,
@@ -128,7 +143,59 @@ async def async_setup_entry(
             name=subentry.title,
         )
 
-    entry.runtime_data = HaIrrigationRuntimeData(plan=plan)
+    # The engine and its four adapters. The switch adapter's cycle_id provider
+    # closes over the sequencer built on the next statement — late-bound on
+    # purpose, since the two reference each other (AD-7 needs the running
+    # cycle's id to mint its one Context).
+    clock = HaClock()
+    journal = JournalAdapter(hass)
+    anomalies = AnomalyManager(hass)
+    switches = VerifiedSwitchAdapter(
+        hass,
+        timeout_s=actuation_timeout_s,
+        cycle_id_provider=lambda: (
+            sequencer.current_run.cycle_id if sequencer.current_run else None
+        ),
+    )
+    # The ONLY thing read back from storage here: the outcome history AC 4
+    # promises to retain for 7 days. Without it the first journal write of
+    # every reload overwrites the stored section with an empty list, and the
+    # reload regime runs on every config change. Machine state stays unread —
+    # resuming an in-flight cycle is AD-11's recovery path and Story 3.2's.
+    sequencer = Sequencer(
+        plan,
+        switches=switches,
+        journal=journal,
+        anomalies=anomalies,
+        history=await journal.async_load_history(),
+    )
+    runner = CycleRunner(hass, entry, sequencer=sequencer, clock=clock)
+
+    # BEFORE forwarding: platform setup reads runtime_data.
+    entry.runtime_data = HaIrrigationRuntimeData(
+        plan=plan,
+        sequencer=sequencer,
+        runner=runner,
+        journal=journal,
+        anomalies=anomalies,
+    )
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Both must run on every unload path: a surviving timer fails PHCC's
+    # verify_cleanup and leaks per reload, and a dropped flush loses the last
+    # transition (the reload regime runs constantly).
+    #
+    # ORDER CONTRACT: HA processes these LIFO, so the LAST registration runs
+    # FIRST — the timers are cancelled before the journal is flushed, and the
+    # flush therefore persists a state nothing can still move.
+    #
+    # Registered BEFORE the timers are armed: HA runs the on-unload callbacks
+    # when setup itself fails (`ConfigEntry.async_setup`'s `finally`), so a
+    # daily start armed while a later one raises would otherwise have no
+    # registered cancel and leak for the process lifetime.
+    entry.async_on_unload(journal.async_flush)
+    entry.async_on_unload(runner.async_shutdown)
+    await runner.async_start()
     return True
 
 
@@ -141,8 +208,25 @@ async def _async_entry_updated(
 
 
 async def async_unload_entry(
-    hass: HomeAssistant,  # noqa: ARG001
-    entry: HaIrrigationConfigEntry,  # noqa: ARG001
+    hass: HomeAssistant,
+    entry: HaIrrigationConfigEntry,
 ) -> bool:
-    """Unload a config entry."""
-    return True
+    """Unload a config entry.
+
+    The timer cancel and the journal flush ride on `async_on_unload`, so they
+    are deliberately NOT repeated here — one registration, one home.
+    """
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+
+async def async_remove_entry(
+    hass: HomeAssistant,
+    entry: HaIrrigationConfigEntry,  # noqa: ARG001
+) -> None:
+    """Delete the journal store when the integration is removed.
+
+    A throwaway Store with the same key: `runtime_data` is gone by the time
+    HA calls this hook, and `async_remove` only needs the key to delete the
+    `.storage` file.
+    """
+    await Store(hass, JOURNAL_SCHEMA_VERSION, STORAGE_KEY).async_remove()
