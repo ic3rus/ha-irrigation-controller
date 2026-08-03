@@ -10,11 +10,14 @@ in-memory record the health projection reads.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from ..const import EVENT_HA_IRRIGATION_CONTROLLER, LOGGER  # noqa: TID252
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from homeassistant.core import HomeAssistant
 
     from ..engine.ports import AnomalyKind  # noqa: TID252
@@ -22,10 +25,15 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class AnomalyRecord:
-    """One reported anomaly: its kind and the context it was raised with."""
+    """One reported anomaly: its kind and the context it was raised with.
+
+    `frozen=True` protects the field binding, not what it points at — so the
+    context is a read-only view, or a caller reading the health projection
+    could mutate the record it is only supposed to observe.
+    """
 
     kind: AnomalyKind
-    context: dict[str, object]
+    context: Mapping[str, object]
 
 
 class AnomalyManager:
@@ -54,9 +62,16 @@ class AnomalyManager:
     def report(self, kind: AnomalyKind, context: dict[str, object]) -> None:
         """Report one anomaly: warn, fire the single bus event, record it."""
         LOGGER.warning("Anomaly %s: %s", kind.value, context)
+        # The caller's context is spread FIRST: `event_type` is the single
+        # discriminator every consumer dispatches on (Story 3.1 fans it out to
+        # Repairs and notify), so a context key of the same name must lose to
+        # it, never silently replace it.
         self._hass.bus.async_fire(
             EVENT_HA_IRRIGATION_CONTROLLER,
-            {"event_type": "anomaly", "anomaly": kind.value, **context},
+            {**context, "event_type": "anomaly", "anomaly": kind.value},
         )
         self._open.add(kind)
-        self._last = AnomalyRecord(kind=kind, context=dict(context))
+        self._last = AnomalyRecord(
+            kind=kind,
+            context=MappingProxyType(dict(context)),
+        )

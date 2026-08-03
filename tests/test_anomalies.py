@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
+
 from custom_components.ha_irrigation_controller.adapters.anomalies import (
     AnomalyManager,
 )
@@ -13,7 +15,6 @@ from custom_components.ha_irrigation_controller.const import (
 from custom_components.ha_irrigation_controller.engine.ports import AnomalyKind
 
 if TYPE_CHECKING:
-    import pytest
     from homeassistant.core import Event, HomeAssistant
 
 
@@ -97,3 +98,53 @@ async def test_recorded_state_is_isolated_from_callers(hass: HomeAssistant) -> N
     last = manager.last_anomaly
     assert last is not None
     assert last.context == {"cycle_id": "c-1"}
+
+
+async def test_a_reader_cannot_mutate_the_recorded_context(
+    hass: HomeAssistant,
+) -> None:
+    """The other direction: `frozen=True` protects the binding, not the dict.
+
+    A caller reading the health projection must not be able to edit the record
+    it is only supposed to observe.
+    """
+    manager = AnomalyManager(hass)
+    manager.report(AnomalyKind.JOURNAL_SAVE_FAILED, {"cycle_id": "c-1"})
+    await hass.async_block_till_done()
+
+    last = manager.last_anomaly
+    assert last is not None
+    with pytest.raises(TypeError):
+        last.context["cycle_id"] = "mutated"  # type: ignore[index]
+
+    assert last.context == {"cycle_id": "c-1"}
+
+
+async def test_a_context_key_cannot_hijack_the_event_discriminator(
+    hass: HomeAssistant,
+) -> None:
+    """`event_type` is the ONE key every consumer dispatches on.
+
+    Story 3.1 fans anomalies out to Repairs and notify off this field, so a
+    context key of the same name has to lose to it — an automation filtering
+    on `event_type == "anomaly"` must never miss a fired anomaly.
+    """
+    events: list[Event] = []
+    unsubscribe = hass.bus.async_listen(
+        EVENT_HA_IRRIGATION_CONTROLLER,
+        events.append,
+    )
+    manager = AnomalyManager(hass)
+
+    manager.report(
+        AnomalyKind.PUMP_ON_UNCONFIRMED,
+        {"event_type": "hijacked", "anomaly": "hijacked", "cycle_id": "c-1"},
+    )
+    await hass.async_block_till_done()
+    unsubscribe()
+
+    assert events[0].data == {
+        "event_type": "anomaly",
+        "anomaly": "pump_on_unconfirmed",
+        "cycle_id": "c-1",
+    }

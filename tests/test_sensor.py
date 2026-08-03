@@ -33,11 +33,11 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ha_irrigation_controller.const import (
     CONF_MORNING_ENABLED,
+    CONF_VALVE_SWITCH,
     DOMAIN,
     SUBENTRY_TYPE_ZONE,
 )
-from tests.common import CONTROLLER_OPTIONS, zone_subentry_data
-from tests.test_runner import fire_at, paris  # noqa: F401 — fixture re-export
+from tests.common import CONTROLLER_OPTIONS, fire_at, zone_subentry_data
 
 if TYPE_CHECKING:
     from freezegun.api import FrozenDateTimeFactory
@@ -130,7 +130,7 @@ def device_of(hass: HomeAssistant, entity: RegistryEntry) -> DeviceEntry:
 async def entry(
     hass: HomeAssistant,
     freezer: FrozenDateTimeFactory,
-    paris: None,  # noqa: F811 — the timezone fixture
+    paris: None,
 ) -> MockConfigEntry:
     """Set up a one-zone controller just before its morning start."""
     freezer.move_to("2026-07-31 06:59:00+02:00")
@@ -251,7 +251,7 @@ async def test_a_failed_open_zone_reports_zero_seconds(
 async def test_entities_follow_the_naming_and_device_conventions(
     hass: HomeAssistant,
     freezer: FrozenDateTimeFactory,
-    paris: None,  # noqa: F811
+    paris: None,
 ) -> None:
     """Stable unique ids, has_entity_name, and each zone entity on its device."""
     freezer.move_to("2026-07-31 06:59:00+02:00")
@@ -285,7 +285,10 @@ async def test_entities_follow_the_naming_and_device_conventions(
         device = device_of(hass, entity)
         assert device.identifiers == {(DOMAIN, zone.subentry_id)}
         assert device.name == title
-        assert valve  # the zone under test is the one carrying this valve
+        # The entity really sits on the device of the zone driving THIS valve,
+        # not merely on some zone device — the pairing is what a subentry mix-up
+        # would break, and titles alone would not catch it.
+        assert zone.data[CONF_VALVE_SWITCH] == valve
 
     assert await hass.config_entries.async_unload(config_entry.entry_id)
     await hass.async_block_till_done()

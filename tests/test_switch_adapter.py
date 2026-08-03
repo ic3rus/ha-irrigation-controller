@@ -9,7 +9,8 @@ engine owns that; double-reporting would double every notification in 3.1).
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from datetime import timedelta
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.const import ATTR_ENTITY_ID, STATE_OFF, STATE_ON
 from homeassistant.exceptions import HomeAssistantError
@@ -20,6 +21,9 @@ from custom_components.ha_irrigation_controller.adapters.switches import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Coroutine
+
+    from freezegun.api import FrozenDateTimeFactory
     from homeassistant.core import HomeAssistant, ServiceCall
 
 VALVE = "switch.zone_1_valve"
@@ -89,6 +93,45 @@ async def test_unconfirmed_command_times_out_to_false(hass: HomeAssistant) -> No
     # nothing — the watch was unsubscribed in `finally`.
     hass.states.async_set(VALVE, STATE_ON)
     await hass.async_block_till_done()
+
+
+async def test_the_timeout_is_the_configured_duration_not_a_flag(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A confirmation inside the window still confirms; past it, it does not.
+
+    The other timeout tests use `timeout_s=0`, which is below the configurable
+    minimum and only proves that the branch exists. This pins the value as a
+    real duration — the clock moves from inside the service call, because
+    `asyncio.timeout` runs on the loop clock and the freezer holds it still.
+    """
+    configured_s = 10
+
+    def _handler_ticking(
+        seconds: int,
+    ) -> Callable[[ServiceCall], Coroutine[Any, Any, None]]:
+        async def _handle(call: ServiceCall) -> None:
+            freezer.tick(timedelta(seconds=seconds))
+            if seconds < configured_s:
+                hass.states.async_set(call.data[ATTR_ENTITY_ID], STATE_ON)
+
+        return _handle
+
+    hass.services.async_register("switch", "turn_on", _handler_ticking(5))
+    hass.states.async_set(VALVE, STATE_OFF)
+    assert await make_adapter(hass, timeout_s=configured_s).async_turn_on(VALVE) is True
+
+    hass.services.async_remove("switch", "turn_on")
+    hass.services.async_register("switch", "turn_on", _handler_ticking(11))
+    hass.states.async_set(VALVE, STATE_OFF)
+    adapter = make_adapter(hass, timeout_s=configured_s)
+
+    task = hass.async_create_task(adapter.async_turn_on(VALVE))
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert await task is False
 
 
 async def test_service_error_returns_false(hass: HomeAssistant) -> None:

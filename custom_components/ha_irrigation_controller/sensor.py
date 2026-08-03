@@ -9,6 +9,13 @@ the loader.
 
 from __future__ import annotations
 
+from typing import Final
+
 from .entities.sensor import async_setup_entry
+
+# Zero: these entities are pushed by the engine-state dispatcher and never
+# poll, so HA has no update calls to serialize (the platform convention wants
+# the constant declared either way).
+PARALLEL_UPDATES: Final = 0
 
 __all__ = ["async_setup_entry"]

@@ -17,6 +17,8 @@ from .plan import irrigation_day
 from .runs import effective_seconds, utc_iso
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from .runs import CycleRun
 
 # Seven calendar days: today plus the six preceding ones (FR20's "7-day
@@ -24,12 +26,16 @@ if TYPE_CHECKING:
 HISTORY_RETENTION_DAYS: Final = 7
 
 
-def history_entry(run: CycleRun) -> dict[str, object]:
+def history_entry(run: CycleRun, ended_at: datetime) -> dict[str, object]:
     """Build one compact, serializable outcome record for a finished cycle.
 
     The irrigation day comes from the ONE `irrigation_day` helper applied to
     `configured_start` — the operator's intent, which never moves, so a cycle
     deferred across midnight stays filed under the day it was scheduled for.
+
+    `ended_at` is the caller's completion instant, NOT the last zone's close:
+    the pump-off (FR3) happens after that close, so keying the field off the
+    zone would report a cycle duration that excludes its final actuation.
     """
     zone_runs = run.zone_runs
     return {
@@ -39,7 +45,7 @@ def history_entry(run: CycleRun) -> dict[str, object]:
         "status": run.status.value,
         "configured_start": utc_iso(run.configured_start),
         "scheduled_start": utc_iso(run.scheduled_start),
-        "ended_at": utc_iso(zone_runs[-1].actual_end) if zone_runs else None,
+        "ended_at": utc_iso(ended_at),
         "zones": [
             {
                 "zone_id": zone.zone_id,

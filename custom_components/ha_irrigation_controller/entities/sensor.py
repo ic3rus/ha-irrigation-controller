@@ -11,7 +11,7 @@ root-level `sensor.py`; this module is what that one re-exports.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -38,6 +38,10 @@ if TYPE_CHECKING:
 # The engine has no cycle at all most of the time, which is not a CycleStatus:
 # an ENUM sensor must declare every state it can ever report.
 STATE_IDLE = "idle"
+
+# Mirrors the root `sensor.py` (the module HA's loader actually imports): the
+# projections are dispatcher-pushed and never poll.
+PARALLEL_UPDATES: Final = 0
 
 
 async def async_setup_entry(
@@ -100,10 +104,16 @@ class CycleStatusSensor(
         """Bind the projection to the controller entry and its sequencer."""
         super().__init__(entry, "cycle_status")
         self._sequencer = sequencer
-        # Every state this sensor can ever report must be listed, and not one
-        # more: HA raises on an unlisted state, and the frontend renders each
-        # of these from translations. CANCELLED joins the list when Story 1.6
-        # adds it to CycleStatus — not before.
+        # Every state this sensor can report MUST be listed — HA raises on an
+        # unlisted one — and each listed value needs a translation entry.
+        #
+        # The list is deliberately wider than what today's push points can
+        # actually surface: the dispatcher fires after `advance()` returns, by
+        # which point PENDING has already become RUNNING and COMPLETED has
+        # already released `current_run` (so a finished cycle reads `idle`).
+        # Declaring the full CycleStatus keeps the sensor safe for Epic 3's
+        # mid-advance pushes instead of making them a breaking change.
+        # CANCELLED joins CycleStatus in Story 1.6 and lands here for free.
         self._attr_options = [STATE_IDLE, *(status.value for status in CycleStatus)]
 
     @property

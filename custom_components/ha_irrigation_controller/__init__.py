@@ -157,11 +157,17 @@ async def async_setup_entry(
             sequencer.current_run.cycle_id if sequencer.current_run else None
         ),
     )
+    # The ONLY thing read back from storage here: the outcome history AC 4
+    # promises to retain for 7 days. Without it the first journal write of
+    # every reload overwrites the stored section with an empty list, and the
+    # reload regime runs on every config change. Machine state stays unread —
+    # resuming an in-flight cycle is AD-11's recovery path and Story 3.2's.
     sequencer = Sequencer(
         plan,
         switches=switches,
         journal=journal,
         anomalies=anomalies,
+        history=await journal.async_load_history(),
     )
     runner = CycleRunner(hass, entry, sequencer=sequencer, clock=clock)
 
@@ -175,7 +181,6 @@ async def async_setup_entry(
     )
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    await runner.async_start()
     # Both must run on every unload path: a surviving timer fails PHCC's
     # verify_cleanup and leaks per reload, and a dropped flush loses the last
     # transition (the reload regime runs constantly).
@@ -183,8 +188,14 @@ async def async_setup_entry(
     # ORDER CONTRACT: HA processes these LIFO, so the LAST registration runs
     # FIRST — the timers are cancelled before the journal is flushed, and the
     # flush therefore persists a state nothing can still move.
+    #
+    # Registered BEFORE the timers are armed: HA runs the on-unload callbacks
+    # when setup itself fails (`ConfigEntry.async_setup`'s `finally`), so a
+    # daily start armed while a later one raises would otherwise have no
+    # registered cancel and leak for the process lifetime.
     entry.async_on_unload(journal.async_flush)
     entry.async_on_unload(runner.async_shutdown)
+    await runner.async_start()
     return True
 
 

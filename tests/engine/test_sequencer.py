@@ -52,8 +52,9 @@ def three_zone_plan() -> ControllerPlan:
 
 def make_sequencer(
     plan: ControllerPlan,
+    history: list[dict[str, object]] | None = None,
 ) -> tuple[Sequencer, FakeSwitchPort, FakeJournalPort, FakeAnomalyPort]:
-    """Wire a sequencer to fresh recording fakes."""
+    """Wire a sequencer to fresh recording fakes, optionally seeded."""
     switches = FakeSwitchPort()
     journal = FakeJournalPort()
     anomalies = FakeAnomalyPort()
@@ -62,6 +63,7 @@ def make_sequencer(
         switches=switches,
         journal=journal,
         anomalies=anomalies,
+        history=history,
     )
     return sequencer, switches, journal, anomalies
 
@@ -678,6 +680,44 @@ async def test_history_gets_one_entry_per_completed_cycle_oldest_first() -> None
         {"zone_id": "zone-1", "status": "completed", "effective_s": 600},
     ]
     json.dumps(history)  # serializable, or this raises
+
+
+async def test_seeded_history_is_kept_and_appended_to() -> None:
+    """A rebuilt engine keeps the outcomes it was handed (the reload path).
+
+    Without the seed the first `_save` after a reload would overwrite the
+    stored 7-day section with an empty list — and the reload regime runs on
+    every config change.
+    """
+    plan = make_plan(make_zone("zone-1", valve=VALVE_1, morning_s=600, evening_s=900))
+    prior: list[dict[str, object]] = [
+        {"irrigation_day": "2026-07-30", "cycle_id": "2026-07-30-evening"},
+    ]
+    sequencer, _, journal, _ = make_sequencer(plan, prior)
+    clock = VirtualClock(aware(7))
+
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await run_to_idle(sequencer, clock)
+
+    history = journal.snapshots[-1]["history"]
+    assert isinstance(history, list)
+    assert [entry["cycle_id"] for entry in history] == [
+        "2026-07-30-evening",
+        "2026-07-31-morning",
+    ]
+
+
+async def test_the_seed_is_copied_not_aliased() -> None:
+    """The caller's list must not grow behind its back (AD-8: owned copies)."""
+    prior: list[dict[str, object]] = []
+    plan = make_plan(make_zone("zone-1", valve=VALVE_1, morning_s=600, evening_s=900))
+    sequencer, _, _, _ = make_sequencer(plan, prior)
+    clock = VirtualClock(aware(7))
+
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await run_to_idle(sequencer, clock)
+
+    assert prior == []
 
 
 async def test_history_records_zero_effective_seconds_for_a_failed_zone() -> None:

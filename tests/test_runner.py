@@ -10,6 +10,7 @@ The runner is the same loop `tests/engine/` drives on a virtual clock, with
 
 from __future__ import annotations
 
+import asyncio
 from datetime import time, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -20,6 +21,7 @@ from homeassistant.helpers.event import (
     async_track_point_in_time,
     async_track_time_change,
 )
+from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
     async_fire_time_changed,
@@ -35,23 +37,38 @@ from custom_components.ha_irrigation_controller.adapters.timing import (
     CycleRunner,
     HaClock,
 )
-from custom_components.ha_irrigation_controller.const import engine_state_signal
+from custom_components.ha_irrigation_controller.const import (
+    CONF_ACTUATION_TIMEOUT,
+    DOMAIN,
+    EVENT_HA_IRRIGATION_CONTROLLER,
+    engine_state_signal,
+)
 from custom_components.ha_irrigation_controller.engine.plan import (
     ControllerPlan,
     ZoneSpec,
 )
-from custom_components.ha_irrigation_controller.engine.runs import CycleStatus
+from custom_components.ha_irrigation_controller.engine.ports import AnomalyKind
+from custom_components.ha_irrigation_controller.engine.runs import (
+    CycleStatus,
+    ZoneRunStatus,
+)
 from custom_components.ha_irrigation_controller.engine.sequencer import Sequencer
+from tests.common import (
+    CONTROLLER_OPTIONS,
+    PUMP,
+    VALVE_1,
+    VALVE_2,
+    fire_at,
+    register_switch_domain,
+    zone_subentry_data,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from datetime import datetime
 
     from freezegun.api import FrozenDateTimeFactory
-    from homeassistant.core import HomeAssistant, ServiceCall
-
-PUMP = "switch.pool_pump"
-VALVE_1 = "switch.zone_1_valve"
-VALVE_2 = "switch.zone_2_valve"
+    from homeassistant.core import Event, HomeAssistant, ServiceCall
 
 
 def make_plan(*, morning_enabled: bool = True) -> ControllerPlan:
@@ -84,26 +101,6 @@ def make_plan(*, morning_enabled: bool = True) -> ControllerPlan:
     )
 
 
-def register_switch_domain(hass: HomeAssistant) -> list[ServiceCall]:
-    """Register switch services that actually flip state, and record calls.
-
-    A recorder alone would never confirm: the verified adapter watches for the
-    state change, so the fake has to behave like a real switch.
-    """
-    calls: list[ServiceCall] = []
-
-    async def _handle(call: ServiceCall) -> None:
-        calls.append(call)
-        state = STATE_ON if call.service == "turn_on" else STATE_OFF
-        hass.states.async_set(call.data[ATTR_ENTITY_ID], state, context=call.context)
-
-    hass.services.async_register("switch", "turn_on", _handle)
-    hass.services.async_register("switch", "turn_off", _handle)
-    for entity_id in (PUMP, VALVE_1, VALVE_2):
-        hass.states.async_set(entity_id, STATE_OFF)
-    return calls
-
-
 def make_runner(
     hass: HomeAssistant,
     plan: ControllerPlan,
@@ -124,23 +121,6 @@ def make_runner(
         anomalies=AnomalyManager(hass),
     )
     return CycleRunner(hass, entry, sequencer=sequencer, clock=clock), sequencer
-
-
-async def fire_at(
-    hass: HomeAssistant,
-    freezer: FrozenDateTimeFactory,
-    moment: str,
-) -> None:
-    """Move the freezer to `moment` (local ISO) and fire the due timers."""
-    freezer.move_to(moment)
-    async_fire_time_changed(hass)
-    await hass.async_block_till_done()
-
-
-@pytest.fixture
-async def paris(hass: HomeAssistant) -> None:
-    """Run the suite in a DST-observing timezone, not the PHCC default."""
-    await hass.config.async_set_time_zone("Europe/Paris")
 
 
 async def test_daily_start_fires_the_cycle(
@@ -456,9 +436,9 @@ async def test_the_runner_arms_nothing_while_idle(
     paris: None,
 ) -> None:
     """Starting an idle runner arms the daily starts only (no point-in-time)."""
-    register_switch_domain(hass)
+    calls = register_switch_domain(hass)
     freezer.move_to("2026-07-31 06:59:00+02:00")
-    runner, _ = make_runner(hass, make_plan())
+    runner, sequencer = make_runner(hass, make_plan())
 
     await runner.async_start()
 
@@ -468,7 +448,166 @@ async def test_the_runner_arms_nothing_while_idle(
     async_fire_time_changed(hass)
     await hass.async_block_till_done()
 
+    assert calls == []
+    assert sequencer.current_run is None
+    assert sequencer.next_wakeup() is None
+
     runner.async_shutdown()
+
+
+# The configurable minimum (`MIN_ACTUATION_TIMEOUT_S`): the shortest wait a
+# real entry can be configured with, so the wired timeout test stays quick.
+UNCONFIRMED_TIMEOUT_S = 1
+
+
+async def drain_asyncio_timers(hass: HomeAssistant) -> None:
+    """Let the loop run the `asyncio.timeout` handles that are already due.
+
+    `async_block_till_done` waits on hass-tracked tasks; the adapter's timeout
+    is a plain loop timer, so a few explicit yields are what actually give the
+    loop the iterations it needs to fire it.
+    """
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await hass.async_block_till_done()
+
+
+async def test_an_exception_from_advance_still_rearms_the_timer(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """A raise must never be what disarms the ONE timer (AC 1).
+
+    This handle has ALREADY fired, so the re-arm alone keeps the loop alive.
+    Without the `finally`, anything the engine does not swallow leaves the
+    cycle with no timer at all and the open valve and pump energized until a
+    daily start that only DEFERS the next cycle rather than closing them.
+    """
+    calls = register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, sequencer = make_runner(hass, make_plan())
+    await runner.async_start()
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+
+    real_advance = sequencer.advance
+
+    async def _boom(now: datetime) -> None:
+        msg = f"engine blew up mid-transition at {now}"
+        raise RuntimeError(msg)
+
+    sequencer.advance = _boom  # type: ignore[method-assign]
+
+    # Driven through the fire callback directly rather than through a timer:
+    # an exception raised inside a loop callback is unretrievable, and the
+    # point here is the `finally`, not how HA logs the failure.
+    freezer.move_to("2026-07-31 07:10:00+02:00")
+    with pytest.raises(RuntimeError, match="blew up"):
+        await runner._async_fire(dt_util.now())  # noqa: SLF001 — the failure path
+
+    sequencer.advance = real_advance  # type: ignore[method-assign]
+    # Nothing was commanded by the failed step...
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls] == [
+        ("turn_on", PUMP),
+        ("turn_on", VALVE_1),
+    ]
+
+    # ...but the surviving registration is what lets the very next tick drain
+    # the boundary for real. Without the `finally` no timer is left to fire.
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls] == [
+        ("turn_on", PUMP),
+        ("turn_on", VALVE_1),
+        ("turn_off", VALVE_1),
+        ("turn_on", VALVE_2),
+    ]
+
+    runner.async_shutdown()
+
+
+def register_hanging_valve(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+) -> list[ServiceCall]:
+    """Switch services where VALVE_1 accepts the command but never flips.
+
+    The real shape of an unconfirmed actuation: no error, no state change —
+    only the adapter's timeout can end the wait.
+
+    The handler pushes the clock past that timeout, because `asyncio.timeout`
+    is scheduled on the event loop's clock and the freezer holds it still: an
+    unmoved clock would hang the wait rather than expire it.
+    """
+    calls: list[ServiceCall] = []
+
+    async def _handle(call: ServiceCall) -> None:
+        calls.append(call)
+        if call.data[ATTR_ENTITY_ID] == VALVE_1 and call.service == "turn_on":
+            freezer.tick(timedelta(seconds=UNCONFIRMED_TIMEOUT_S + 1))
+            return
+        state = STATE_ON if call.service == "turn_on" else STATE_OFF
+        hass.states.async_set(call.data[ATTR_ENTITY_ID], state, context=call.context)
+
+    hass.services.async_register("switch", "turn_on", _handle)
+    hass.services.async_register("switch", "turn_off", _handle)
+    for entity_id in (PUMP, VALVE_1):
+        hass.states.async_set(entity_id, STATE_OFF)
+    return calls
+
+
+async def test_an_unconfirmed_actuation_raises_an_anomaly_and_the_cycle_continues(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """AC 3 end to end, through the timeout branch and the wired adapters.
+
+    The unit suites cover the adapter's timeout and the manager's fan-out
+    separately; this joins them on the real setup path — a valve that never
+    confirms must produce the anomaly AND leave the cycle running fail-wet.
+
+    Uses the configurable minimum so the wait is short; the hanging handler
+    moves the clock past it.
+    """
+    calls = register_hanging_valve(hass, freezer)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    events: list[Event] = []
+    unsubscribe = hass.bus.async_listen(EVENT_HA_IRRIGATION_CONTROLLER, events.append)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options={**CONTROLLER_OPTIONS, CONF_ACTUATION_TIMEOUT: UNCONFIRMED_TIMEOUT_S},
+        subentries_data=[zone_subentry_data("Zone A", VALVE_1)],
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    await drain_asyncio_timers(hass)
+    unsubscribe()
+
+    anomalies = entry.runtime_data.anomalies
+    assert AnomalyKind.VALVE_OPEN_UNCONFIRMED in anomalies.open_anomalies
+    last = anomalies.last_anomaly
+    assert last is not None
+    assert last.context["entity_id"] == VALVE_1
+    assert [event.data["anomaly"] for event in events] == ["valve_open_unconfirmed"]
+
+    # Fail-wet: the slot is consumed, not aborted — the pump stayed on and the
+    # cycle is still running with its zone commanded.
+    run = entry.runtime_data.sequencer.current_run
+    assert run is not None
+    assert run.status is CycleStatus.RUNNING
+    assert run.zone_runs[0].status is ZoneRunStatus.FAILED
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls] == [
+        ("turn_on", PUMP),
+        ("turn_on", VALVE_1),
+    ]
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
 
 
 def test_ha_clock_returns_aware_local_time(hass: HomeAssistant) -> None:

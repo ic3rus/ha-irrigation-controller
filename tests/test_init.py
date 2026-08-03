@@ -18,6 +18,9 @@ from custom_components.ha_irrigation_controller import (
 )
 from custom_components.ha_irrigation_controller.adapters.anomalies import AnomalyManager
 from custom_components.ha_irrigation_controller.adapters.journal import JournalAdapter
+from custom_components.ha_irrigation_controller.adapters.switches import (
+    VerifiedSwitchAdapter,
+)
 from custom_components.ha_irrigation_controller.adapters.timing import CycleRunner
 from custom_components.ha_irrigation_controller.const import (
     CONF_ACTUATION_TIMEOUT,
@@ -43,6 +46,8 @@ from custom_components.ha_irrigation_controller.engine.sequencer import Sequence
 from tests.common import CONTROLLER_OPTIONS, controller_entry, zone_subentry_data
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from homeassistant.core import HomeAssistant
 
 _MODULE = "custom_components.ha_irrigation_controller"
@@ -97,6 +102,48 @@ async def test_setup_wires_the_engine_and_its_adapters(hass: HomeAssistant) -> N
     # The engine runs on the plan the setup validated — one plan, one home.
     assert data.sequencer.plan is data.plan
     assert data.sequencer.current_run is None
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_the_configured_timeout_reaches_the_switch_adapter(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC 3's timeout is configurable only if the parsed value gets wired in.
+
+    The parser, the selector bounds and the adapter are each covered on their
+    own; this pins the wire between them. Line coverage cannot: the
+    construction runs on every setup whatever the value is, and the adapter is
+    deliberately not exposed on `runtime_data`.
+    """
+    configured_s = MAX_ACTUATION_TIMEOUT_S - 1
+    captured: list[int] = []
+
+    def _spy(
+        hass_: HomeAssistant,
+        *,
+        timeout_s: int,
+        cycle_id_provider: Callable[[], str | None],
+    ) -> VerifiedSwitchAdapter:
+        captured.append(timeout_s)
+        return VerifiedSwitchAdapter(
+            hass_,
+            timeout_s=timeout_s,
+            cycle_id_provider=cycle_id_provider,
+        )
+
+    monkeypatch.setattr(f"{_MODULE}.VerifiedSwitchAdapter", _spy)
+    entry = controller_entry(
+        {**CONTROLLER_OPTIONS, CONF_ACTUATION_TIMEOUT: configured_s},
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert captured == [configured_s]
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

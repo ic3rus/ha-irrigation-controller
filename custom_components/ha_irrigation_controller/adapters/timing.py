@@ -126,11 +126,17 @@ class CycleRunner:
         engine's contract is HA-local aware datetimes. Advancing immediately
         starts the cycle in this same tick; the re-arm still catches whatever
         boundary is left.
+
+        The re-arm rides a `finally` for the reason spelled out in
+        `_async_fire`: an escaping exception must never be what disarms the
+        ONE timer.
         """
-        await self._sequencer.request_cycle(kind, self._clock.now())
-        await self._sequencer.advance(self._clock.now())
-        self._rearm()
-        self._async_push_state()
+        try:
+            await self._sequencer.request_cycle(kind, self._clock.now())
+            await self._sequencer.advance(self._clock.now())
+        finally:
+            self._rearm()
+            self._async_push_state()
 
     async def _async_fire(self, _now: datetime) -> None:
         """Serve the due time intent, then re-arm on the next one.
@@ -139,10 +145,20 @@ class CycleRunner:
         no-op on an already-fired timer) so that cancel-then-arm stays the one
         path every registration goes through — which is what makes "exactly
         one live registration" checkable rather than merely intended.
+
+        The re-arm and the push ride a `finally`: this handle has ALREADY
+        fired, so it is the re-arm alone that keeps the loop alive. Anything
+        the engine does not swallow — a `CancelledError` (which its blanket
+        `except Exception` does not catch), a malformed stored history once
+        Story 3.2 loads one — would otherwise leave the cycle with no timer
+        at all, and the open valve and the pump energized until a daily start
+        that only DEFERS the next cycle rather than closing them.
         """
-        await self._sequencer.advance(self._clock.now())
-        self._rearm()
-        self._async_push_state()
+        try:
+            await self._sequencer.advance(self._clock.now())
+        finally:
+            self._rearm()
+            self._async_push_state()
 
     @callback
     def _rearm(self) -> None:

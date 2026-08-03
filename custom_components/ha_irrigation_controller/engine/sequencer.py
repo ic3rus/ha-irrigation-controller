@@ -65,8 +65,17 @@ class Sequencer:
         switches: SwitchPort,
         journal: JournalPort,
         anomalies: AnomalyPort,
+        history: list[dict[str, object]] | None = None,
     ) -> None:
-        """Wire the sequencer to its plan and ports."""
+        """Wire the sequencer to its plan, its ports and any prior history.
+
+        `history` is the ONLY state this constructor accepts back: outcome
+        records are not machine state, so seeding them is not resuming an
+        in-flight cycle (AD-11's recovery path stays Story 3.2's, and it
+        restores `run`/`last_run`/`deferred`). Without the seed the first
+        `_save` of every reload would overwrite the stored 7-day section with
+        an empty list, and the reload regime runs on every config change.
+        """
         # Public and replaceable on purpose: a new plan applies to the NEXT
         # requested cycle; the running cycle only ever reads its own snapshot
         # (AD-8 — Story 1.7's reload deferral builds on this seam).
@@ -79,7 +88,9 @@ class Sequencer:
         # Completed-cycle outcomes, oldest→newest, pruned to the retention
         # window on every completion. Journalled with the rest of the state:
         # Epic 4's state view reads it from here, never from storage (AD-14).
-        self._history: list[dict[str, object]] = []
+        self._history: list[dict[str, object]] = (
+            [] if history is None else list(history)
+        )
         # Each deferred entry keeps the reference instant of its ORIGINAL
         # request: that is what its configured start (and therefore its
         # irrigation day) is derived from, so a cycle deferred across midnight
@@ -269,7 +280,7 @@ class Sequencer:
         # Appended BEFORE the save and before the deferral branch below: a
         # deferred cycle is created in this same call, and the snapshot taken
         # then must already carry this cycle's outcome.
-        self._history.append(history_entry(run))
+        self._history.append(history_entry(run, now))
         self._history = prune_history(self._history, irrigation_day(now))
         await self._save()
         self._last_run = run

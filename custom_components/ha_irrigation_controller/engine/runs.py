@@ -101,12 +101,17 @@ def effective_seconds(zone_run: ZoneRun) -> int:
 
     Epic 2's deficit input and Story 1.5's per-zone sensor both read THIS
     function: AD-5's "no feature re-implements the math" starts here.
+
+    Clamped at zero: `now` comes from the wall clock, which is not monotonic —
+    an NTP correction, a manual time change or a VM snapshot restore between a
+    zone's open and its close would otherwise produce a negative DURATION on a
+    `MEASUREMENT` sensor and a negative deficit input.
     """
     if zone_run.status is ZoneRunStatus.FAILED:
         return 0
     if zone_run.actual_start is None or zone_run.actual_end is None:
         return 0
-    return int((zone_run.actual_end - zone_run.actual_start).total_seconds())
+    return max(0, int((zone_run.actual_end - zone_run.actual_start).total_seconds()))
 
 
 @dataclass(slots=True)

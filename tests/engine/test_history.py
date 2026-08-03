@@ -83,6 +83,19 @@ def test_effective_seconds_of_a_never_started_zone_is_zero() -> None:
     assert effective_seconds(zone) == 0
 
 
+def test_effective_seconds_never_goes_negative() -> None:
+    """A backwards clock step must not produce a negative DURATION.
+
+    `now` comes from the wall clock, which is not monotonic: an NTP
+    correction, a manual time change or a VM snapshot restore between a zone's
+    open and its close would otherwise feed a negative value to the
+    MEASUREMENT sensor and to Epic 2's deficit.
+    """
+    zone = zone_run(start_minute=10, end_minute=8)
+
+    assert effective_seconds(zone) == 0
+
+
 def test_effective_seconds_of_an_unconfirmed_close_still_counts() -> None:
     """An unconfirmed CLOSE watered its slot — only a failed OPEN waters nothing.
 
@@ -101,7 +114,7 @@ def test_history_entry_is_a_compact_serializable_outcome() -> None:
         zone_run(status=ZoneRunStatus.FAILED, zone_id="zone-2", end_minute=25),
     )
 
-    entry = history_entry(run)
+    entry = history_entry(run, aware(7, 26))
 
     assert entry == {
         "cycle_id": "2026-07-31-morning",
@@ -110,7 +123,7 @@ def test_history_entry_is_a_compact_serializable_outcome() -> None:
         "status": "completed",
         "configured_start": "2026-07-31T05:00:00+00:00",
         "scheduled_start": "2026-07-31T05:00:00+00:00",
-        "ended_at": "2026-07-31T05:25:00+00:00",
+        "ended_at": "2026-07-31T05:26:00+00:00",
         "zones": [
             {"zone_id": "zone-1", "status": "completed", "effective_s": 600},
             {"zone_id": "zone-2", "status": "failed", "effective_s": 0},
@@ -118,12 +131,25 @@ def test_history_entry_is_a_compact_serializable_outcome() -> None:
     }
 
 
+def test_ended_at_is_the_completion_instant_not_the_last_zone_close() -> None:
+    """The pump-off (FR3) happens AFTER the last zone closes — `ended_at` covers it.
+
+    Keying the field off `zone_runs[-1].actual_end` would report a cycle
+    duration that excludes its final actuation.
+    """
+    run = cycle_run(zone_run(end_minute=10))
+
+    entry = history_entry(run, aware(7, 11))
+
+    assert entry["ended_at"] == "2026-07-31T05:11:00+00:00"
+
+
 def test_history_entry_of_a_zoneless_cycle() -> None:
-    """A cycle with no zones has no end instant and an empty zone list."""
-    entry = history_entry(cycle_run())
+    """A cycle with no zones still records when it ended, with no zone list."""
+    entry = history_entry(cycle_run(), aware(7))
 
     assert entry["zones"] == []
-    assert entry["ended_at"] is None
+    assert entry["ended_at"] == "2026-07-31T05:00:00+00:00"
 
 
 def test_prune_history_keeps_today_and_the_six_preceding_days() -> None:
