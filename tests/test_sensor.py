@@ -38,6 +38,7 @@ from custom_components.ha_irrigation_controller.const import (
     CONF_MORNING_ENABLED,
     CONF_VALVE_SWITCH,
     DOMAIN,
+    SERVICE_CANCEL_CYCLE,
     SUBENTRY_TYPE_ZONE,
 )
 from tests.common import CONTROLLER_OPTIONS, fire_at, zone_subentry_data
@@ -346,6 +347,56 @@ async def test_removing_a_zone_removes_its_entity(
 
     assert er.async_get(hass).async_get_entity_id("sensor", DOMAIN, unique_id) is None
     assert not entry.get_subentries_of_type(SUBENTRY_TYPE_ZONE)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_a_cancelled_cycle_reports_zero_for_the_zones_it_never_reached(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """A CANCELLED run is an ANSWER for un-reached zones, not missing data.
+
+    `_close_live_zone` leaves the zones the cancel never reached with no
+    `actual_end`, and that run becomes `last_run` — the first time `last_run`
+    can hold a zone with no end instant. Gating on `actual_end` alone would
+    flap every one of those MEASUREMENT sensors to `unknown` and pollute its
+    long-term statistics, while the README documents the opposite ("zones the
+    cycle never reached are recorded as having watered zero seconds").
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    entry = controller_with_zones(
+        zone_subentry_data("Zone A", VALVE_A),
+        zone_subentry_data("Zone B", VALVE_B),
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switches(hass)
+
+    duration_b = entity_id_for(
+        hass,
+        f"{entry.entry_id}_{zone_of(entry, 'Zone B').subentry_id}"
+        "_last_watering_duration",
+    )
+    duration_a = entity_id_for(
+        hass,
+        f"{entry.entry_id}_{zone_of(entry, 'Zone A').subentry_id}"
+        "_last_watering_duration",
+    )
+    assert state_of(hass, duration_b).state == "unknown"
+
+    # Zone A opens at 07:00 and is still the live slot at 07:05, so Zone B's
+    # 07:10-07:20 window is never reached.
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    freezer.move_to("2026-07-31 07:05:00+02:00")
+    await hass.services.async_call(DOMAIN, SERVICE_CANCEL_CYCLE, blocking=True)
+    await hass.async_block_till_done()
+
+    assert state_of(hass, duration_a).state == "300"
+    assert state_of(hass, duration_b).state == "0"
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

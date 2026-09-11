@@ -19,6 +19,7 @@ from homeassistant.const import (
     SERVICE_TURN_ON,
     STATE_OFF,
     STATE_ON,
+    STATE_UNAVAILABLE,
     Platform,
 )
 from homeassistant.helpers import (
@@ -240,6 +241,8 @@ async def test_unloading_leaves_no_lingering_subscription(
     await hass.async_block_till_done()
 
     # The registry keeps the entity (a reload restores it); its state going
-    # unavailable is what "the platform was torn down" looks like.
+    # unavailable is what "the platform was torn down" looks like. Asserted as
+    # the exact state, not merely "not on and not off": the loose form passes
+    # for any string at all, including a corrupted one.
     state = state_of(hass, season)
-    assert state.state not in (STATE_ON, STATE_OFF)
+    assert state.state == STATE_UNAVAILABLE

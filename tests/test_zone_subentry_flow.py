@@ -942,3 +942,43 @@ async def test_zone_order_survives_the_storage_path(hass: HomeAssistant) -> None
     assert [
         s.title for s in entry.get_subentries_of_type(SUBENTRY_TYPE_ZONE)
     ] == expected
+
+
+async def test_add_zone_rejects_our_own_season_switch_as_a_valve(
+    hass: HomeAssistant,
+) -> None:
+    """The valve picker refuses the integration's own switch entity.
+
+    Same rule as the pump guard in `test_config_flow.py`, from the other side:
+    a zone whose "valve" is our own season switch would make the sequencer
+    command itself mid-cycle, and the ONE lock turns that into a stalled
+    actuation plus a season flip landing out of band.
+    """
+    entry = await _setup_controller(hass)
+    season = er.async_get(hass).async_get_entity_id(
+        "switch",
+        DOMAIN,
+        f"{entry.entry_id}_season",
+    )
+    assert season is not None
+
+    result = await hass.config_entries.subentries.async_init(
+        (entry.entry_id, SUBENTRY_TYPE_ZONE),
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={**ZONE_INPUT, CONF_VALVE_SWITCH: season},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_VALVE_SWITCH: "valve_is_own_entity"}
+
+    # Recovery: a real valve saves through the same open form.
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={**ZONE_INPUT, CONF_VALVE_SWITCH: "switch.zone_1_valve"},
+    )
+    await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    zones = entry.get_subentries_of_type(SUBENTRY_TYPE_ZONE)
+    assert [s.data[CONF_VALVE_SWITCH] for s in zones] == ["switch.zone_1_valve"]

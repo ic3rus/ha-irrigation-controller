@@ -86,9 +86,15 @@ class JournalAdapter:
         honoured only when it is a real `bool`, so an absent key (every
         document written before Story 1.6) and the drift that merely looks
         falsy (`None`, `"false"`, `0`) all read as True. Doubt waters (AD-4).
+
+        The document TYPE is part of that boundary: `Store` is only generic in
+        its annotation, so a `data` section that is a list or a string is a
+        real shape a hand edit or a restored backup can produce. Trusting the
+        annotation would raise `AttributeError` out of `async_setup_entry` —
+        the opposite of the fail-wet default this method promises.
         """
         stored = await self._store.async_load()
-        if stored is None:
+        if not isinstance(stored, dict):
             return JournalSeed(history=[], season_enabled=True)
         history = stored.get("history")
         season = stored.get("season_enabled")

@@ -4,10 +4,12 @@ Registered in `async_setup`, resolved to the one loaded entry per call, and
 never removed on unload (`action-setup`) — an automation referencing one must
 stay editable, and the call must explain itself when nothing is loaded.
 
-Every user error is a translated `ServiceValidationError`. Never a bare
-`return`, never a `vol.Invalid`: the range and identity checks live in the
-handlers precisely because a schema failure is not what AC 5 asks for, and the
-`services.yaml` selectors are UI affordances the WebSocket API bypasses.
+Every error AC 5 enumerates is a translated `ServiceValidationError`, never a
+bare `return`: the range and identity checks live in the handlers precisely
+because a schema failure is not what AC 5 asks for, and the `services.yaml`
+selectors are UI affordances the WebSocket API bypasses. A value of the wrong
+TYPE still fails voluptuous as an untranslated `vol.Invalid`, exactly as it
+does in core — none of those is one of AC 5's cases.
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ from tests.common import (
     PUMP,
     VALVE_1,
     VALVE_2,
+    controller_entry,
     fire_at,
     register_switch_domain,
     zone_subentry_data,
@@ -355,6 +358,43 @@ async def test_an_unknown_zone_id_names_the_zones_it_could_have_been(
     await hass.async_block_till_done()
 
 
+async def test_the_unknown_zone_message_says_so_when_there_are_no_zones(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """The message is the operator's only recovery route — it must not trail off.
+
+    A controller with no zones is a supported state (the engine runs zero-zone
+    plans), and it is the state in which a wrong `zone_id` is most likely. A
+    bare join would render "The configured zones are: ." and tell them nothing.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    config_entry = controller_entry()
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    with pytest.raises(ServiceValidationError) as raised:
+        await call(
+            hass,
+            SERVICE_SET_ZONE_DURATION,
+            {
+                ATTR_ZONE_ID: "not-a-zone",
+                ATTR_CYCLE: "morning",
+                ATTR_DURATION: 12,
+            },
+        )
+
+    assert raised.value.translation_key == "unknown_zone"
+    placeholders = raised.value.translation_placeholders
+    assert placeholders is not None
+    assert placeholders["known"] == "none — this controller has no zones configured"
+
+    assert await hass.config_entries.async_unload(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+
 async def test_a_subentry_that_is_not_a_zone_is_rejected(
     hass: HomeAssistant,
     freezer: FrozenDateTimeFactory,
@@ -449,20 +489,16 @@ async def test_a_duration_outside_the_bounds_raises(
 
 
 @pytest.mark.parametrize(
-    ("duration", "at_bound"),
-    [
-        (MIN_ZONE_DURATION_MINUTES, "min"),
-        (MAX_ZONE_DURATION_MINUTES, "max"),
-    ],
+    "duration",
+    [MIN_ZONE_DURATION_MINUTES, MAX_ZONE_DURATION_MINUTES],
+    ids=["min", "max"],
 )
 async def test_the_bounds_themselves_are_accepted(
     hass: HomeAssistant,
     entry: MockConfigEntry,
     duration: int,
-    at_bound: str,
 ) -> None:
     """Both edges are INSIDE the range — an off-by-one here is invisible."""
-    assert at_bound in ("min", "max")
     # The maximum on one zone would collide with the evening cycle, so the
     # other zone is shortened to its minimum first.
     await call(

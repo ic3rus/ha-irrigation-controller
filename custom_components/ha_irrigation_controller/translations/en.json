@@ -27,7 +27,8 @@
             }
         },
         "error": {
-            "start_times_conflict": "The morning and evening cycles cannot start at the same time. Change one of them, or turn the morning cycle off."
+            "start_times_conflict": "The morning and evening cycles cannot start at the same time. Change one of them, or turn the morning cycle off.",
+            "pump_is_own_entity": "This is the irrigation controller's own Season switch, not a physical pump. Pick the switch that powers your pump."
         },
         "abort": {
             "already_configured": "This controller is already configured.",
@@ -86,6 +87,7 @@
             },
             "error": {
                 "valve_is_pump": "This is the pump switch, not a zone valve. Pick the switch that opens this zone's own valve.",
+                "valve_is_own_entity": "This is the irrigation controller's own Season switch, not a physical valve. Pick the switch that opens this zone's valve.",
                 "valve_already_configured": "Another zone already uses this valve. Each zone needs its own valve switch.",
                 "valve_not_found": "That valve no longer exists. Pick a switch that is currently available.",
                 "name_required": "Give this zone a name. It is how the zone appears on its device, the dashboard card and in notifications.",
@@ -129,6 +131,7 @@
         "error": {
             "start_times_conflict": "The morning and evening cycles cannot start at the same time. Change one of them, or turn the morning cycle off.",
             "pump_is_zone_valve": "This switch is already used as a zone's valve. Pick the switch that powers the pump, not one that opens a valve.",
+            "pump_is_own_entity": "This is the irrigation controller's own Season switch, not a physical pump. Pick the switch that powers your pump.",
             "cycles_overlap": "With these start times the morning cycle would still be watering when the evening cycle starts. Move the start times apart or shorten the zones.",
             "evening_cycle_overlap": "With these start times the evening cycle would still be watering when the morning cycle starts. Move the start times apart or shorten the zones."
         }

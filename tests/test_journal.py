@@ -338,6 +338,34 @@ async def test_an_absent_or_non_bool_season_seeds_on(
     assert (await JournalAdapter(hass).async_load_seed()).season_enabled is True
 
 
+@pytest.mark.parametrize(
+    "stored",
+    [[], "corrupted", 3, None],
+)
+async def test_a_document_that_is_not_a_mapping_seeds_the_fail_wet_defaults(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    stored: object,
+) -> None:
+    """The document TYPE is part of the trust boundary, not an assumption.
+
+    `Store` is generic only in its annotation, so a `data` section that is a
+    list, a string or a number is a real shape a hand edit or a restored backup
+    produces. Trusting the annotation would raise `AttributeError` out of
+    `async_setup_entry` — the opposite of the fail-wet default this seam
+    promises, and an integration that refuses to load rather than watering.
+    """
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": stored,
+    }
+
+    seed = await JournalAdapter(hass).async_load_seed()
+    assert seed.history == []
+    assert seed.season_enabled is True
+
+
 async def test_a_stored_false_season_is_honoured(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],

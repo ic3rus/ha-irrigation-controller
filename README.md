@@ -82,11 +82,13 @@ The change applies without restarting Home Assistant. The call is rejected —
 with a translated error and no write — when the duration is outside 1–120
 minutes, or when it would make the morning and evening cycles overlap.
 
-> **Caveat (fixed in a later release):** applying a duration change reloads the
-> integration, and a reload currently abandons a cycle that is running at that
-> moment, leaving the valve and pump as they were. Avoid calling this action
-> mid-cycle until that is handled. The action deliberately does *not* refuse
-> the call, because durations are meant to be editable at any moment.
+> **⚠️ Caveat (fixed in a later release):** applying a duration change reloads
+> the integration, and a reload currently abandons a cycle that is running at
+> that moment. The open valve and the pump are **left switched on, with no
+> timer left to close them** — they stay energized until you turn them off
+> yourself. Do not call this action while a cycle is running until that is
+> handled. The action deliberately does *not* refuse the call, because
+> durations are meant to be editable at any moment.
 
 ## Development
 

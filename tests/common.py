@@ -78,14 +78,32 @@ def register_switch_domain(hass: HomeAssistant) -> list[ServiceCall]:
     registered; calling it is exactly what `async_call` does.
     """
     calls: list[ServiceCall] = []
-    fake_hardware = {PUMP, VALVE_1, VALVE_2}
+    # A tuple, not a set: the seeding loop below sets initial states, and a set
+    # would order them by PYTHONHASHSEED.
+    fake_hardware = (PUMP, VALVE_1, VALVE_2)
     replaced = {
         name: service.job.target
         for name, service in hass.services.async_services_for_domain("switch").items()
     }
+    # The ORDER CONTRACT above, enforced rather than merely documented. An entry
+    # for this domain existing means `async_forward_entry_setups` has run (or is
+    # about to), and forwarding `Platform.SWITCH` is what loads HA's switch
+    # component — so an empty `replaced` at that point means this helper is
+    # about to be overwritten and every cycle will stall on a confirmation that
+    # cannot arrive. A hang is the hardest failure to trace back to here; this
+    # turns it into a named one. Runner-level tests build no entry at all and
+    # legitimately have nothing to delegate to.
+    assert replaced or not hass.config_entries.async_entries(DOMAIN), (
+        "register_switch_domain must be called AFTER the entry is set up — "
+        "see the ORDER CONTRACT in its docstring."
+    )
 
     async def _handle(call: ServiceCall) -> None:
-        entity_id = call.data[ATTR_ENTITY_ID]
+        # `.get`, not `[]`: a call targeting an area, a device or a label
+        # carries no `entity_id` at all, and the list form is equally legal.
+        # Neither is fake hardware, so both belong on the delegate path rather
+        # than raising KeyError inside a service handler.
+        entity_id = call.data.get(ATTR_ENTITY_ID)
         if entity_id not in fake_hardware:
             delegate = replaced.get(call.service)
             if delegate is not None:

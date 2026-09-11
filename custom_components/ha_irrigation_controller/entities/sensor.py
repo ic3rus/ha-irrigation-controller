@@ -136,18 +136,27 @@ class ZoneLastWateringSensor(HaIrrigationZoneEntity, SensorEntity):
 
         The value itself always comes from `effective_seconds` — the ONE
         helper Epic 2's deficit also reads (AD-5).
+
+        A CANCELLED run is the one case where a zone with no `actual_end` is
+        still an ANSWER rather than missing data: the cancel stopped the cycle
+        before that zone's slot, so it watered zero seconds — which is what the
+        README documents and what `effective_seconds` returns for it. Without
+        this branch a cancel would flap every un-reached zone's MEASUREMENT
+        sensor to `unknown` and pollute its long-term statistics.
         """
         for run in (self._sequencer.current_run, self._sequencer.last_run):
+            if run is None:
+                continue
             zone = _zone_run(run, self._zone_id)
-            if zone is not None and zone.actual_end is not None:
+            if zone is not None and (
+                zone.actual_end is not None or run.status is CycleStatus.CANCELLED
+            ):
                 return effective_seconds(zone)
         return None
 
 
-def _zone_run(run: CycleRun | None, zone_id: str) -> ZoneRun | None:
+def _zone_run(run: CycleRun, zone_id: str) -> ZoneRun | None:
     """Return `zone_id`'s slot in `run`, or None when it has none."""
-    if run is None:
-        return None
     return next((zone for zone in run.zone_runs if zone.zone_id == zone_id), None)
 
 
@@ -157,6 +166,11 @@ def _live_zone(run: CycleRun) -> ZoneRun | None:
     Identified by "started but not finished" rather than by status: a FAILED
     zone is indistinguishable by status from a finished one, and it is still
     the live slot until its planned end (fail-wet consumes the slot, AD-4).
+
+    The SAME rule is encoded in `engine/sequencer.py::_close_live_zone`, which
+    is what a cancel closes. The duplication is deliberate (the engine may not
+    import from `entities/`), so the two must be edited together — promoting it
+    to a shared `engine/runs.py` helper is the clean follow-up.
     """
     return next(
         (

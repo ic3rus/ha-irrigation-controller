@@ -17,9 +17,13 @@ Five rules hold this module together:
    path resolves the one entry and raises the already-translated
    `ServiceValidationError` for "no entry" / "more than one" / "not loaded" —
    three branches this module neither writes nor has to cover.
-3. Every user error is a `ServiceValidationError` carrying
+3. Every error AC 5 enumerates is a `ServiceValidationError` carrying
    `translation_domain` + `translation_key` (`action-exceptions`). Never a bare
-   `return`, never a `HomeAssistantError` for bad input.
+   `return`, never a `HomeAssistantError` for bad input. The schemas below are
+   the one exception and are NOT translated: a value that is the wrong TYPE
+   (`cycle: "afternoon"`, a non-numeric `duration`, a missing `enabled`) fails
+   voluptuous and surfaces as `vol.Invalid`, exactly as it does in every core
+   integration. None of those is one of AC 5's cases.
 4. Range and identity validation live in the HANDLERS, not in the voluptuous
    schemas: a schema failure raises `vol.Invalid`, which is not what AC 5 asks
    for. The `services.yaml` selectors are UI affordances only — the WebSocket
@@ -236,8 +240,14 @@ def _proposed_zones(
 
 
 def _known_zones(entry: HaIrrigationConfigEntry) -> str:
-    """Return the zones as `id (name)` pairs for an error message."""
-    return ", ".join(
+    """Return the zones as `id (name)` pairs for an error message.
+
+    A controller with no zones is a supported state (the engine runs zero-zone
+    plans), and it is the state in which a wrong `zone_id` is most likely — so
+    the message says so rather than trailing off into "are: .".
+    """
+    pairs = ", ".join(
         f"{subentry.subentry_id} ({subentry.title})"
         for subentry in entry.get_subentries_of_type(SUBENTRY_TYPE_ZONE)
     )
+    return pairs or "none — this controller has no zones configured"
