@@ -19,6 +19,7 @@ from custom_components.ha_irrigation_controller.adapters.journal import (
 from custom_components.ha_irrigation_controller.const import (
     ATTR_CYCLE,
     DOMAIN,
+    SERVICE_CANCEL_CYCLE,
     SERVICE_RUN_NOW,
 )
 from custom_components.ha_irrigation_controller.engine.sequencer import (
@@ -40,6 +41,10 @@ if TYPE_CHECKING:
 def snapshot(marker: int) -> dict[str, object]:
     """Build a distinguishable engine-like snapshot."""
     return {"schema_version": JOURNAL_SCHEMA_VERSION, "history": [], "run": marker}
+
+
+# The ledger section that owes nothing — what every unreadable section reads as.
+EMPTY_LEDGER: dict[str, object] = {"settled_cycle_id": None, "deficits": {}}
 
 
 async def test_transitions_coalesce_under_the_debounce(
@@ -222,6 +227,7 @@ async def test_load_seed_returns_the_fail_wet_defaults_when_no_store_exists(
 
     assert seed.history == []
     assert seed.season_enabled is True
+    assert seed.ledger == EMPTY_LEDGER
 
 
 @pytest.mark.parametrize(
@@ -256,7 +262,22 @@ async def test_load_seed_drops_records_the_engine_cannot_consume(
     That abandons a cycle mid-flight with the pump on, so the trust boundary
     filters rather than trusts — the same rule `build_plan` applies to options.
     """
-    good = {"irrigation_day": "2026-07-30", "cycle_id": "keep-me"}
+    good = {
+        "irrigation_day": "2026-07-30",
+        "cycle_id": "keep-me",
+        # A zone record as Story 2.2 writes it: the quoted duration and the
+        # carried deficit ride through the seed untouched, like every other
+        # nested value.
+        "zones": [
+            {
+                "zone_id": "zone-1",
+                "status": "completed",
+                "planned_s": 900,
+                "carried_s": 300,
+                "effective_s": 900,
+            },
+        ],
+    }
     hass_storage[STORAGE_KEY] = {
         "version": JOURNAL_SCHEMA_VERSION,
         "key": STORAGE_KEY,
@@ -610,3 +631,162 @@ async def test_a_journal_written_before_the_manual_marker_still_sets_up(
         "2026-07-31-morning",
     ]
     assert [record["manual"] for record in stored] == [False, False]
+
+
+# --------------------------------------------------------------------------
+# The ledger section (Story 2.2)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        {"schema_version": JOURNAL_SCHEMA_VERSION},  # a document written before 2.2
+        {"ledger": None},
+        {"ledger": "corrupted"},
+        {"ledger": []},
+        {"ledger": {}},
+        {"ledger": {"settled_cycle_id": None, "deficits": "not-a-mapping"}},
+        {"ledger": {"settled_cycle_id": None, "deficits": [600]}},
+        {"ledger": {"settled_cycle_id": 42, "deficits": {}}},
+        {"ledger": {"settled_cycle_id": ["x"], "deficits": {"zone-1": 600}}},
+    ],
+    ids=[
+        "absent",
+        "none",
+        "string",
+        "list",
+        "empty-mapping",
+        "deficits-string",
+        "deficits-list",
+        "settled-int",
+        "settled-list",
+    ],
+)
+async def test_load_seed_reads_a_missing_or_malformed_ledger_as_empty(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    stored: dict[str, object],
+) -> None:
+    """Matrix "pre-2.2 journal": no section, or a broken one, is an EMPTY ledger.
+
+    `JOURNAL_SCHEMA_VERSION` carries no migration, so the section is optional
+    on read; and the engine trusts the seed, so a shape it cannot do
+    arithmetic on must never reach it. Empty is the fail-wet reading (AD-4):
+    the next cycle is quoted on base durations, and nothing is logged.
+    """
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": stored,
+    }
+
+    assert (await JournalAdapter(hass).async_load_seed()).ledger == EMPTY_LEDGER
+
+
+async def test_load_seed_keeps_only_the_deficits_the_engine_can_consume(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+) -> None:
+    """Entries are filtered ONE BY ONE: a bad zone must not forget the others.
+
+    Kept: a `str` key with a non-negative `int` value. Dropped: a negative, a
+    numeric string, a float, a `bool` (an `int` to Python — the one shape a
+    plain `isinstance` would let through) and a non-string key.
+    """
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {
+            "ledger": {
+                "settled_cycle_id": "2026-07-30-evening",
+                "deficits": {
+                    "zone-1": 300,
+                    "zone-2": 0,
+                    "zone-3": -5,
+                    "zone-4": "600",
+                    "zone-5": True,
+                    "zone-6": 1.5,
+                    7: 600,
+                },
+            },
+        },
+    }
+
+    assert (await JournalAdapter(hass).async_load_seed()).ledger == {
+        "settled_cycle_id": "2026-07-30-evening",
+        "deficits": {"zone-1": 300, "zone-2": 0},
+    }
+
+
+async def test_load_seed_accepts_a_ledger_with_deficits_but_no_settled_id(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+) -> None:
+    """A hand-written section with only `deficits` seeds those deficits.
+
+    An absent `settled_cycle_id` reads as None — the ledger has nothing to
+    replay-guard against — and the deficits are still kept, filtered as usual.
+    """
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {"ledger": {"deficits": {"zone-1": 300, "zone-2": "bad"}}},
+    }
+
+    assert (await JournalAdapter(hass).async_load_seed()).ledger == {
+        "settled_cycle_id": None,
+        "deficits": {"zone-1": 300},
+    }
+
+
+async def test_a_stored_ledger_round_trips_through_a_reload(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """AC 3: a deficit written by the one writer is read back by the one reader.
+
+    A cancel at +5 min of a 10 min morning slot books 300 s. After the
+    unload the stored section carries it; after the reload the rebuilt engine
+    owes it, and the evening cycle is quoted 900 + 300.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[zone_subentry_data("Zone A", "switch.zone_1_valve")],
+    )
+    entry.add_to_hass(hass)
+    zone_id = next(iter(entry.subentries))
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    freezer.move_to("2026-07-31 07:05:00+02:00")
+    await hass.services.async_call(DOMAIN, SERVICE_CANCEL_CYCLE, blocking=True)
+    await hass.async_block_till_done()
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass_storage[STORAGE_KEY]["data"]["ledger"] == {
+        "settled_cycle_id": "2026-07-31-morning",
+        "deficits": {zone_id: 300},
+    }
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+    sequencer = entry.runtime_data.sequencer
+    assert sequencer.ledger.deficit_s(zone_id) == 300
+
+    await fire_at(hass, freezer, "2026-07-31 20:00:00+02:00")
+    run = sequencer.current_run
+    assert run is not None
+    assert (run.zone_runs[0].duration_s, run.zone_runs[0].carried_s) == (1200, 300)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()

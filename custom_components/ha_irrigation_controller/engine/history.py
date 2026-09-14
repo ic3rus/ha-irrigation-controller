@@ -41,6 +41,11 @@ def history_entry(run: CycleRun, ended_at: datetime) -> dict[str, object]:
     the ONE place it reaches history, and it is what tells a run-now apart
     from the scheduled cycle of the same kind on the same irrigation day —
     Story 2.3's day credit and Epic 4's history view both key off it.
+
+    Each zone record carries the QUOTED duration (`planned_s`) and the deficit
+    the ledger applied to it (`carried_s`) next to what it actually watered
+    (Story 2.2): Epic 4's history view reads the three together to show why a
+    zone ran longer than its base and how much of the plan it met.
     """
     zone_runs = run.zone_runs
     return {
@@ -56,6 +61,8 @@ def history_entry(run: CycleRun, ended_at: datetime) -> dict[str, object]:
             {
                 "zone_id": zone.zone_id,
                 "status": zone.status.value,
+                "planned_s": zone.duration_s,
+                "carried_s": zone.carried_s,
                 "effective_s": effective_seconds(zone),
             }
             for zone in zone_runs

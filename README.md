@@ -43,7 +43,8 @@ is loaded fails with a clear message rather than disappearing.
 No fields. Stops the cycle running right now: the open valve is closed, then
 the pump, and the run is recorded as **cancelled**. This is the *only* thing
 that stops a running cycle. Zones the cycle never reached are recorded as
-having watered zero seconds.
+having watered zero seconds — and, like the zone that was cut short, they
+carry the shortfall forward (see [Water debt](#water-debt)).
 
 Calling it with nothing running is an error, not a silent no-op.
 
@@ -115,6 +116,42 @@ minutes, or when it would make the morning and evening cycles overlap.
 Like every other configuration change, it follows the rules below when a
 cycle is running. The action deliberately does *not* refuse the call, because
 durations are meant to be editable at any moment.
+
+## Water debt
+
+A zone that waters less than planned — its valve never confirmed open, the
+cycle was cancelled before or during its slot, a late catch-up ran every
+boundary at once — does not simply lose that water. The shortfall is recorded
+as a per-zone **deficit** and added to that zone's *next* cycle, whichever
+kind runs next: a zone that is owed 5 minutes waters its configured duration
+plus 5 minutes, and the zones after it start correspondingly later. Water debt
+is a *floor*, never a ceiling: every doubtful case (a valve that timed out but
+may have opened, a cycle that ran with no dwell time) is booked as a deficit
+and watered again.
+
+An extended cycle can still be running when the other cycle's configured
+start arrives. That cycle is then queued and starts the moment the running one
+finishes — delayed, never overlapped and never skipped. The overlap check the
+configuration forms apply to your start times looks at the configured
+durations only and ignores debt.
+
+The deficit is **capped at one full configured duration**, both when it is
+recorded and when it is applied — so a zone never waters more than twice its
+configured duration in one cycle, and repeated failures never snowball. A zone
+that waters its full extended duration clears its debt. The debt of a zone
+removed from the configuration is never applied again and is dropped when the
+next cycle completes. The ledger lives in the integration's own journal, so a
+deficit survives a reload and a Home Assistant restart.
+
+`run_now` uses the same arithmetic: a manual cycle applies, and then clears,
+outstanding deficits exactly like a scheduled one.
+
+Each zone's **Last watering duration** sensor carries two attributes:
+`carried_deficit`, the seconds that were added to the run the sensor is
+showing, and `pending_deficit`, the seconds the zone is owed according to the
+ledger. The ledger only moves when a cycle completes (or is cancelled), so
+while the run that is paying a debt is still in progress `pending_deficit`
+keeps showing that debt; it drops once the run finishes.
 
 ## Configuration changes and running cycles
 

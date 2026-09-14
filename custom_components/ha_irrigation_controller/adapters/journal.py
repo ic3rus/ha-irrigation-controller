@@ -4,11 +4,11 @@ AD-2: the engine journals its state on every transition through this adapter
 into the single versioned `Store`.
 
 Writes are the whole snapshot; what is read back is the SEED
-(`async_load_seed`): the `history` section and the `season_enabled` mode flag,
-in ONE read. Machine state — `run`, `last_run`, `zone_index`, `deferred` — is
-deliberately never loaded here: restoring it to resume an in-flight cycle is
-AD-11's recovery path and it belongs to Story 3.2, which extends this seam
-rather than replacing it.
+(`async_load_seed`): the `history` section, the `season_enabled` mode flag and
+the water-debt `ledger` section, in ONE read. Machine state — `run`,
+`last_run`, `zone_index`, `deferred` — is deliberately never loaded here:
+restoring it to resume an in-flight cycle is AD-11's recovery path and it
+belongs to Story 3.2, which extends this seam rather than replacing it.
 
 One reader method rather than one per key, deliberately: `Store.async_load`
 clears its `_load_future` in a `finally`, so two calls are two reads of the
@@ -45,14 +45,20 @@ STORAGE_KEY: Final = f"{DOMAIN}.journal"
 class JournalSeed:
     """What a freshly built `Sequencer` is seeded with after a load.
 
-    Explicitly NOT machine state: outcome records are history, and the season
-    is a runtime MODE. Neither resumes an in-flight cycle, so reading them
-    back does not make this the AD-11 recovery path — Story 3.2 owns that and
-    extends this dataclass.
+    Explicitly NOT machine state: outcome records are history, the season is
+    a runtime MODE, and the ledger is accounting BETWEEN cycles (Story 2.2).
+    None of them resumes an in-flight cycle, so reading them back does not
+    make this the AD-11 recovery path — Story 3.2 owns that and extends this
+    dataclass.
+
+    `ledger` is the section in the shape `Ledger.as_dict` writes —
+    `{"settled_cycle_id": str | None, "deficits": {zone_id: int}}` — already
+    validated, so the engine can trust it.
     """
 
     history: list[dict[str, object]]
     season_enabled: bool
+    ledger: dict[str, object]
 
 
 class JournalAdapter:
@@ -100,10 +106,17 @@ class JournalAdapter:
         every key this story adds has to be optional on read), and every such
         record reads back as scheduled instead of failing. Readers therefore
         never have to ask whether the key is there.
+
+        The `ledger` section (Story 2.2) is optional on read for the same
+        reason — a document written before it has none — and validated by
+        `_seed_ledger`: a malformed section reads as an EMPTY ledger, which
+        quotes the next cycle on base durations. Fail-wet (AD-4): the worst a
+        corrupt ledger can do is forget a debt, never invent one or crash the
+        setup, and nothing is logged for it.
         """
         stored = await self._store.async_load()
         if not isinstance(stored, dict):
-            return JournalSeed(history=[], season_enabled=True)
+            return JournalSeed(history=[], season_enabled=True, ledger=_empty_ledger())
         history = stored.get("history")
         season = stored.get("season_enabled")
         return JournalSeed(
@@ -117,6 +130,7 @@ class JournalAdapter:
                 else []
             ),
             season_enabled=season if isinstance(season, bool) else True,
+            ledger=_seed_ledger(stored.get("ledger")),
         )
 
     async def async_save(self, snapshot: dict[str, object]) -> None:
@@ -195,3 +209,45 @@ def _seed_entry(entry: object) -> dict[str, object] | None:
     except ValueError:
         return None
     return {**entry, MANUAL_KEY: is_manual(entry)}
+
+
+def _empty_ledger() -> dict[str, object]:
+    """Return the section of a ledger that owes nothing."""
+    return {"settled_cycle_id": None, "deficits": {}}
+
+
+def _seed_ledger(section: object) -> dict[str, object]:
+    """Return the ledger `section` fit for the engine, or an empty ledger.
+
+    The trust boundary for Story 2.2's state, mirroring `_seed_entry`. The
+    engine trusts the seed and does arithmetic on it directly, so every value
+    that reaches it must already be the right type:
+
+    - `deficits` must be a mapping; each entry is kept only with a `str` key
+      and a non-negative `int` value (a `bool` is an `int` to Python and is
+      NOT kept). Entries that fail are dropped one by one — a hand edit that
+      breaks one zone's debt must not forget every other zone's.
+    - `settled_cycle_id` must be a `str` or `None`.
+
+    Anything else about the section's shape — absent (every document written
+    before this story), not a mapping, a `deficits` that is not a mapping, a
+    settled id of another type — reads as an EMPTY ledger. Fail-wet: an empty
+    ledger quotes the next cycle on base durations, which waters.
+    """
+    if not isinstance(section, dict):
+        return _empty_ledger()
+    deficits = section.get("deficits")
+    settled = section.get("settled_cycle_id")
+    if not isinstance(deficits, dict) or not isinstance(settled, str | None):
+        return _empty_ledger()
+    return {
+        "settled_cycle_id": settled,
+        "deficits": {
+            zone_id: seconds
+            for zone_id, seconds in deficits.items()
+            if isinstance(zone_id, str)
+            and isinstance(seconds, int)
+            and not isinstance(seconds, bool)
+            and seconds >= 0
+        },
+    }

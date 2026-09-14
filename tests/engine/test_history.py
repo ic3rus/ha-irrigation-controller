@@ -40,6 +40,7 @@ def zone_run(
         name="Front Lawn",
         valve_entity_id=VALVE_1,
         duration_s=600,
+        base_s=600,
         planned_start=aware(7),
         planned_end=aware(7, 10),
         status=status,
@@ -127,9 +128,23 @@ def test_history_entry_is_a_compact_serializable_outcome() -> None:
         "configured_start": "2026-07-31T05:00:00+00:00",
         "scheduled_start": "2026-07-31T05:00:00+00:00",
         "ended_at": "2026-07-31T05:26:00+00:00",
+        # Story 2.2: the quoted duration and the carried deficit sit next to
+        # what the zone actually watered, so Epic 4 can show all three.
         "zones": [
-            {"zone_id": "zone-1", "status": "completed", "effective_s": 600},
-            {"zone_id": "zone-2", "status": "failed", "effective_s": 0},
+            {
+                "zone_id": "zone-1",
+                "status": "completed",
+                "planned_s": 600,
+                "carried_s": 0,
+                "effective_s": 600,
+            },
+            {
+                "zone_id": "zone-2",
+                "status": "failed",
+                "planned_s": 600,
+                "carried_s": 0,
+                "effective_s": 0,
+            },
         ],
     }
 
