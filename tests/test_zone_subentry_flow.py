@@ -665,11 +665,13 @@ async def test_reconfigure_prefills_and_updates_only_that_zone(
     # non-obvious semantics a refactor to `if device is None:` would break
     # silently, leaving every renamed zone's device stuck on its old name.
     registry = dr.async_get(hass)
-    zone1_device = registry.async_get_device(identifiers={(DOMAIN, zone1_id)})
+    zone1_device = registry.async_get_device_by_identifier(
+        (DOMAIN, zone1_id), entry.entry_id
+    )
     assert zone1_device is not None
     assert zone1_device.name == "Zone 1 renamed"
-    zone2_device = registry.async_get_device(
-        identifiers={(DOMAIN, zone2.subentry_id)},
+    zone2_device = registry.async_get_device_by_identifier(
+        (DOMAIN, zone2.subentry_id), entry.entry_id
     )
     assert zone2_device is not None
     assert zone2_device.name == "Zone 2"
@@ -735,13 +737,13 @@ async def test_zone_device_links_via_device_to_controller(
     zone = await add_zone(hass, entry, name="Front Lawn")
 
     registry = dr.async_get(hass)
-    controller_device = registry.async_get_device(
-        identifiers={(DOMAIN, entry.entry_id)},
+    controller_device = registry.async_get_device_by_identifier(
+        (DOMAIN, entry.entry_id), entry.entry_id
     )
     assert controller_device is not None
 
-    zone_device = registry.async_get_device(
-        identifiers={(DOMAIN, zone.subentry_id)},
+    zone_device = registry.async_get_device_by_identifier(
+        (DOMAIN, zone.subentry_id), entry.entry_id
     )
     assert zone_device is not None
     assert zone_device.via_device_id == controller_device.id
@@ -850,9 +852,17 @@ async def test_remove_zone_reloads_and_cleans_up(hass: HomeAssistant) -> None:
     assert zone2.subentry_id in entry.subentries
 
     registry = dr.async_get(hass)
-    assert registry.async_get_device(identifiers={(DOMAIN, zone1.subentry_id)}) is None
     assert (
-        registry.async_get_device(identifiers={(DOMAIN, zone2.subentry_id)}) is not None
+        registry.async_get_device_by_identifier(
+            (DOMAIN, zone1.subentry_id), entry.entry_id
+        )
+        is None
+    )
+    assert (
+        registry.async_get_device_by_identifier(
+            (DOMAIN, zone2.subentry_id), entry.entry_id
+        )
+        is not None
     )
     # The removal reloaded the entry (update listener), no restart needed.
     assert entry.runtime_data is not runtime_data_before
@@ -868,12 +878,14 @@ async def test_zone_count_is_unbounded(hass: HomeAssistant) -> None:
     assert len(entry.subentries) == 5
 
     registry = dr.async_get(hass)
-    controller_device = registry.async_get_device(
-        identifiers={(DOMAIN, entry.entry_id)},
+    controller_device = registry.async_get_device_by_identifier(
+        (DOMAIN, entry.entry_id), entry.entry_id
     )
     assert controller_device is not None
     for zone in zones:
-        device = registry.async_get_device(identifiers={(DOMAIN, zone.subentry_id)})
+        device = registry.async_get_device_by_identifier(
+            (DOMAIN, zone.subentry_id), entry.entry_id
+        )
         assert device is not None
         assert device.via_device_id == controller_device.id
 
@@ -898,7 +910,10 @@ async def test_zone_count_is_unbounded(hass: HomeAssistant) -> None:
         assert survivor.title == title
         assert survivor.data == data
         assert (
-            registry.async_get_device(identifiers={(DOMAIN, subentry_id)}) is not None
+            registry.async_get_device_by_identifier(
+                (DOMAIN, subentry_id), entry.entry_id
+            )
+            is not None
         )
 
 
@@ -953,14 +968,14 @@ async def test_setup_creates_devices_for_preexisting_zones(
     await hass.async_block_till_done()
 
     registry = dr.async_get(hass)
-    controller_device = registry.async_get_device(
-        identifiers={(DOMAIN, entry.entry_id)},
+    controller_device = registry.async_get_device_by_identifier(
+        (DOMAIN, entry.entry_id), entry.entry_id
     )
     assert controller_device is not None
     assert len(entry.subentries) == 3
     for subentry in entry.subentries.values():
-        device = registry.async_get_device(
-            identifiers={(DOMAIN, subentry.subentry_id)},
+        device = registry.async_get_device_by_identifier(
+            (DOMAIN, subentry.subentry_id), entry.entry_id
         )
         assert device is not None
         assert device.via_device_id == controller_device.id

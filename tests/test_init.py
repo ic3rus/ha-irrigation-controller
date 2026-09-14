@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import time
 from typing import TYPE_CHECKING, Any
 
@@ -199,6 +200,36 @@ async def test_unload_removes_the_platform_entities_and_leaves_no_timer(
     )
 
 
+async def test_setup_emits_no_deprecation_report(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Setup (controller + zone devices) trips no Home Assistant deprecation.
+
+    For custom integrations `frame.report_usage` only LOGS a deprecated call
+    (the beta CI leg is `continue-on-error`), so nothing else would flag the
+    next `async_get_or_create` deprecation before its removal release. The
+    `via_device` → `via_device_id` migration is what this guards.
+    """
+    entry = _entry_with_zones(zone_subentry_data("Zone A", VALVE_1))
+    entry.add_to_hass(hass)
+    caplog.set_level(logging.WARNING)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    reports = [
+        record.getMessage()
+        for record in caplog.records
+        if "deprecated" in record.getMessage().lower()
+        or "will stop working" in record.getMessage()
+    ]
+    assert reports == []
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
 async def test_setup_registers_the_reload_listener(hass: HomeAssistant) -> None:
     """Setup registers exactly one update listener: the reload-on-change seam.
 
@@ -226,8 +257,8 @@ async def test_setup_creates_the_controller_device(hass: HomeAssistant) -> None:
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
 
-    device = dr.async_get(hass).async_get_device(
-        identifiers={(DOMAIN, entry.entry_id)},
+    device = dr.async_get(hass).async_get_device_by_identifier(
+        (DOMAIN, entry.entry_id), entry.entry_id
     )
     assert device is not None
     assert device.entry_type is DeviceEntryType.SERVICE
@@ -824,7 +855,7 @@ async def test_setup_succeeds_on_prerelease_of_min_ha_version(
 ) -> None:
     """A beta of the minimum month release is supported, not rejected.
 
-    Regression guard: a full-string comparison sorts 2026.7.0b5 BELOW 2026.7.0
+    Regression guard: a full-string comparison sorts X.Y.0b5 BELOW X.Y.0
     and locked beta-channel users out of the exact minimum release.
     """
     _patch_ha_version(

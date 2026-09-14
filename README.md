@@ -9,7 +9,7 @@ A Home Assistant custom integration for deterministic irrigation scheduling — 
 hass-free sequencer engine driving your valves, plus a bundled Lovelace timeline
 card (`ha-irrigation-timeline-card`) delivered in the same install.
 
-**Requires Home Assistant 2026.7.0 or newer** (setup fails with a clear error on
+**Requires Home Assistant 2026.9.0 or newer** (setup fails with a clear error on
 older versions).
 
 ## Installation (HACS custom repository)

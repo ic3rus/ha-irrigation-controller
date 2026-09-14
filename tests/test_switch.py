@@ -196,7 +196,8 @@ async def test_the_switch_follows_the_engine_conventions(
     assert registry_entry.config_subentry_id is None
     assert registry_entry.device_id is not None
     device = dr.async_get(hass).async_get(registry_entry.device_id)
-    assert device is not None
+    # HA 2026.9 returns `DeviceEntry | ChildDeviceEntry`; ours are top-level.
+    assert isinstance(device, dr.DeviceEntry)
     assert device.identifiers == {(DOMAIN, entry.entry_id)}
 
     assert await hass.config_entries.async_unload(entry.entry_id)
