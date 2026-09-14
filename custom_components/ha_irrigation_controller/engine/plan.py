@@ -38,7 +38,9 @@ class ZoneSpec:
     valve_entity_id: str
     morning_duration_s: int
     evening_duration_s: int
-    # Rain fields ride through untouched until Epic 2 (rain credit/ledger).
+    # Rain credit inputs, both read by `Ledger.quote` (Story 2.4):
+    # `rain_exposed` gates the credit (a sheltered zone is never reduced) and
+    # `rain_factor` is the min/mm conversion (0 disables it for this zone).
     rain_exposed: bool
     rain_factor: float
 

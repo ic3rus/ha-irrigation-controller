@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from .plan import ControllerPlan, CycleKind
-    from .ports import AnomalyPort, JournalPort, SwitchPort
+    from .ports import AnomalyPort, JournalPort, RainPort, SwitchPort
 
 # Journal snapshot schema — code-owned (the spine defers it) but versioned
 # from day one so the Story 1.5 adapter and future migrations can tell what
@@ -59,18 +59,24 @@ class Sequencer:
     skipped (AD-4, runtime half of the overlap defense).
     """
 
-    def __init__(  # noqa: PLR0913 — three injected ports plus the three seeds; collapsing them into a config object would hide which are ports and which are state
+    def __init__(  # noqa: PLR0913 — four injected ports plus the three seeds; collapsing them into a config object would hide which are ports and which are state
         self,
         plan: ControllerPlan,
         *,
         switches: SwitchPort,
         journal: JournalPort,
         anomalies: AnomalyPort,
+        rain: RainPort | None = None,
         history: list[dict[str, object]] | None = None,
         season_enabled: bool = True,
         ledger: dict[str, object] | None = None,
     ) -> None:
         """Wire the sequencer to its plan, its ports and any prior state.
+
+        `rain` (Story 2.4) is the gauge seam, read ONCE per cycle in
+        `_build_run`; `None` means there is no gauge and every quote is
+        unmodulated — the engine never distinguishes "no gauge" from "gauge
+        doubtful", both quote full durations.
 
         `history`, `season_enabled` and `ledger` are the ONLY state this
         constructor accepts back, and none is machine state: outcome records
@@ -100,6 +106,7 @@ class Sequencer:
         self._switches = switches
         self._journal = journal
         self._anomalies = anomalies
+        self._rain = rain
         self._run: CycleRun | None = None
         self._last_run: CycleRun | None = None
         # Completed-cycle outcomes, oldest→newest, pruned to the retention
@@ -439,9 +446,19 @@ class Sequencer:
                     return
 
     async def _start_cycle(self, run: CycleRun, now: datetime) -> None:
-        """Start the cycle: pump on (FR3), journal, then open the first zone."""
-        if not run.zone_runs:
+        """Start the cycle: pump on (FR3), journal, then open the first zone.
+
+        A run with nothing to water — no zones at all, or every zone quoted
+        at ZERO because rain covered it (Story 2.4) — completes at once
+        without the pump: running it against a closed manifold is the one
+        thing the skip exists to avoid. The all-covered zones are filed
+        SKIPPED so history says why nothing flowed; the cycle itself still
+        COMPLETES (and a run-now among them credits the day, Story 2.3).
+        """
+        if not any(zone.duration_s > 0 for zone in run.zone_runs):
             # Nothing to water — never run the pump against a closed manifold.
+            for zone in run.zone_runs:
+                zone.status = ZoneRunStatus.SKIPPED
             run.status = CycleStatus.RUNNING
             await self._save()
             await self._complete_cycle(run, now, pump_was_on=False)
@@ -461,7 +478,20 @@ class Sequencer:
         await self._open_zone(run, run.zone_runs[0], now)
 
     async def _open_zone(self, run: CycleRun, zone: ZoneRun, now: datetime) -> None:
-        """Open one zone's valve and record the commanded-vs-verified outcome."""
+        """Open one zone's valve and record the commanded-vs-verified outcome.
+
+        A zone quoted at ZERO seconds (Story 2.4: rain covered its whole base
+        and it owed nothing) is SKIPPED instead: no open, no close, no
+        anomaly, no instants (so `effective_seconds` reads 0 and the ledger
+        books no deficit — its quote was 0), and the slot advances at once
+        within this same call. Opening and closing it back to back would
+        still command the valve twice and risk a spurious
+        `VALVE_*_UNCONFIRMED` on a slow relay for water that must not flow.
+        """
+        if zone.duration_s == 0:
+            zone.status = ZoneRunStatus.SKIPPED
+            await self._advance_slot(run, now)
+            return
         zone.actual_start = now
         confirmed, error = await self._command(on=True, entity_id=zone.valve_entity_id)
         zone.open_confirmed = confirmed
@@ -505,6 +535,25 @@ class Sequencer:
             )
         if zone.status is not ZoneRunStatus.FAILED:
             zone.status = ZoneRunStatus.COMPLETED
+        await self._advance_slot(run, now)
+
+    async def _advance_slot(self, run: CycleRun, now: datetime) -> None:
+        """Move past the current slot: open the next zone or complete the cycle.
+
+        The tail shared by a closed zone (`_finish_zone`) and a skipped one
+        (`_open_zone`, Story 2.4). The index is bumped BEFORE the save, so
+        `next_wakeup()` — which the journal observer may call inside that
+        save — already points at the next slot (or at nothing). ONE window
+        does show a zero-duration slot as current: `_start_cycle`'s RUNNING
+        save, where `_zone_index` is 0 and slot 0 may be about to be skipped
+        — `next_wakeup()` then returns its planned end, which equals `now`,
+        and the skip happens in this same `advance` call, so a re-arm there
+        is harmless (the fire finds nothing due). Once a skip has been
+        passed, no save ever points back at it. Reached with the
+        pump ON in both cases: a skip happens inside a started cycle, and an
+        all-skipped run never gets here (`_start_cycle` completes it
+        without the pump).
+        """
         self._zone_index += 1
         await self._save()
         if self._zone_index < len(run.zone_runs):
@@ -541,7 +590,11 @@ class Sequencer:
         completion already carries the deficits it produced, and the deferred
         cycle created further down is quoted against them. Both terminal
         statuses settle — a cancelled run's un-reached zones owe their whole
-        slot — and this is the ONLY place `settle` is called.
+        slot — and this is the ONLY place `settle` is called. The settlement
+        is also where every zone's RAIN BASELINE advances to the run's
+        quote-time gauge reading (Story 2.4), so the deferred cycle quoted
+        below is credited only for rain the gauge has counted since this
+        run was quoted — never the same millimetres twice.
 
         Called from inside the lock by `advance` and directly by
         `async_cancel_cycle`, which already holds it — this method must NOT
@@ -665,15 +718,26 @@ class Sequencer:
 
         Durations are QUOTED through the ledger (Story 2.2, AD-5), whichever
         caller is creating the run: a scheduled start, a deferred pop and a
-        run-now all apply the carried deficit the same way — FR11's "current
-        durations" are the current EFFECTIVE durations. The windows accumulate
-        the quoted durations, so a carried deficit shifts every following
-        zone and `next_wakeup()` with it. Quoting is pure; the ledger is only
-        written when this run settles in `_complete_cycle`.
+        run-now all apply the carried deficit — and the rain credit (Story
+        2.4) — the same way — FR11's "current durations" are the current
+        EFFECTIVE durations, so a run-now after rain is rain-reduced like any
+        cycle. The windows accumulate the quoted durations, so a carried
+        deficit shifts every following zone and `next_wakeup()` with it.
+        Quoting is pure; the ledger is only written when this run settles in
+        `_complete_cycle`.
+
+        The RAIN GAUGE is read HERE and nowhere else, exactly once per run,
+        and the reading is snapshotted on the run next to the credit it
+        produced (AD-8): a resumed, deferred-then-started or running cycle is
+        never re-quoted, and rain during a cycle credits the next one. A
+        port that raises is treated like a doubtful reading — `None`, full
+        durations, no anomaly — the same defence `_command` gives the switch
+        port, because a broken gauge must never be what stops the water.
         """
         schedule = derive_schedule(self.plan, kind, reference)
         scheduled_start = schedule.start if dispatch_at is None else dispatch_at
-        quotes = self._ledger.quote(self.plan.zones, kind)
+        rain_total_mm = self._rain_total_mm()
+        quotes = self._ledger.quote(self.plan.zones, kind, rain_total_mm)
         windows = zone_windows(
             self.plan,
             kind,
@@ -698,6 +762,7 @@ class Sequencer:
                     duration_s=quote.quoted_s,
                     base_s=quote.base_s,
                     carried_s=quote.carried_s,
+                    rain_credit_s=quote.rain_credit_s,
                     planned_start=window.start,
                     planned_end=window.end,
                 )
@@ -709,7 +774,23 @@ class Sequencer:
                 )
             ),
             manual=manual,
+            rain_total_mm=rain_total_mm,
         )
+
+    def _rain_total_mm(self) -> float | None:
+        """Read the gauge once for a quote; None without a gauge or on a raise.
+
+        The adapter is supposed to translate every doubtful reading into
+        `None` itself (`RainPort`); a leaked exception is read the same way
+        rather than propagated out of `request_cycle` or `async_run_now` —
+        fail-wet (AD-4): the cycle is quoted on full durations.
+        """
+        if self._rain is None:
+            return None
+        try:
+            return self._rain.total_mm()
+        except Exception:  # noqa: BLE001 — see docstring: a broken gauge quotes full durations
+            return None
 
     def _next_occurrence(self, kind: CycleKind, configured_start: datetime) -> int:
         """Return this run's occurrence number for its irrigation day and kind.

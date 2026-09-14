@@ -208,6 +208,7 @@ async def test_the_waived_record_is_the_snapshot_a_real_run_would_have_had() -> 
                 "status": "pending",
                 "planned_s": 600,
                 "carried_s": 0,
+                "rain_credit_s": 0,
                 "effective_s": 0,
             },
             {
@@ -215,6 +216,7 @@ async def test_the_waived_record_is_the_snapshot_a_real_run_would_have_had() -> 
                 "status": "pending",
                 "planned_s": 600,
                 "carried_s": 0,
+                "rain_credit_s": 0,
                 "effective_s": 0,
             },
         ],
@@ -553,6 +555,7 @@ async def test_an_outstanding_deficit_survives_a_waived_cycle() -> None:
             "settled_cycle_id": "2026-07-30-evening",
             "deficits": {"zone-1": 300},
             "day_credit": CREDIT_31,
+            "rain_baselines": {},
         },
     )
     clock = VirtualClock(aware(7))
@@ -567,12 +570,14 @@ async def test_an_outstanding_deficit_survives_a_waived_cycle() -> None:
         "status": "pending",
         "planned_s": 900,
         "carried_s": 300,
+        "rain_credit_s": 0,
         "effective_s": 0,
     }
     assert sequencer.ledger.as_dict() == {
         "settled_cycle_id": "2026-07-30-evening",
         "deficits": {"zone-1": 300},
         "day_credit": None,
+        "rain_baselines": {},
     }
 
     clock.advance_to(aware(20))

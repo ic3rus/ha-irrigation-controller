@@ -47,10 +47,19 @@ def history_entry(
     from the scheduled cycle of the same kind on the same irrigation day —
     Story 2.3's day credit and Epic 4's history view both key off it.
 
-    Each zone record carries the QUOTED duration (`planned_s`) and the deficit
-    the ledger applied to it (`carried_s`) next to what it actually watered
-    (Story 2.2): Epic 4's history view reads the three together to show why a
-    zone ran longer than its base and how much of the plan it met.
+    Each zone record carries the QUOTED duration (`planned_s`), the deficit
+    the ledger applied to it (`carried_s`) and the rain credit it subtracted
+    (`rain_credit_s`, Story 2.4) next to what it actually watered (Story
+    2.2): Epic 4's history view reads them together to show why a zone ran
+    longer or shorter than its base and how much of the plan it met.
+
+    A zone quoted at zero because rain covered it is filed `status:
+    "skipped"` with `effective_s: 0` and the credit that skipped it (Story
+    2.4). That is how history records WHY nothing flowed: Epic 3's watchdog
+    reads a skipped zone with `rain_credit_s > 0` as a PERMITTED
+    non-watering cause, like a waived cycle. Records written before 2.4 have
+    no `rain_credit_s` key and are not backfilled — Epic 4's reader defaults
+    it, as it does `planned_s`.
 
     `waived_by` (Story 2.3) is the id of the completed run-now whose day
     credit excused this cycle, on a record filed with `status: "waived"`; it
@@ -79,6 +88,7 @@ def history_entry(
                 "status": zone.status.value,
                 "planned_s": zone.duration_s,
                 "carried_s": zone.carried_s,
+                "rain_credit_s": zone.rain_credit_s,
                 "effective_s": effective_seconds(zone),
             }
             for zone in zone_runs

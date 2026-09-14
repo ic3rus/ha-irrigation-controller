@@ -53,12 +53,23 @@ class ZoneRunStatus(StrEnum):
 
     FAILED means the open was never confirmed — the slot is still consumed
     (fail-wet, AD-4) and the shortfall becomes ledger material in Epic 2.
+
+    SKIPPED (Story 2.4) is a slot quoted at ZERO seconds: real rain covered
+    the zone's whole base duration and it owed nothing. The valve is never
+    commanded (no open, no close, no `*_UNCONFIRMED` anomaly), the slot has
+    no instants so `effective_seconds` reads 0, and its quote was 0 so the
+    ledger books no deficit. It is a ZONE status, not a cycle status: a cycle
+    with one skipped zone still COMPLETES, and a cycle whose zones are all
+    skipped completes without ever starting the pump. Epic 3's watchdog reads
+    a skipped zone with `rain_credit_s > 0` as a PERMITTED non-watering
+    cause, never as a miss.
     """
 
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    SKIPPED = "skipped"
 
 
 def utc_iso(moment: datetime | None) -> str | None:
@@ -75,14 +86,21 @@ def utc_iso(moment: datetime | None) -> str | None:
 class ZoneRun:
     """One zone's slot in a cycle run — parameters snapshotted from the plan.
 
-    Three durations, all seconds, all frozen at quote time (Story 2.2):
+    Four durations, all seconds, all frozen at quote time (Stories 2.2, 2.4):
 
     - `base_s` is the plan's duration for this cycle kind — the snapshot the
       ledger settles against, never the live plan (AD-8).
     - `carried_s` is the deficit the ledger applied to this run (≤ `base_s`).
+    - `rain_credit_s` is the rain credit the ledger subtracted from the base
+      for this run (Story 2.4): `floor(mm since the zone's previous settled
+      cycle * rain_factor * 60)`, 0 for a sheltered zone, a zone with no
+      baseline yet, a factor of 0 or a doubtful gauge. It may exceed
+      `base_s`; the formula clamps, this field does not — it records what
+      the rain was worth, which is what history shows (Epic 4).
     - `duration_s` is the QUOTED effective duration the slot actually runs:
-      `max(0, base_s - rain credit) + carried_s`. The planned window is
-      derived from it, so a carried deficit really does extend the run.
+      `max(0, base_s - rain_credit_s) + carried_s`. The planned window is
+      derived from it, so a carried deficit really does extend the run — and
+      a zero here means the slot is SKIPPED, never commanded.
     """
 
     zone_id: str
@@ -93,6 +111,7 @@ class ZoneRun:
     planned_start: datetime
     planned_end: datetime
     carried_s: int = 0
+    rain_credit_s: int = 0
     status: ZoneRunStatus = ZoneRunStatus.PENDING
     actual_start: datetime | None = None
     actual_end: datetime | None = None
@@ -111,6 +130,7 @@ class ZoneRun:
             "duration_s": self.duration_s,
             "base_s": self.base_s,
             "carried_s": self.carried_s,
+            "rain_credit_s": self.rain_credit_s,
             "planned_start": utc_iso(self.planned_start),
             "planned_end": utc_iso(self.planned_end),
             "status": self.status.value,
@@ -170,6 +190,14 @@ class CycleRun:
     duration-map key, and a manual cycle waters a real morning or evening
     kind. It defaults to False, so every run created by the scheduled path is
     scheduled without that path mentioning it.
+
+    `rain_total_mm` (Story 2.4) is the gauge's cumulative total AS READ AT
+    QUOTE TIME, or None when the gauge was doubtful (or there is none). It is
+    frozen with the rest of the snapshot (AD-8): a resumed or running cycle
+    is never re-quoted, and this is the value the ledger advances every
+    settled zone's rain baseline to — so rain falling DURING the cycle is
+    banked for the next one rather than lost. Settlement needs no second
+    gauge read because of it.
     """
 
     cycle_id: str
@@ -182,6 +210,7 @@ class CycleRun:
     pump_on_confirmed: bool | None = None
     pump_off_confirmed: bool | None = None
     manual: bool = False
+    rain_total_mm: float | None = None
 
     def as_dict(self) -> dict[str, object]:
         """Return a plain serializable snapshot of this cycle run."""
@@ -195,6 +224,7 @@ class CycleRun:
             "pump_on_confirmed": self.pump_on_confirmed,
             "pump_off_confirmed": self.pump_off_confirmed,
             MANUAL_KEY: self.manual,
+            "rain_total_mm": self.rain_total_mm,
             "zones": [zone.as_dict() for zone in self.zone_runs],
         }
 

@@ -38,6 +38,7 @@ from custom_components.ha_irrigation_controller.adapters.journal import STORAGE_
 from custom_components.ha_irrigation_controller.const import (
     ATTR_CYCLE,
     CONF_MORNING_ENABLED,
+    CONF_RAIN_EXPOSED,
     CONF_VALVE_SWITCH,
     DOMAIN,
     SERVICE_CANCEL_CYCLE,
@@ -523,6 +524,7 @@ async def test_zone_sensor_debt_attributes_read_zero_with_no_run_and_no_debt(
     assert state.state == "unknown"
     assert state.attributes["carried_deficit"] == 0
     assert state.attributes["pending_deficit"] == 0
+    assert state.attributes["rain_credit"] == 0
 
     await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
     await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
@@ -531,6 +533,7 @@ async def test_zone_sensor_debt_attributes_read_zero_with_no_run_and_no_debt(
     assert state.state == "600"
     assert state.attributes["carried_deficit"] == 0
     assert state.attributes["pending_deficit"] == 0
+    assert state.attributes["rain_credit"] == 0
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
@@ -627,6 +630,140 @@ async def test_zone_sensor_shows_a_pending_deficit_with_no_run_at_all(
     assert state.state == "unknown"
     assert state.attributes["carried_deficit"] == 0
     assert state.attributes["pending_deficit"] == 300
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+# --------------------------------------------------------------------------
+# Rain credit attribute (Story 2.4)
+# --------------------------------------------------------------------------
+
+
+def set_gauge(hass: HomeAssistant, total: str) -> None:
+    """Put a cumulative total in mm on the representative entry's rain sensor."""
+    hass.states.async_set("sensor.rain_gauge", total, {"unit_of_measurement": "mm"})
+
+
+async def test_zone_sensor_shows_the_rain_credit_of_the_run_it_reports(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 2.4 AC 1, end to end: two cycles, the second reduced, the credit visible.
+
+    The morning at 12.0 mm waters its full 600 s (no baseline yet) and shows
+    `rain_credit: 0`. By the evening the gauge reads 15.5: the 15 min slot
+    is quoted 690 s and, once it closes, the sensor shows 690 s watered with
+    `rain_credit: 210` — the same slot both figures describe.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    set_gauge(hass, "12.0")
+    entry = controller_with_zones(zone_subentry_data("Zone A", VALVE_A))
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switches(hass)
+    zone = zone_of(entry, "Zone A")
+    duration = entity_id_for(
+        hass,
+        f"{entry.entry_id}_{zone.subentry_id}_last_watering_duration",
+    )
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    state = state_of(hass, duration)
+    assert state.state == "600"
+    assert state.attributes["rain_credit"] == 0
+
+    set_gauge(hass, "15.5")
+    await fire_at(hass, freezer, "2026-07-31 20:00:00+02:00")
+    # The evening slot is still open: the sensor keeps showing the morning.
+    state = state_of(hass, duration)
+    assert state.state == "600"
+    assert state.attributes["rain_credit"] == 0
+
+    await fire_at(hass, freezer, "2026-07-31 20:11:30+02:00")
+
+    state = state_of(hass, duration)
+    assert state.state == "690"
+    assert state.attributes["rain_credit"] == 210
+    assert state.attributes["carried_deficit"] == 0
+    assert state.attributes["pending_deficit"] == 0
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_a_rain_skipped_zone_reports_zero_seconds_and_its_credit(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """A skip is an ANSWER — 0 s — not missing data, and the credit says why.
+
+    Zone A's baseline is 0.0 and the gauge reads 12.0: the 10 min slot is
+    fully covered, the zone is skipped the instant the cycle starts, and the
+    MEASUREMENT sensor reads `0` (never `unknown`) with `rain_credit` 720 —
+    while zone B, sheltered, waters its 600 s.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    set_gauge(hass, "12.0")
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {
+            "schema_version": JOURNAL_SCHEMA_VERSION,
+            "history": [],
+            "ledger": {
+                "settled_cycle_id": "2026-07-30-evening",
+                "deficits": {},
+                "day_credit": None,
+                "rain_baselines": {"zone-a": 0.0, "zone-b": 0.0},
+            },
+        },
+    }
+    entry = controller_with_zones(
+        {**zone_subentry_data("Zone A", VALVE_A), "subentry_id": "zone-a"},
+        {
+            **zone_subentry_data("Zone B", VALVE_B, **{CONF_RAIN_EXPOSED: False}),
+            "subentry_id": "zone-b",
+        },
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    calls = register_switches(hass)
+    duration_a = entity_id_for(hass, f"{entry.entry_id}_zone-a_last_watering_duration")
+    duration_b = entity_id_for(hass, f"{entry.entry_id}_zone-b_last_watering_duration")
+    assert state_of(hass, duration_a).state == "unknown"
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+
+    # Skipped in the same tick the cycle started: already an answer.
+    state = state_of(hass, duration_a)
+    assert state.state == "0"
+    assert state.attributes["rain_credit"] == 720
+    assert state.attributes["carried_deficit"] == 0
+    assert state_of(hass, duration_b).state == "unknown"  # still watering
+    assert [call.data[ATTR_ENTITY_ID] for call in calls] == [PUMP, VALVE_B]
+
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+
+    state = state_of(hass, duration_a)
+    assert state.state == "0"
+    assert state.attributes["rain_credit"] == 720
+    assert state.attributes["pending_deficit"] == 0
+    state = state_of(hass, duration_b)
+    assert state.state == "600"
+    assert state.attributes["rain_credit"] == 0
+    assert [call.data[ATTR_ENTITY_ID] for call in calls] == [
+        PUMP,
+        VALVE_B,
+        VALVE_B,
+        PUMP,
+    ]
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

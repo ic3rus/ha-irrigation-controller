@@ -9,10 +9,16 @@ through this module rather than adding parallel arithmetic.
 Three operations, deliberately asymmetric:
 
 - ``quote()`` is PURE. It reads the ledger and mutates nothing, so a quoted
-  cycle that never settles (crash, suspend) leaves its deficit in place and
-  the deficit is re-applied to the next quote — doubt waters (AD-4).
-- ``settle(run)`` is the ONLY writer of debt AND of the day credit, keyed by
-  the run's cycle id so a replay of the same completion is a no-op.
+  cycle that never settles (crash, suspend, waiver) leaves its deficit AND
+  its rain baselines in place: the deficit is re-applied to the next quote
+  and the rain stays banked for it — doubt waters (AD-4). It is also the ONE
+  place that turns millimetres into seconds (Story 2.4): the rain credit is
+  ``floor(max(0, total - baseline) * rain_factor * 60)`` for an exposed zone
+  with a baseline, given the gauge total the sequencer read at quote time.
+- ``settle(run)`` is the ONLY writer of debt, of the day credit AND of the
+  per-zone rain baselines (the gauge total at the zone's previous settled
+  cycle), keyed by the run's cycle id so a replay of the same completion is
+  a no-op.
 - ``waive(day)`` is the ONLY CONSUMER of the day credit (Story 2.3, FR12):
   one credit, one decision. The `day_credit` property and `as_dict` read it
   too, for the sensor and the journal, and reading consumes nothing. The
@@ -23,10 +29,10 @@ Hass-free like the rest of the engine: stdlib plus the engine's own types.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import date
-from types import MappingProxyType
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING
 
 from .plan import irrigation_day
 from .runs import CycleStatus, effective_seconds
@@ -36,11 +42,6 @@ if TYPE_CHECKING:
 
     from .plan import CycleKind, ZoneSpec
     from .runs import CycleRun
-
-# The rain-credit slot of the quote formula, empty. Story 2.4 fills it; until
-# then every quote is base + carried deficit. An immutable mapping rather than
-# a `{}` default so the shared default can never be written through.
-NO_RAIN_CREDIT: Final[Mapping[str, int]] = MappingProxyType({})
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,7 +53,8 @@ class ZoneQuote:
     word belongs to `effective_seconds()` and the history key `effective_s`,
     which mean what a zone ACTUALLY watered. The other fields are the inputs,
     kept so the run snapshot and the history record can say WHY a zone runs as
-    long as it does (Epic 4 reads them).
+    long as it does (Epic 4 reads them). `rain_credit_s` is the UNCLAMPED
+    worth of the rain (it may exceed `base_s`); the clamp is in `quoted_s`.
     """
 
     zone_id: str
@@ -63,17 +65,21 @@ class ZoneQuote:
 
 
 class Ledger:
-    """Per-zone water debt with idempotent settlement, plus the day credit.
+    """Per-zone water debt with idempotent settlement, day credit, rain baselines.
 
-    State is three things: the outstanding deficit per zone (seconds, strictly
+    State is four things: the outstanding deficit per zone (seconds, strictly
     positive — a zero deficit is simply absent), the id of the last settled
-    cycle, and at most ONE day credit (Story 2.3) — the irrigation day a
-    completed run-now has already watered, with the id of that run-now. The
+    cycle, at most ONE day credit (Story 2.3) — the irrigation day a
+    completed run-now has already watered, with the id of that run-now — and
+    the rain BASELINE per zone (Story 2.4): the gauge's cumulative total, in
+    mm, as it was quoted for the zone's previous settled cycle. The
     sequencer settles only the run it just completed, once, inside
     `_complete_cycle`, so a replay can only ever be of that same run — one id
     is the whole replay defence, and it cannot grow without a pruning rule the
     way a set would. One credit rather than a set for the same reason: the
     next scheduled decision consumes it whatever its day, so nothing ages.
+    Baselines are keyed like deficits (the zone id) and pruned like them: the
+    settled run's zones REPLACE the mapping, so a removed zone's entry goes.
     """
 
     def __init__(
@@ -81,13 +87,16 @@ class Ledger:
         deficits: Mapping[str, int] | None = None,
         settled_cycle_id: str | None = None,
         day_credit: Mapping[str, object] | None = None,
+        rain_baselines: Mapping[str, float] | None = None,
     ) -> None:
-        """Start from `deficits` (zeros dropped), the settled id and the credit.
+        """Start from `deficits` (zeros dropped), the settled id, credit and baselines.
 
         `day_credit` is the section's `{"irrigation_day": "YYYY-MM-DD",
         "cycle_id": str}` (or None), already validated by the journal adapter
         at the trust boundary; the `isinstance` checks are type narrowing for
-        the serialized `object` values, not validation.
+        the serialized `object` values, not validation. `rain_baselines` is
+        `{zone_id: mm}` the same way — the adapter has already dropped every
+        entry that is not a finite, non-negative number.
         """
         self._deficits: dict[str, int] = {
             zone_id: seconds
@@ -95,6 +104,11 @@ class Ledger:
             if seconds > 0
         }
         self._settled_cycle_id = settled_cycle_id
+        # mm at the zone's previous settled cycle; absent = no baseline yet,
+        # which quotes with NO credit (the first cycle ever banks, never spends).
+        self._rain_baselines: dict[str, float] = {
+            zone_id: float(total) for zone_id, total in (rain_baselines or {}).items()
+        }
         # (credited irrigation day, id of the run-now that credited it).
         self._day_credit: tuple[date, str] | None = None
         if day_credit is not None:
@@ -118,19 +132,23 @@ class Ledger:
         deficits = data.get("deficits")
         settled = data.get("settled_cycle_id")
         credit = data.get("day_credit")
+        baselines = data.get("rain_baselines")
         return cls(
             deficits=deficits if isinstance(deficits, dict) else None,
             settled_cycle_id=settled if isinstance(settled, str) else None,
             day_credit=credit if isinstance(credit, dict) else None,
+            rain_baselines=baselines if isinstance(baselines, dict) else None,
         )
 
     def as_dict(self) -> dict[str, object]:
         """Return the serializable ledger section of the journal snapshot.
 
         `day_credit` is `None` or `{"irrigation_day": "YYYY-MM-DD",
-        "cycle_id": str}` — the shape `_seed_ledger` validates on the way
-        back in (`JOURNAL_SCHEMA_VERSION` stays 1: the key is optional on
-        read, so a pre-2.3 section loads with no credit).
+        "cycle_id": str}` and `rain_baselines` is `{zone_id: float}` — the
+        shapes `_seed_ledger` validates on the way back in
+        (`JOURNAL_SCHEMA_VERSION` stays 1: both keys are optional on read, so
+        a pre-2.3 section loads with no credit and a pre-2.4 one with no
+        baselines).
         """
         credit = self._day_credit
         return {
@@ -141,6 +159,7 @@ class Ledger:
                 if credit is None
                 else {"irrigation_day": credit[0].isoformat(), "cycle_id": credit[1]}
             ),
+            "rain_baselines": dict(self._rain_baselines),
         }
 
     @property
@@ -183,18 +202,31 @@ class Ledger:
         """Return the seconds outstanding for `zone_id` (0 when none)."""
         return self._deficits.get(zone_id, 0)
 
+    def rain_baseline_mm(self, zone_id: str) -> float | None:
+        """Return the gauge total at `zone_id`'s previous settled cycle, or None.
+
+        READ-ONLY (AD-6). None means the zone has never settled a cycle with
+        a readable gauge, so the next quote credits nothing and settlement
+        will bank the first baseline.
+        """
+        return self._rain_baselines.get(zone_id)
+
     def quote(
         self,
         plan_zones: Sequence[ZoneSpec],
         kind: CycleKind,
-        rain_credit_s: Mapping[str, int] = NO_RAIN_CREDIT,
+        rain_total_mm: float | None = None,
     ) -> tuple[ZoneQuote, ...]:
         """Return the quoted duration of every zone for a `kind` cycle.
 
         Pure: reads the ledger, writes nothing. Per zone::
 
-            carried_s = min(deficit, base_s)
-            quoted_s  = max(0, base_s - rain_credit_s) + carried_s
+            rain_credit_s = floor(round(max(0, total - baseline) * rain_factor
+                                        * 60, 6))
+                            iff exposed and factor > 0 and total and baseline
+                            are both known and the product is finite, else 0
+            carried_s     = min(deficit, base_s)
+            quoted_s      = max(0, base_s - rain_credit_s) + carried_s
 
         The cap is applied at quote time as well as at settlement: a deficit
         settled on the other kind's (larger) base is capped by THIS kind's
@@ -202,13 +234,29 @@ class Ledger:
         The remainder is discarded, not carried — FR13's "capped at one full
         base duration" is a ceiling on the debt, and deficits never compound.
 
-        `rain_credit_s` is the formula slot for Story 2.4; it is always empty
-        in this story.
+        `rain_total_mm` (Story 2.4) is the gauge's cumulative total as the
+        sequencer read it for THIS quote — the same value it snapshots on the
+        run — or None when there is no gauge or its reading is doubtful, in
+        which case no zone is modulated. THE one place millimetres become
+        seconds (AD-5). The rain since the zone's previous settled cycle
+        (`total - baseline`) is what is credited; a sheltered zone, a factor
+        of 0 and a zone with no baseline yet credit nothing; a total BELOW
+        the baseline (a gauge reset — Story 2.5's concern) credits nothing
+        rather than a negative amount; and `floor` rounds toward LESS credit,
+        which waters more (AD-4). The product is rounded to 6 decimals BEFORE
+        the floor so a binary-float artefact (`(10.0 - 9.9) * 60 = 5.999…`)
+        does not shave a whole second off an ordinary delta; a product that
+        is not finite (an absurd total overflowing to `inf`) is a doubtful
+        reading and credits 0 rather than raising. The credit comes off the
+        base BEFORE the deficit is added and never drives the base part below
+        zero: a zone in debt still waters its `carried_s` however much it
+        rained — the
+        debt floor holds (FR13).
         """
         quotes: list[ZoneQuote] = []
         for zone in plan_zones:
             base_s = zone.duration_s(kind)
-            credit_s = rain_credit_s.get(zone.zone_id, 0)
+            credit_s = self._rain_credit_s(zone, rain_total_mm)
             carried_s = min(self.deficit_s(zone.zone_id), base_s)
             quotes.append(
                 ZoneQuote(
@@ -220,6 +268,21 @@ class Ledger:
                 ),
             )
         return tuple(quotes)
+
+    def _rain_credit_s(self, zone: ZoneSpec, rain_total_mm: float | None) -> int:
+        """Return the seconds `rain_total_mm` is worth to `zone` — see `quote`."""
+        baseline = self._rain_baselines.get(zone.zone_id)
+        if (
+            not zone.rain_exposed
+            or zone.rain_factor <= 0
+            or rain_total_mm is None
+            or baseline is None
+        ):
+            return 0
+        credit = max(0.0, rain_total_mm - baseline) * zone.rain_factor * 60
+        if not math.isfinite(credit):
+            return 0
+        return math.floor(round(credit, 6))
 
     def settle(self, run: CycleRun) -> bool:
         """Record what a terminal `run` owes; False when already settled.
@@ -249,6 +312,19 @@ class Ledger:
         cancel and a zero-dwell catch-up all credit nothing — doubt waters —
         and they leave an existing credit UNTOUCHED (only `waive` consumes).
         A later completed run-now on the same day simply refreshes it.
+
+        The RAIN BASELINES (Story 2.4) advance here too, and only here: every
+        settled zone's baseline becomes the run's snapshotted `rain_total_mm`
+        — the QUOTE-TIME reading, so rain that fell during the cycle is
+        banked for the next one — whatever the zone's status. FAILED or
+        cancelled included, on purpose: the credit was already subtracted
+        from that zone's quote and its shortfall carries as a deficit, so
+        keeping the old baseline would credit the same rain twice — the one
+        direction fail-wet forbids. A `None` reading is the exception:
+        nothing was credited, so nothing is spent and each zone keeps the
+        baseline it had. Like deficits, the mapping is REPLACED by the run's
+        zones, so a removed zone's baseline is dropped. A waived cycle never
+        reaches here, so its rain stays banked for the next real cycle.
         """
         if run.cycle_id == self._settled_cycle_id:
             return False
@@ -262,4 +338,13 @@ class Ledger:
         self._settled_cycle_id = run.cycle_id
         if run.manual and run.status is CycleStatus.COMPLETED and not deficits:
             self._day_credit = (irrigation_day(run.configured_start), run.cycle_id)
+        total = run.rain_total_mm
+        baselines: dict[str, float] = {}
+        for zone in run.zone_runs:
+            baseline = (
+                total if total is not None else self._rain_baselines.get(zone.zone_id)
+            )
+            if baseline is not None:
+                baselines[zone.zone_id] = baseline
+        self._rain_baselines = baselines
         return True

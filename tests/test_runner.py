@@ -30,6 +30,9 @@ from pytest_homeassistant_custom_component.common import (
 from custom_components.ha_irrigation_controller.adapters import timing
 from custom_components.ha_irrigation_controller.adapters.anomalies import AnomalyManager
 from custom_components.ha_irrigation_controller.adapters.journal import JournalAdapter
+from custom_components.ha_irrigation_controller.adapters.rain import (
+    RainSensorAdapter,
+)
 from custom_components.ha_irrigation_controller.adapters.switches import (
     VerifiedSwitchAdapter,
 )
@@ -105,8 +108,13 @@ def make_plan(*, morning_enabled: bool = True) -> ControllerPlan:
 def make_runner(
     hass: HomeAssistant,
     plan: ControllerPlan,
+    *,
+    rain: RainSensorAdapter | None = None,
 ) -> tuple[CycleRunner, Sequencer]:
-    """Wire a runner over the real adapters, exactly as `async_setup_entry` does."""
+    """Wire a runner over the real adapters, exactly as `async_setup_entry` does.
+
+    `rain` is the gauge adapter (Story 2.4); None is an entry with no gauge.
+    """
     entry = MockConfigEntry(domain="ha_irrigation_controller")
     clock = HaClock()
     sequencer = Sequencer(
@@ -120,6 +128,7 @@ def make_runner(
         ),
         journal=JournalAdapter(hass),
         anomalies=AnomalyManager(hass),
+        rain=rain,
     )
     return CycleRunner(hass, entry, sequencer=sequencer, clock=clock), sequencer
 
@@ -196,6 +205,84 @@ async def test_a_full_cycle_drives_the_real_switch_services_in_order(
     assert run.status is CycleStatus.COMPLETED
     # Every command of one cycle carries that cycle's single Context (AD-7).
     assert len({call.context.id for call in calls}) == 1
+
+    runner.async_shutdown()
+
+
+async def test_the_rain_gauge_reduces_the_second_cycle_through_the_real_timers(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 2.4, end to end through the timing adapter: two cycles, the second reduced.
+
+    The morning at 12.0 mm waters both zones in full and banks the reading.
+    The evening at 15.5 mm quotes each zone 390 s: the timer fires at
+    20:06:30 (zone 1 closes, zone 2 opens) and 20:13:00 (cycle complete) —
+    the re-armed wake-ups follow the reduced windows, and the service calls
+    prove the valves really switched at those instants.
+    """
+    calls = register_switch_domain(hass)
+    hass.states.async_set("sensor.rain_gauge", "12.0", {"unit_of_measurement": "mm"})
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, sequencer = make_runner(
+        hass,
+        make_plan(),
+        rain=RainSensorAdapter(hass, "sensor.rain_gauge"),
+    )
+    await runner.async_start()
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 07:20:00+02:00")
+    first = sequencer.last_run
+    assert first is not None
+    assert first.rain_total_mm == 12.0
+    assert [zone.rain_credit_s for zone in first.zone_runs] == [0, 0]
+    assert sequencer.ledger.as_dict()["rain_baselines"] == {
+        "zone-1": 12.0,
+        "zone-2": 12.0,
+    }
+    calls.clear()
+
+    hass.states.async_set("sensor.rain_gauge", "15.5", {"unit_of_measurement": "mm"})
+    await fire_at(hass, freezer, "2026-07-31 20:00:00+02:00")
+    run = sequencer.current_run
+    assert run is not None
+    assert (run.kind, run.status) == (CycleKind.EVENING, CycleStatus.RUNNING)
+    assert run.rain_total_mm == 15.5
+    assert [(zone.duration_s, zone.rain_credit_s) for zone in run.zone_runs] == [
+        (390, 210),
+        (390, 210),
+    ]
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls] == [
+        ("turn_on", PUMP),
+        ("turn_on", VALVE_1),
+    ]
+
+    # One second before the reduced boundary nothing moves; at it, zone 1
+    # closes and zone 2 opens.
+    await fire_at(hass, freezer, "2026-07-31 20:06:29+02:00")
+    assert len(calls) == 2
+    await fire_at(hass, freezer, "2026-07-31 20:06:30+02:00")
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls][2:] == [
+        ("turn_off", VALVE_1),
+        ("turn_on", VALVE_2),
+    ]
+    await fire_at(hass, freezer, "2026-07-31 20:13:00+02:00")
+
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls][4:] == [
+        ("turn_off", VALVE_2),
+        ("turn_off", PUMP),
+    ]
+    assert sequencer.current_run is None
+    second = sequencer.last_run
+    assert second is not None
+    assert second.status is CycleStatus.COMPLETED
+    assert sequencer.ledger.as_dict()["rain_baselines"] == {
+        "zone-1": 15.5,
+        "zone-2": 15.5,
+    }
 
     runner.async_shutdown()
 

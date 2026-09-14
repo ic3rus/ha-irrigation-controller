@@ -112,6 +112,31 @@ class FakeJournalPort:
             raise PortError(msg)
 
 
+class FakeRainPort:
+    """A settable rain gauge (Story 2.4).
+
+    `total` is what `total_mm()` answers — the cumulative mm, or None for a
+    doubtful gauge. `raising` makes it leak a `PortError` instead: a real
+    adapter is supposed to translate every doubtful reading into None, and
+    the engine must survive one that does not. `reads` counts the calls so a
+    test can pin "read once per cycle, at quote time".
+    """
+
+    def __init__(self, total: float | None = None) -> None:
+        """Start with `total` on the gauge and nothing raising."""
+        self.total = total
+        self.raising = False
+        self.reads = 0
+
+    def total_mm(self) -> float | None:
+        """Answer the current total, or leak an exception when `raising`."""
+        self.reads += 1
+        if self.raising:
+            msg = "rain adapter blew up reading the gauge"
+            raise PortError(msg)
+        return self.total
+
+
 class FakeAnomalyPort:
     """Records every reported anomaly."""
 

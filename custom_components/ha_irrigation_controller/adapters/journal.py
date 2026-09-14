@@ -18,6 +18,7 @@ method.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import date
 from typing import TYPE_CHECKING, Final
@@ -53,11 +54,15 @@ class JournalSeed:
 
     `ledger` is the section in the shape `Ledger.as_dict` writes —
     `{"settled_cycle_id": str | None, "deficits": {zone_id: int},
-    "day_credit": {"irrigation_day": "YYYY-MM-DD", "cycle_id": str} | None}`
-    — already validated, so the engine can trust it. `day_credit` (Story
-    2.3) is the irrigation day a completed run-now has already watered, with
-    that run-now's id; it is optional on read, and a malformed one reads as
-    no credit without touching the rest of the section.
+    "day_credit": {"irrigation_day": "YYYY-MM-DD", "cycle_id": str} | None,
+    "rain_baselines": {zone_id: float}}` — already validated, so the engine
+    can trust it. `day_credit` (Story 2.3) is the irrigation day a completed
+    run-now has already watered, with that run-now's id; it is optional on
+    read, and a malformed one reads as no credit without touching the rest
+    of the section. `rain_baselines` (Story 2.4) is the gauge total, in mm,
+    at each zone's previous settled cycle — what the next rain credit is
+    measured from; optional on read too, and each malformed entry reads as
+    "no baseline" (no credit until the zone settles a cycle) on its own.
     """
 
     history: list[dict[str, object]]
@@ -224,8 +229,13 @@ def _seed_entry(entry: object) -> dict[str, object] | None:
 
 
 def _empty_ledger() -> dict[str, object]:
-    """Return the section of a ledger that owes nothing and credits no day."""
-    return {"settled_cycle_id": None, "deficits": {}, "day_credit": None}
+    """Return the section of a ledger owing nothing, with no credit and no baseline."""
+    return {
+        "settled_cycle_id": None,
+        "deficits": {},
+        "day_credit": None,
+        "rain_baselines": {},
+    }
 
 
 def _seed_ledger(section: object) -> dict[str, object]:
@@ -246,6 +256,12 @@ def _seed_ledger(section: object) -> dict[str, object]:
       reads as NO credit, on its own, without rejecting the section. A bad
       credit must not forget the zones' debts, and the fail-wet reading of a
       doubtful credit is "not credited": the next cycle waters.
+    - `rain_baselines` (Story 2.4) is optional — absent in every document
+      written before it — and kept entry by entry (`_seed_rain_baselines`):
+      a `str` key with a finite, non-negative `int` or `float` value (not a
+      `bool`). A bad entry reads as NO baseline for that zone, which credits
+      it nothing until it settles a cycle — the fail-wet direction — and
+      never rejects the section or the other zones' baselines.
 
     Anything else about the section's shape — absent (every document written
     before this story), not a mapping, a `deficits` that is not a mapping, a
@@ -269,6 +285,7 @@ def _seed_ledger(section: object) -> dict[str, object]:
             and seconds >= 0
         },
         "day_credit": _seed_day_credit(section.get("day_credit")),
+        "rain_baselines": _seed_rain_baselines(section.get("rain_baselines")),
     }
 
 
@@ -292,3 +309,31 @@ def _seed_day_credit(credit: object) -> dict[str, object] | None:
     except ValueError:
         return None
     return {"irrigation_day": day, "cycle_id": cycle_id}
+
+
+def _seed_rain_baselines(baselines: object) -> dict[str, float]:
+    """Return the rain baselines fit for the engine — bad entries dropped one by one.
+
+    The baseline half of `_seed_ledger`'s trust boundary (Story 2.4). The
+    engine subtracts each value from the gauge total and multiplies by the
+    zone's factor, so every value that reaches it must be a real finite
+    number: a `str`, a `bool` (an `int` to Python), `nan`, `inf` and a
+    negative total are all dropped, each on its own — a hand edit that breaks
+    one zone's baseline must not reset every other zone's accumulation
+    window. Values are normalized to `float` so the section reads back in the
+    one shape `Ledger.as_dict` writes. Anything that is not a mapping at all
+    (absent — every document written before this story — or another type)
+    reads as no baselines: no credit until each zone settles a cycle, which
+    waters.
+    """
+    if not isinstance(baselines, dict):
+        return {}
+    return {
+        zone_id: float(total)
+        for zone_id, total in baselines.items()
+        if isinstance(zone_id, str)
+        and isinstance(total, int | float)
+        and not isinstance(total, bool)
+        and math.isfinite(total)
+        and total >= 0
+    }

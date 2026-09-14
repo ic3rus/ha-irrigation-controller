@@ -139,6 +139,7 @@ def test_history_entry_is_a_compact_serializable_outcome() -> None:
                 "status": "completed",
                 "planned_s": 600,
                 "carried_s": 0,
+                "rain_credit_s": 0,
                 "effective_s": 600,
             },
             {
@@ -146,6 +147,7 @@ def test_history_entry_is_a_compact_serializable_outcome() -> None:
                 "status": "failed",
                 "planned_s": 600,
                 "carried_s": 0,
+                "rain_credit_s": 0,
                 "effective_s": 0,
             },
         ],
@@ -181,7 +183,51 @@ def test_a_waived_record_names_the_run_now_that_excused_it() -> None:
             "status": "pending",
             "planned_s": 600,
             "carried_s": 0,
+            "rain_credit_s": 0,
             "effective_s": 0,
+        },
+    ]
+
+
+def test_a_rain_skipped_zone_records_why_nothing_flowed() -> None:
+    """Story 2.4: `status: "skipped"`, 0 s planned and watered, the credit next to them.
+
+    Epic 3's watchdog reads a skipped zone with `rain_credit_s > 0` as a
+    PERMITTED non-watering cause — the record has to say so on its own.
+    """
+    skipped = ZoneRun(
+        zone_id="zone-1",
+        name="Front Lawn",
+        valve_entity_id=VALVE_1,
+        duration_s=0,
+        base_s=600,
+        rain_credit_s=720,
+        planned_start=aware(7),
+        planned_end=aware(7),
+        status=ZoneRunStatus.SKIPPED,
+    )
+    watered = zone_run(zone_id="zone-2")
+    watered.rain_credit_s = 210
+
+    entry = history_entry(cycle_run(skipped, watered), aware(7, 10))
+
+    assert entry["status"] == "completed"
+    assert entry["zones"] == [
+        {
+            "zone_id": "zone-1",
+            "status": "skipped",
+            "planned_s": 0,
+            "carried_s": 0,
+            "rain_credit_s": 720,
+            "effective_s": 0,
+        },
+        {
+            "zone_id": "zone-2",
+            "status": "completed",
+            "planned_s": 600,
+            "carried_s": 0,
+            "rain_credit_s": 210,
+            "effective_s": 600,
         },
     ]
 

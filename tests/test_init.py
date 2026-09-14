@@ -32,6 +32,7 @@ from custom_components.ha_irrigation_controller.const import (
     CONF_ACTUATION_TIMEOUT,
     CONF_EVENING_START,
     CONF_MORNING_DURATION,
+    CONF_RAIN_SENSOR,
     DEFAULT_ACTUATION_TIMEOUT_S,
     DOMAIN,
     MAX_ACTUATION_TIMEOUT_S,
@@ -943,6 +944,7 @@ async def test_a_journal_written_before_the_ledger_sets_up_and_quotes_on_base(
         "settled_cycle_id": None,
         "deficits": {},
         "day_credit": None,
+        "rain_baselines": {},
     }
 
     await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
@@ -1048,6 +1050,7 @@ async def test_a_seeded_day_credit_waives_the_same_days_first_scheduled_cycle(
                 "status": "completed",
                 "planned_s": 600,
                 "carried_s": 0,
+                "rain_credit_s": 0,
                 "effective_s": 600,
             },
         ],
@@ -1065,6 +1068,7 @@ async def test_a_seeded_day_credit_waives_the_same_days_first_scheduled_cycle(
                     "irrigation_day": "2026-07-31",
                     "cycle_id": "2026-07-31-morning",
                 },
+                "rain_baselines": {},
             },
         },
     }
@@ -1102,3 +1106,174 @@ async def test_a_seeded_day_credit_waives_the_same_days_first_scheduled_cycle(
         ("2026-07-31-morning", "completed", None),
         ("2026-07-31-morning-2", "waived", "2026-07-31-morning"),
     ]
+
+
+# --------------------------------------------------------------------------
+# The rain gauge reaches the engine (Story 2.4)
+# --------------------------------------------------------------------------
+
+
+def set_gauge(hass: HomeAssistant, total: str) -> None:
+    """Put a cumulative total in mm on the representative entry's rain sensor."""
+    hass.states.async_set("sensor.rain_gauge", total, {"unit_of_measurement": "mm"})
+
+
+async def test_seeded_rain_baselines_reach_the_engine_and_reduce_the_first_cycle(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 2.4 AC 4: baselines written before an HA restart credit after setup.
+
+    `async_setup_entry` hands `seed.ledger` — baselines included — to the
+    sequencer and wires the gauge adapter from `CONF_RAIN_SENSOR`. Zone A
+    banked 12.0 in a previous life; the gauge reads 15.5 now, so its 10 min
+    slot is quoted 390 s. Zone B has no baseline and waters in full.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    set_gauge(hass, "15.5")
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {
+            "schema_version": JOURNAL_SCHEMA_VERSION,
+            "history": [],
+            "ledger": {
+                "settled_cycle_id": "2026-07-30-evening",
+                "deficits": {},
+                "day_credit": None,
+                "rain_baselines": {"zone-a": 12.0},
+            },
+        },
+    }
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[
+            {**zone_subentry_data("Zone A", VALVE_1), "subentry_id": "zone-a"},
+            {**zone_subentry_data("Zone B", VALVE_2), "subentry_id": "zone-b"},
+        ],
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+    sequencer = entry.runtime_data.sequencer
+    assert sequencer.ledger.rain_baseline_mm("zone-a") == 12.0
+    assert sequencer.ledger.rain_baseline_mm("zone-b") is None
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+
+    run = sequencer.current_run
+    assert run is not None
+    assert run.rain_total_mm == 15.5
+    zone_a, zone_b = run.zone_runs
+    assert (zone_a.duration_s, zone_a.rain_credit_s) == (390, 210)
+    assert (zone_b.duration_s, zone_b.rain_credit_s) == (600, 0)
+    assert zone_b.planned_start.isoformat() == "2026-07-31T07:06:30+02:00"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_a_journal_written_before_rain_baselines_quotes_full_durations(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 2.4 AC 5: a pre-2.4 ledger section loads with no baselines.
+
+    The gauge is readable, but no zone has a baseline, so the first cycle is
+    quoted in full (debt included) — and banks the reading for the next one.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    set_gauge(hass, "15.5")
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {
+            "schema_version": JOURNAL_SCHEMA_VERSION,
+            "history": [],
+            "ledger": {
+                "settled_cycle_id": "2026-07-30-evening",
+                "deficits": {"zone-a": 300},
+                "day_credit": None,
+            },
+        },
+    }
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[
+            {**zone_subentry_data("Zone A", VALVE_1), "subentry_id": "zone-a"},
+        ],
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+    sequencer = entry.runtime_data.sequencer
+    assert sequencer.ledger.as_dict()["rain_baselines"] == {}
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+
+    run = sequencer.current_run
+    assert run is not None
+    assert run.rain_total_mm == 15.5
+    zone = run.zone_runs[0]
+    assert (zone.duration_s, zone.carried_s, zone.rain_credit_s) == (900, 300, 0)
+
+    await fire_at(hass, freezer, "2026-07-31 07:15:00+02:00")
+    assert sequencer.ledger.as_dict()["rain_baselines"] == {"zone-a": 15.5}
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_an_entry_without_a_rain_sensor_quotes_unmodulated(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """No `CONF_RAIN_SENSOR` (or not a string) means no gauge: `rain=None`.
+
+    The flow requires the option, but a stored entry is unvalidated input.
+    Setup succeeds and every cycle is quoted on full durations with no
+    reading snapshotted.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    options = {
+        key: value
+        for key, value in CONTROLLER_OPTIONS.items()
+        if key != CONF_RAIN_SENSOR
+    }
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=options,
+        subentries_data=[zone_subentry_data("Zone A", VALVE_1)],
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+
+    run = entry.runtime_data.sequencer.current_run
+    assert run is not None
+    assert run.rain_total_mm is None
+    assert (run.zone_runs[0].duration_s, run.zone_runs[0].rain_credit_s) == (600, 0)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
