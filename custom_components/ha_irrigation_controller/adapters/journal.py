@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Final
 from homeassistant.helpers.storage import Store
 
 from ..const import DOMAIN, LOGGER  # noqa: TID252
+from ..engine.runs import MANUAL_KEY, is_manual  # noqa: TID252
 from ..engine.sequencer import JOURNAL_SCHEMA_VERSION  # noqa: TID252
 
 if TYPE_CHECKING:
@@ -92,6 +93,13 @@ class JournalAdapter:
         real shape a hand edit or a restored backup can produce. Trusting the
         annotation would raise `AttributeError` out of `async_setup_entry` —
         the opposite of the fail-wet default this method promises.
+
+        Surviving records are NORMALIZED rather than merely filtered, which is
+        how a journal written before Story 2.1 keeps loading: it carries no
+        manual marker at all (`JOURNAL_SCHEMA_VERSION` has no migration, so
+        every key this story adds has to be optional on read), and every such
+        record reads back as scheduled instead of failing. Readers therefore
+        never have to ask whether the key is there.
         """
         stored = await self._store.async_load()
         if not isinstance(stored, dict):
@@ -100,7 +108,11 @@ class JournalAdapter:
         season = stored.get("season_enabled")
         return JournalSeed(
             history=(
-                [entry for entry in history if _is_usable_entry(entry)]
+                [
+                    usable
+                    for entry in history
+                    if (usable := _seed_entry(entry)) is not None
+                ]
                 if isinstance(history, list)
                 else []
             ),
@@ -157,15 +169,29 @@ class JournalAdapter:
         return snapshot
 
 
-def _is_usable_entry(entry: object) -> bool:
-    """Return True iff `entry` is a history record the engine can consume."""
+def _seed_entry(entry: object) -> dict[str, object] | None:
+    """Return `entry` fit for the engine, or None when it cannot be consumed.
+
+    Two halves of one trust boundary. The REFUSALS are the shapes that would
+    raise out of `prune_history` → `_complete_cycle` → `advance()` and abandon
+    a cycle mid-flight with the pump on. The REWRITE fills in the keys later
+    stories added, so a document written before them loads with their default
+    rather than making every reader defend itself: today that is Story 2.1's
+    manual marker, defaulted to scheduled by `is_manual` (the ONE place that
+    rule lives).
+
+    A SHALLOW copy, never the stored dict mutated in place: the top level is
+    rebuilt so the caller's document keeps the keys it had, while nested values
+    (a record's `zones` list) are shared with it. Nothing writes through them —
+    the engine journals this list straight back out untouched.
+    """
     if not isinstance(entry, dict):
-        return False
+        return None
     day = entry.get("irrigation_day")
     if not isinstance(day, str):
-        return False
+        return None
     try:
         date.fromisoformat(day)
     except ValueError:
-        return False
-    return True
+        return None
+    return {**entry, MANUAL_KEY: is_manual(entry)}

@@ -14,7 +14,7 @@ from datetime import date, timedelta
 from typing import TYPE_CHECKING, Final
 
 from .plan import irrigation_day
-from .runs import effective_seconds, utc_iso
+from .runs import MANUAL_KEY, effective_seconds, utc_iso
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -36,6 +36,11 @@ def history_entry(run: CycleRun, ended_at: datetime) -> dict[str, object]:
     `ended_at` is the caller's completion instant, NOT the last zone's close:
     the pump-off (FR3) happens after that close, so keying the field off the
     zone would report a cycle duration that excludes its final actuation.
+
+    The manual marker rides along verbatim from the run (Story 2.1): this is
+    the ONE place it reaches history, and it is what tells a run-now apart
+    from the scheduled cycle of the same kind on the same irrigation day —
+    Story 2.3's day credit and Epic 4's history view both key off it.
     """
     zone_runs = run.zone_runs
     return {
@@ -43,6 +48,7 @@ def history_entry(run: CycleRun, ended_at: datetime) -> dict[str, object]:
         "irrigation_day": irrigation_day(run.configured_start).isoformat(),
         "kind": run.kind.value,
         "status": run.status.value,
+        MANUAL_KEY: run.manual,
         "configured_start": utc_iso(run.configured_start),
         "scheduled_start": utc_iso(run.scheduled_start),
         "ended_at": utc_iso(ended_at),

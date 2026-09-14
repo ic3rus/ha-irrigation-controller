@@ -16,7 +16,11 @@ from custom_components.ha_irrigation_controller.adapters.journal import (
     STORAGE_KEY,
     JournalAdapter,
 )
-from custom_components.ha_irrigation_controller.const import DOMAIN
+from custom_components.ha_irrigation_controller.const import (
+    ATTR_CYCLE,
+    DOMAIN,
+    SERVICE_RUN_NOW,
+)
 from custom_components.ha_irrigation_controller.engine.sequencer import (
     JOURNAL_SCHEMA_VERSION,
 )
@@ -267,7 +271,51 @@ async def test_load_seed_drops_records_the_engine_cannot_consume(
         },
     }
 
-    assert (await JournalAdapter(hass).async_load_seed()).history == [good]
+    # The survivor comes back with the optional keys later stories added filled
+    # in — here Story 2.1's manual marker, defaulted to scheduled.
+    assert (await JournalAdapter(hass).async_load_seed()).history == [
+        {**good, "manual": False},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("stored_marker", "expected"),
+    [
+        ({}, False),  # a document written before Story 2.1
+        ({"manual": False}, False),
+        ({"manual": True}, True),
+        ({"manual": None}, False),
+        ({"manual": "true"}, False),
+        ({"manual": 1}, False),
+    ],
+    ids=["absent", "scheduled", "manual", "none", "string", "int"],
+)
+async def test_load_seed_defaults_a_missing_manual_marker_to_scheduled(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    stored_marker: dict[str, object],
+    expected: bool,  # noqa: FBT001 — a parametrized expectation, not a flag
+) -> None:
+    """A journal written before Story 2.1 loads, and its runs read as scheduled.
+
+    `JOURNAL_SCHEMA_VERSION` carries no migration, so every key a story adds
+    has to be optional on read — and drift that merely looks truthy is not a
+    manual run either. Only a real `True` is one, which is the direction that
+    waters: Story 2.3 turns a manual run into a reason NOT to water.
+    """
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {
+            "history": [
+                {"irrigation_day": "2026-07-30", "cycle_id": "x", **stored_marker},
+            ],
+        },
+    }
+
+    seed = await JournalAdapter(hass).async_load_seed()
+
+    assert seed.history[0]["manual"] is expected
 
 
 async def test_the_season_flag_round_trips_through_the_store(
@@ -445,3 +493,120 @@ async def test_removing_the_entry_removes_the_store_file(
     await hass.async_block_till_done()
 
     assert STORAGE_KEY not in hass_storage
+
+
+async def test_cycle_ids_stay_unique_across_a_reload(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """The occurrence suffix has to survive the reload-per-config-change regime.
+
+    Epic 2 keys idempotent settlement off the cycle id, so two runs of one kind
+    on one irrigation day may never share one. The occurrence number is counted
+    from the seeded history for exactly this reason: a private counter is
+    journalled but never read back, so it would reset here and file the second
+    run under the first one's id. `run_now` makes that reachable in a single
+    service call.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[zone_subentry_data("Zone A", "switch.zone_1_valve")],
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    # The reload the regime performs on every config change.
+    freezer.move_to("2026-07-31 09:30:00+02:00")
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_RUN_NOW,
+        {ATTR_CYCLE: "morning"},
+        blocking=True,
+    )
+    await fire_at(hass, freezer, "2026-07-31 09:40:00+02:00")
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    stored = hass_storage[STORAGE_KEY]["data"]["history"]
+    assert [record["cycle_id"] for record in stored] == [
+        "2026-07-31-morning",
+        "2026-07-31-morning-2",
+    ]
+    assert [record["manual"] for record in stored] == [False, True]
+
+
+async def test_a_journal_written_before_the_manual_marker_still_sets_up(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 2.1 AC 4, end to end: an existing install upgrades without a break.
+
+    The stored document is one the pre-2.1 code wrote — a complete history
+    record with no `manual` key anywhere. Setup must load it, and the record
+    must reach the engine (and the journal it writes back) reading as
+    scheduled: a run-now marker invented for a cycle nobody triggered would
+    make Story 2.3 waive a day that was never manually watered.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    legacy = {
+        "cycle_id": "2026-07-30-evening",
+        "irrigation_day": "2026-07-30",
+        "kind": "evening",
+        "status": "completed",
+        "configured_start": "2026-07-30T18:00:00+00:00",
+        "scheduled_start": "2026-07-30T18:00:00+00:00",
+        "ended_at": "2026-07-30T18:10:00+00:00",
+        "zones": [{"zone_id": "zone-1", "status": "completed", "effective_s": 600}],
+    }
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {"schema_version": JOURNAL_SCHEMA_VERSION, "history": [legacy]},
+    }
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[zone_subentry_data("Zone A", "switch.zone_1_valve")],
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+
+    # Running one cycle of the NEW code journals the whole section back: the
+    # seeded record survives intact apart from the defaulted marker, and the
+    # cycle that just ran is scheduled too.
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    stored = hass_storage[STORAGE_KEY]["data"]["history"]
+    assert stored[0] == {**legacy, "manual": False}
+    assert [record["cycle_id"] for record in stored] == [
+        "2026-07-30-evening",
+        "2026-07-31-morning",
+    ]
+    assert [record["manual"] for record in stored] == [False, False]

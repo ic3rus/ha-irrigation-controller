@@ -33,7 +33,7 @@ card is not yet selectable in the dashboard editor.
 
 ## Services
 
-Three actions are available to automations, scripts and voice assistants. They
+Four actions are available to automations, scripts and voice assistants. They
 are registered at component setup, so they stay callable (and editable in an
 automation) even while the integration is reloading — a call made while nothing
 is loaded fails with a clear message rather than disappearing.
@@ -46,6 +46,36 @@ that stops a running cycle. Zones the cycle never reached are recorded as
 having watered zero seconds.
 
 Calling it with nothing running is an error, not a silent no-op.
+
+### `ha_irrigation_controller.run_now`
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `cycle` | `morning` \| `evening` | yes | Which daily cycle to run |
+
+Starts a full cycle immediately. It is the scheduled cycle in every respect:
+the pump starts first, the zones water one at a time in their configured
+order, each actuation is verified, and the run is journalled and recorded in
+history — where it is marked as a **manual** run so it can be told apart from
+the scheduled cycle of the same kind on the same day.
+
+`cycle` is required and has no default. Each zone stores a separate duration
+for the morning and the evening cycle, so naming the cycle is what decides how
+long every zone waters; the controller never guesses one from the time of day.
+
+**It runs with the season off.** Ending the season suspends *scheduling*;
+watering once on demand is an explicit decision, so it is not gated. Turning
+the season off while a run-now cycle is in progress does not stop it either.
+
+**It runs the morning cycle even when the morning cycle is turned off.**
+"Run a morning cycle" suppresses the daily 07:00 *start*, not the cycle
+itself, so `cycle: morning` on an evening-only controller waters every zone on
+its morning durations. Asking for it by name is the decision.
+
+It is refused — with a translated error and nothing started — when a cycle is
+already running *or* waiting to start (two zones must never water at once; use
+`cancel_cycle` first if you mean to replace it), and when the controller has no
+zones configured.
 
 ### `ha_irrigation_controller.set_season`
 

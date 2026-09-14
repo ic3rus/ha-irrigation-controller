@@ -1,4 +1,4 @@
-"""The three verb-named actions (FR5, AD-10, AC 3, AC 5).
+"""The verb-named actions (FR5, AD-10, AC 3, AC 5; `run_now` from Story 2.1).
 
 Registered in `async_setup`, resolved to the one loaded entry per call, and
 never removed on unload (`action-setup`) — an automation referencing one must
@@ -17,12 +17,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import pytest
+import voluptuous as vol
 from homeassistant.config_entries import ConfigSubentryData
 from homeassistant.const import ATTR_ENTITY_ID, STATE_OFF, STATE_ON, Platform
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.ha_irrigation_controller.adapters.journal import STORAGE_KEY
 from custom_components.ha_irrigation_controller.const import (
     ATTR_CYCLE,
     ATTR_DURATION,
@@ -35,10 +37,14 @@ from custom_components.ha_irrigation_controller.const import (
     MAX_ZONE_DURATION_MINUTES,
     MIN_ZONE_DURATION_MINUTES,
     SERVICE_CANCEL_CYCLE,
+    SERVICE_RUN_NOW,
     SERVICE_SET_SEASON,
     SERVICE_SET_ZONE_DURATION,
 )
-from custom_components.ha_irrigation_controller.engine.runs import CycleStatus
+from custom_components.ha_irrigation_controller.engine.runs import (
+    CycleStatus,
+    is_manual,
+)
 from tests.common import (
     CONTROLLER_OPTIONS,
     PUMP,
@@ -55,7 +61,12 @@ if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigSubentry
     from homeassistant.core import HomeAssistant
 
-ALL_SERVICES = (SERVICE_CANCEL_CYCLE, SERVICE_SET_SEASON, SERVICE_SET_ZONE_DURATION)
+ALL_SERVICES = (
+    SERVICE_CANCEL_CYCLE,
+    SERVICE_RUN_NOW,
+    SERVICE_SET_SEASON,
+    SERVICE_SET_ZONE_DURATION,
+)
 
 
 def zone_of(entry: MockConfigEntry, title: str) -> ConfigSubentry:
@@ -108,7 +119,7 @@ async def entry(
 # --------------------------------------------------------------------------
 
 
-async def test_the_three_services_are_registered(
+async def test_every_service_is_registered(
     hass: HomeAssistant,
     entry: MockConfigEntry,
 ) -> None:
@@ -147,6 +158,8 @@ async def test_calling_an_action_with_no_entry_loaded_explains_itself(
         await call(hass, SERVICE_CANCEL_CYCLE)
     with pytest.raises(ServiceValidationError):
         await call(hass, SERVICE_SET_SEASON, {ATTR_ENABLED: False})
+    with pytest.raises(ServiceValidationError):
+        await call(hass, SERVICE_RUN_NOW, {ATTR_CYCLE: "morning"})
 
 
 # --------------------------------------------------------------------------
@@ -195,6 +208,252 @@ async def test_cancel_cycle_with_nothing_running_raises(
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
+
+
+# --------------------------------------------------------------------------
+# run_now (Story 2.1)
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def idle_entry(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> MockConfigEntry:
+    """Set up the same two-zone controller MID-MORNING, with no start pending.
+
+    Run-now must be measured against a quiet schedule. `async_fire_time_changed`
+    fires every timer that has come due, so a controller set up before 07:00 and
+    then jumped forward carries an overdue morning start that lands on the first
+    tick — deferring a scheduled cycle behind the manual one and adding a second
+    pump-on to the command log that has nothing to do with this action.
+    Arming the daily trackers at 09:30 instead puts the next morning start on
+    tomorrow and the evening one at 20:00: both stay in the future for the whole
+    of these tests.
+    """
+    freezer.move_to("2026-07-31 09:30:00+02:00")
+    config_entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[
+            zone_subentry_data("Zone A", VALVE_1),
+            zone_subentry_data("Zone B", VALVE_2),
+        ],
+    )
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    return config_entry
+
+
+async def test_run_now_starts_a_full_cycle_immediately(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    idle_entry: MockConfigEntry,
+) -> None:
+    """AC 1: the same sequencing and pump orchestration as a scheduled cycle.
+
+    Called at 09:30, two and a half hours after the morning start and ten and
+    a half before the evening one — nothing here is a daily start firing by
+    coincidence, and the cycle runs on the plan's zone order all the same.
+    """
+    calls = register_switch_domain(hass)
+
+    await call(hass, SERVICE_RUN_NOW, {ATTR_CYCLE: "morning"})
+
+    run = idle_entry.runtime_data.sequencer.current_run
+    assert run is not None
+    assert run.manual is True
+    assert run.status is CycleStatus.RUNNING
+    # Ten minutes per zone — the MORNING column, not the evening's fifteen.
+    assert [zone.duration_s for zone in run.zone_runs] == [600, 600]
+    assert [(one.service, one.data[ATTR_ENTITY_ID]) for one in calls] == [
+        ("turn_on", PUMP),
+        ("turn_on", VALVE_1),
+    ]
+
+    await fire_at(hass, freezer, "2026-07-31 09:40:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 09:50:00+02:00")
+
+    assert [(one.service, one.data[ATTR_ENTITY_ID]) for one in calls] == [
+        ("turn_on", PUMP),
+        ("turn_on", VALVE_1),
+        ("turn_off", VALVE_1),
+        ("turn_on", VALVE_2),
+        ("turn_off", VALVE_2),
+        ("turn_off", PUMP),
+    ]
+    finished = idle_entry.runtime_data.sequencer.last_run
+    assert finished is not None
+    assert finished.cycle_id == run.cycle_id
+    assert finished.status is CycleStatus.COMPLETED
+    assert finished.manual is True
+    assert idle_entry.runtime_data.sequencer.current_run is None
+    assert idle_entry.runtime_data.anomalies.open_anomalies == frozenset()
+
+    assert await hass.config_entries.async_unload(idle_entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_run_now_evening_uses_the_evening_durations(
+    hass: HomeAssistant,
+    idle_entry: MockConfigEntry,
+) -> None:
+    """The caller names the cycle; the cycle names the duration column."""
+    register_switch_domain(hass)
+
+    await call(hass, SERVICE_RUN_NOW, {ATTR_CYCLE: "evening"})
+
+    run = idle_entry.runtime_data.sequencer.current_run
+    assert run is not None
+    assert [zone.duration_s for zone in run.zone_runs] == [900, 900]
+
+    await call(hass, SERVICE_CANCEL_CYCLE)
+    assert await hass.config_entries.async_unload(idle_entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_run_now_waters_with_the_season_off(
+    hass: HomeAssistant,
+    idle_entry: MockConfigEntry,
+) -> None:
+    """AC 2: an explicit operator action is independent of scheduling."""
+    calls = register_switch_domain(hass)
+    await call(hass, SERVICE_SET_SEASON, {ATTR_ENABLED: False})
+
+    await call(hass, SERVICE_RUN_NOW, {ATTR_CYCLE: "morning"})
+
+    assert idle_entry.runtime_data.sequencer.current_run is not None
+    assert [(one.service, one.data[ATTR_ENTITY_ID]) for one in calls] == [
+        ("turn_on", PUMP),
+        ("turn_on", VALVE_1),
+    ]
+    # Watering once is not resuming the season.
+    assert idle_entry.runtime_data.sequencer.season_enabled is False
+
+    await call(hass, SERVICE_CANCEL_CYCLE)
+    assert await hass.config_entries.async_unload(idle_entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_a_completed_run_now_is_recorded_as_a_manual_run(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    idle_entry: MockConfigEntry,
+) -> None:
+    """AC 3: the journal's history entry says manual, and `last_run` is it."""
+    register_switch_domain(hass)
+
+    await call(hass, SERVICE_RUN_NOW, {ATTR_CYCLE: "morning"})
+    await fire_at(hass, freezer, "2026-07-31 09:40:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 09:50:00+02:00")
+
+    last_run = idle_entry.runtime_data.sequencer.last_run
+    assert last_run is not None
+    assert last_run.manual is True
+    assert last_run.status is CycleStatus.COMPLETED
+
+    assert await hass.config_entries.async_unload(idle_entry.entry_id)
+    await hass.async_block_till_done()
+
+    history = hass_storage[STORAGE_KEY]["data"]["history"]
+    assert [record["cycle_id"] for record in history] == ["2026-07-31-morning"]
+    assert is_manual(history[0]) is True
+
+
+async def test_run_now_while_a_cycle_runs_is_refused_and_changes_nothing(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    entry: MockConfigEntry,
+) -> None:
+    """AC 5: a translated error, and the live cycle untouched — never a cancel."""
+    calls = register_switch_domain(hass)
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    live = entry.runtime_data.sequencer.current_run
+    assert live is not None
+    commands_before = [(one.service, one.data[ATTR_ENTITY_ID]) for one in calls]
+
+    freezer.move_to("2026-07-31 07:04:00+02:00")
+    with pytest.raises(ServiceValidationError) as raised:
+        await call(hass, SERVICE_RUN_NOW, {ATTR_CYCLE: "evening"})
+
+    assert raised.value.translation_key == "cycle_already_running"
+    assert entry.runtime_data.sequencer.current_run is live
+    assert live.status is CycleStatus.RUNNING
+    assert live.manual is False
+    # Not queued either: a refused command is an error, not deferred work.
+    assert entry.runtime_data.sequencer.deferred_kinds == ()
+    assert [(one.service, one.data[ATTR_ENTITY_ID]) for one in calls] == commands_before
+
+    await call(hass, SERVICE_CANCEL_CYCLE)
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_run_now_on_a_controller_with_no_zones_is_refused(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """A zero-zone plan is a supported state — and nothing to water.
+
+    The scheduled path files such a cycle as a completed zero-length run; a
+    phantom "manual run" in history is water Story 2.3 would credit the day
+    for, so the action refuses instead.
+    """
+    freezer.move_to("2026-07-31 09:30:00+02:00")
+    config_entry = controller_entry()
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    with pytest.raises(ServiceValidationError) as raised:
+        await call(hass, SERVICE_RUN_NOW, {ATTR_CYCLE: "morning"})
+
+    assert raised.value.translation_key == "no_zones"
+    assert config_entry.runtime_data.sequencer.current_run is None
+    assert config_entry.runtime_data.sequencer.last_run is None
+
+    assert await hass.config_entries.async_unload(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+
+@pytest.mark.parametrize("data", [{}, {ATTR_CYCLE: "noon"}, {ATTR_CYCLE: 3}])
+async def test_a_bad_or_missing_cycle_is_a_schema_rejection(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+    data: dict[str, Any],
+) -> None:
+    """Rule 3: a value of the wrong TYPE fails voluptuous, exactly as in core.
+
+    `cycle` is required and has no default — the controller never guesses one
+    from the time of day. Neither branch is one of AC 5's cases, so neither is
+    translated; what matters is that nothing starts.
+    """
+    with pytest.raises(vol.Invalid):
+        await call(hass, SERVICE_RUN_NOW, data)
+
+    assert entry.runtime_data.sequencer.current_run is None
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_run_now_survives_an_unload_and_explains_itself(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+) -> None:
+    """`action-setup`: registered in `async_setup`, never removed on unload."""
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert hass.services.has_service(DOMAIN, SERVICE_RUN_NOW)
+    with pytest.raises(ServiceValidationError):
+        await call(hass, SERVICE_RUN_NOW, {ATTR_CYCLE: "morning"})
 
 
 # --------------------------------------------------------------------------

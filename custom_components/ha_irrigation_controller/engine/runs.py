@@ -11,12 +11,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from .plan import irrigation_day
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from .plan import CycleKind
+
+# The serialized key carrying Story 2.1's manual marker, in BOTH the run
+# snapshot and the history record. Named once so the journal adapter, the
+# history reader and Story 2.3's day credit cannot spell it three ways.
+MANUAL_KEY: Final = "manual"
 
 
 class CycleStatus(StrEnum):
@@ -132,6 +139,12 @@ class CycleRun:
       skipped). Collapsing the two would either make a deferred cycle wait for
       tomorrow's configured start or file a past-midnight cycle under the
       wrong irrigation day.
+
+    `manual` is Story 2.1's run-now marker — a FIELD, deliberately not a third
+    `CycleKind`: the kind is also the cycle-id component and the per-zone
+    duration-map key, and a manual cycle waters a real morning or evening
+    kind. It defaults to False, so every run created by the scheduled path is
+    scheduled without that path mentioning it.
     """
 
     cycle_id: str
@@ -143,6 +156,7 @@ class CycleRun:
     status: CycleStatus = CycleStatus.PENDING
     pump_on_confirmed: bool | None = None
     pump_off_confirmed: bool | None = None
+    manual: bool = False
 
     def as_dict(self) -> dict[str, object]:
         """Return a plain serializable snapshot of this cycle run."""
@@ -155,8 +169,22 @@ class CycleRun:
             "status": self.status.value,
             "pump_on_confirmed": self.pump_on_confirmed,
             "pump_off_confirmed": self.pump_off_confirmed,
+            MANUAL_KEY: self.manual,
             "zones": [zone.as_dict() for zone in self.zone_runs],
         }
+
+
+def is_manual(record: Mapping[str, object]) -> bool:
+    """Return whether a SERIALIZED run or history record is a manual run.
+
+    THE reader of the marker (AD-5: one home for the rule). The journal
+    carries `JOURNAL_SCHEMA_VERSION` with no migration, so a document written
+    before Story 2.1 simply has no such key — and a restored backup or a hand
+    edit can put anything at all there. Both read as scheduled: only a real
+    `True` marks a manual run, which is the conservative direction (Story
+    2.3's day credit is a reason NOT to water, and doubt waters — AD-4).
+    """
+    return record.get(MANUAL_KEY) is True
 
 
 def cycle_id_for(
@@ -168,10 +196,14 @@ def cycle_id_for(
 
     Deterministic on purpose so Epic 2's settlement can key idempotent writes
     off it (AD-5) — which requires it to be UNIQUE as well. The deferral queue
-    accepts repeated requests for the same kind, so the second and later runs
-    of a kind on one irrigation day carry an occurrence suffix
-    (`2026-07-31-morning-2`). The first run of a kind keeps the bare id, so the
-    scheduled cycle every other feature keys off never changes shape.
+    accepts repeated requests for the same kind, and Story 2.1's run-now adds
+    another way to run one twice, so the second and later runs of a kind on one
+    irrigation day carry an occurrence suffix (`2026-07-31-morning-2`).
+
+    The suffix promises uniqueness and NOTHING about which run gets which
+    number: occurrences are handed out in creation order, so a run-now fired
+    before the morning cycle is due takes the bare id and files that day's
+    scheduled morning cycle as `-2`. Nothing may key off the bare form.
     """
     base = f"{irrigation_day(configured_start).isoformat()}-{kind.value}"
     return base if occurrence <= 1 else f"{base}-{occurrence}"

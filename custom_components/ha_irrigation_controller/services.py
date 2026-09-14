@@ -1,8 +1,8 @@
 """The integration's verb-named actions (FR5, AD-10, AC 3).
 
 **Declared deviation:** the architecture's structural seed comments put service
-registration in `__init__.py`. Three handlers with their schemas and their
-validation would roughly double that file, and both Home Assistant core
+registration in `__init__.py`. Four handlers with their schemas and their
+validation would more than double that file, and both Home Assistant core
 practice (`tado/services.py` and friends) and the `common-modules` quality-scale
 rule favour the split. `__init__.py` keeps the registration CALL; the handlers
 live here.
@@ -29,7 +29,7 @@ Five rules hold this module together:
    for. The `services.yaml` selectors are UI affordances only — the WebSocket
    API bypasses them exactly like it bypasses the config-flow pickers.
 5. No `async_register_admin_service`: household automations, scripts and voice
-   assistants must be able to call all three.
+   assistants must be able to call every one of them.
 """
 
 from __future__ import annotations
@@ -53,6 +53,7 @@ from .const import (
     MAX_ZONE_DURATION_MINUTES,
     MIN_ZONE_DURATION_MINUTES,
     SERVICE_CANCEL_CYCLE,
+    SERVICE_RUN_NOW,
     SERVICE_SET_SEASON,
     SERVICE_SET_ZONE_DURATION,
     SUBENTRY_TYPE_ZONE,
@@ -81,6 +82,14 @@ _DURATION_KEY: dict[CycleKind, str] = {
 
 _SET_SEASON_SCHEMA = vol.Schema({vol.Required(ATTR_ENABLED): cv.boolean})
 
+# The caller NAMES the cycle: each zone stores two durations and the sequencer
+# needs a `CycleKind`, so there is no defaulting rule and no clock-dependent
+# guess. The exact mould `set_zone_duration` uses below — an unknown value is a
+# schema rejection (`vol.Invalid`, rule 3), never a handler branch.
+_RUN_NOW_SCHEMA = vol.Schema(
+    {vol.Required(ATTR_CYCLE): vol.In([kind.value for kind in CycleKind])},
+)
+
 # `duration` is coerced to an int and NOT range-checked here — see rule 4.
 _SET_ZONE_DURATION_SCHEMA = vol.Schema(
     {
@@ -93,11 +102,17 @@ _SET_ZONE_DURATION_SCHEMA = vol.Schema(
 
 @callback
 def async_setup_services(hass: HomeAssistant) -> None:
-    """Register the three actions on the component, once."""
+    """Register the integration's actions on the component, once."""
     hass.services.async_register(
         DOMAIN,
         SERVICE_CANCEL_CYCLE,
         _async_cancel_cycle,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_RUN_NOW,
+        _async_run_now,
+        schema=_RUN_NOW_SCHEMA,
     )
     hass.services.async_register(
         DOMAIN,
@@ -138,6 +153,45 @@ async def _async_cancel_cycle(call: ServiceCall) -> None:
         raise ServiceValidationError(
             translation_domain=DOMAIN,
             translation_key="no_cycle_running",
+        )
+
+
+async def _async_run_now(call: ServiceCall) -> None:
+    """Start a full cycle immediately, on demand (FR11, Story 2.1).
+
+    Routed through the runner like every other mutating command: the re-arm,
+    the deferred reload and the state push are the runner's, and the cycle it
+    starts is the scheduled one in every respect — same zone order, same pump
+    orchestration, same verified actuation, same journal and history. Only the
+    accounting differs: the run is marked manual.
+
+    Deliberately NOT gated on the season. Turning the season off suspends
+    *scheduling*; this is an explicit operator action, and refusing it would
+    make the operator turn the season back on (and so re-arm the daily starts)
+    just to water once.
+
+    Two rejections, both translated (`action-exceptions`) and both visible —
+    a silent no-op here would look exactly like a cycle that started:
+
+    - no zones configured. Checked here rather than left to the engine's False
+      because the two refusals need two different messages; the engine refuses
+      it as well, so no phantom zero-length "manual run" can reach history by
+      another route.
+    - a cycle already active, PENDING as well as RUNNING. The engine returns
+      False and leaves the live cycle untouched — nothing is cancelled to make
+      room, since `cancel_cycle` is the only thing that stops a cycle.
+    """
+    entry = _loaded_entry(call)
+    runtime = entry.runtime_data
+    if not runtime.plan.zones:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="no_zones",
+        )
+    if not await runtime.runner.async_run_now(CycleKind(call.data[ATTR_CYCLE])):
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="cycle_already_running",
         )
 
 

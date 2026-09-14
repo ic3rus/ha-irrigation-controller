@@ -179,6 +179,37 @@ class CycleRunner:
             self._async_maybe_reload()
             self._async_push_state()
 
+    async def async_run_now(self, kind: CycleKind) -> bool:
+        """Start `kind` now on operator demand; False when the engine refused.
+
+        Mirrors `async_cancel_cycle`: a mutating command reaches the sequencer
+        through the runner and nowhere else, so `_rearm`, the deferred reload
+        and the dispatcher push keep their single home — a call that skipped
+        them would leave the ONE timer pointing at a boundary the engine no
+        longer has, or (here) at nothing while a cycle is running.
+
+        The `advance` is `_async_daily_start`'s, for the same reason: the new
+        run is dispatched at `now`, so advancing starts it in this very tick
+        instead of waiting for the re-armed timer to fire on an instant that
+        is already in the past. It is called unconditionally because it is
+        idempotent — on the refused paths it either finds no run at all, or
+        performs exactly the transitions the re-armed timer would have served
+        a moment later, and it never touches the live run's identity.
+
+        ONE clock read for both calls: a single operator action must not derive
+        the run's windows from one instant and the decision to start it from a
+        later one.
+        """
+        now = self._clock.now()
+        try:
+            started = await self._sequencer.async_run_now(kind, now)
+            await self._sequencer.advance(now)
+        finally:
+            self._rearm()
+            self._async_maybe_reload()
+            self._async_push_state()
+        return started
+
     async def async_set_season(self, *, enabled: bool) -> None:
         """Turn the season on or off and re-arm (FR10, AC 1).
 

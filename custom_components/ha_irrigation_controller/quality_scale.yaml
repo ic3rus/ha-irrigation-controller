@@ -2,7 +2,7 @@ rules:
   # Bronze
   action-setup:
     status: done
-    comment: cancel_cycle, set_season and set_zone_duration are registered in async_setup (services.py), so they stay registered while the entry is unloaded. Each handler resolves the entry per call via homeassistant.helpers.service.async_get_config_entry, which raises the translated "not found"/"not loaded"/"multiple entries" errors itself.
+    comment: cancel_cycle, run_now, set_season and set_zone_duration are registered in async_setup (services.py), so they stay registered while the entry is unloaded. Each handler resolves the entry per call via homeassistant.helpers.service.async_get_config_entry, which raises the translated "not found"/"not loaded"/"multiple entries" errors itself.
   appropriate-polling:
     status: exempt
     comment: iot_class is calculated — the integration does not poll.
@@ -18,7 +18,7 @@ rules:
     status: done
   docs-actions:
     status: done
-    comment: README "Services" section documents all three actions, their fields and units, that season OFF does not stop a running cycle, and the mid-cycle reload caveat.
+    comment: README "Services" section documents all four actions, their fields and units, that run_now runs with the season off and is refused while a cycle is active, that season OFF does not stop a running cycle, and the mid-cycle reload caveat.
   docs-high-level-description:
     status: done
   docs-installation-instructions:
@@ -44,4 +44,4 @@ rules:
   # Silver
   action-exceptions:
     status: done
-    comment: Every failure path of the three actions raises a translated ServiceValidationError (no_cycle_running, unknown_zone, invalid_duration, cycles_overlap); the "no entry"/"not loaded"/"multiple entries" cases come already translated from async_get_config_entry. Range and identity checks live in the handlers rather than the voluptuous schemas, so a bad value never surfaces as an untranslated vol.Invalid.
+    comment: Every failure path of the four actions raises a translated ServiceValidationError (no_cycle_running, cycle_already_running, no_zones, unknown_zone, invalid_duration, cycles_overlap); the "no entry"/"not loaded"/"multiple entries" cases come already translated from async_get_config_entry. Range and identity checks live in the handlers rather than the voluptuous schemas, so a bad value never surfaces as an untranslated vol.Invalid.
