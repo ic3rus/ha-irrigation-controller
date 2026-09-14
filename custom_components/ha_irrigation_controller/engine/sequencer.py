@@ -112,11 +112,6 @@ class Sequencer:
         # stays filed under the day it was requested for.
         self._deferred: list[tuple[CycleKind, datetime]] = []
         self._zone_index = 0
-        # How many runs of each (irrigation day, kind) have been created —
-        # feeds the cycle id's occurrence suffix. Journalled, because a
-        # counter that resets on restart would recreate the id collisions the
-        # suffix exists to remove.
-        self._cycle_counts: dict[str, int] = {}
         # The state machine mutates run state across `await` boundaries. Two
         # overlapping calls — a re-armed timer firing while a slow verified
         # service call is still in flight — would interleave those mutations,
@@ -178,9 +173,9 @@ class Sequencer:
         ``advance`` — this only records the intent, so the caller's next step
         is always the same: re-arm on ``next_wakeup()``.
 
-        Story 2.1's `run_now` must NOT reuse this method as-is: it runs with
-        the season OFF by design, so it needs its own entry point (or a flag
-        added when it finally has a caller) rather than bypassing the guard.
+        Story 2.1's `run_now` does NOT reuse this method: it runs with the
+        season OFF by design, so it has its own entry point
+        (`async_run_now`) rather than bypassing the guard from inside here.
         """
         async with self._lock:
             if not self._season_enabled:
@@ -193,6 +188,53 @@ class Sequencer:
             else:
                 self._create_run(kind, now)
             await self._save()
+
+    async def async_run_now(self, kind: CycleKind, now: datetime) -> bool:
+        """Start `kind` immediately on operator demand; False when refused.
+
+        Story 2.1's run-now, and deliberately the SIBLING of `request_cycle`
+        rather than a flag inside it: that method's first statement is the
+        season gate, and an explicit operator action is independent of
+        scheduling — running with the season OFF is the point here, not an
+        edge case. Everything after the decision is the scheduled path
+        verbatim: `_create_run(..., dispatch_at=now)` builds the same
+        snapshot, so windows, pump orchestration, actuation verification,
+        journalling and history all come from code this story never touches.
+        The run is tagged `manual` so history — and Story 2.3's day credit —
+        can tell it apart without a third `CycleKind`.
+
+        A disabled morning cycle is not a refusal either, for the same reason
+        the season is not: `morning_enabled` suppresses the daily START, and
+        this is not one. `run_now(morning)` on such a plan waters every zone on
+        its morning durations, from the configured morning start's windows —
+        the operator asked for that cycle by name.
+
+        Two refusals, both returning False rather than raising: the engine
+        speaks no user-facing errors (it must stay importable with no Home
+        Assistant), so the SERVICE is what turns each into its translated
+        `ServiceValidationError`, exactly as `async_cancel_cycle` does.
+
+        - A cycle is already active. PENDING counts, not just RUNNING: it
+          holds its own AD-8 snapshot and a scheduled start, and overwriting
+          it would abandon a cycle nobody cancelled. Nothing here closes,
+          cancels, journals or even reads that run.
+        - The plan has no zones. The scheduled path files such a cycle as a
+          completed zero-length run (`_start_cycle`'s no-zones branch), which
+          is honest for a daily start nobody asked for; here it would put a
+          phantom "manual run" in history for water that never flowed, and
+          Story 2.3 would credit the irrigation day for it.
+
+        A refused run-now is never queued. The deferral queue exists so a
+        *scheduled* cycle is delayed rather than skipped (AD-4); an operator
+        command that cannot run now is an error to report, not work to
+        remember — the operator can see the cycle running and call again.
+        """
+        async with self._lock:
+            if self._run is not None or not self.plan.zones:
+                return False
+            self._create_run(kind, now, dispatch_at=now, manual=True)
+            await self._save()
+            return True
 
     def next_wakeup(self) -> datetime | None:
         """Return the earliest pending time intent, or None when idle."""
@@ -495,6 +537,7 @@ class Sequencer:
         reference: datetime,
         *,
         dispatch_at: datetime | None = None,
+        manual: bool = False,
     ) -> None:
         """Snapshot the plan into a new pending run (AD-8: owned copies).
 
@@ -504,6 +547,12 @@ class Sequencer:
         not whatever instant the caller happened to fire at. A deferred cycle
         passes `dispatch_at` to start right away instead of waiting for its
         configured start, while still keeping that start for its identity.
+
+        `manual` marks Story 2.1's run-now. It defaults to False so both
+        scheduled callers stay unchanged, and it only ever reaches the run
+        object — the id, the windows and the occurrence counter are derived
+        identically either way, which is what keeps a run-now indistinguishable
+        from a scheduled cycle everywhere except in the accounting.
         """
         schedule = derive_schedule(self.plan, kind, reference)
         scheduled_start = schedule.start if dispatch_at is None else dispatch_at
@@ -533,15 +582,35 @@ class Sequencer:
                 )
                 for spec, window in zip(self.plan.zones, windows, strict=True)
             ),
+            manual=manual,
         )
         self._zone_index = 0
 
     def _next_occurrence(self, kind: CycleKind, configured_start: datetime) -> int:
-        """Return (and record) this run's occurrence number for its day+kind."""
-        key = f"{irrigation_day(configured_start).isoformat()}-{kind.value}"
-        occurrence = self._cycle_counts.get(key, 0) + 1
-        self._cycle_counts[key] = occurrence
-        return occurrence
+        """Return this run's occurrence number for its irrigation day and kind.
+
+        COUNTED FROM HISTORY, not from a counter of its own. A private counter
+        is journalled but never seeded back (`JournalSeed` restores history and
+        the season flag, nothing else, and Story 3.2 owns the rest), so it
+        resets on every reload — and the reload regime runs on every config
+        change. The second run of a kind after a reload would then be handed
+        the id the first one already has, which is precisely the collision the
+        suffix exists to remove: Epic 2 keys idempotent settlement off the
+        cycle id. History is the one piece of this state that already survives
+        a reload, so the count comes from there.
+
+        Every terminal run reaches history, cancelled ones included, and
+        `_complete_cycle` appends BEFORE it pops the deferred queue — so the
+        count is already right for a cycle created inside that same call.
+        Retention cannot interfere: pruning is by irrigation DAY over a 7-day
+        window, so a run's own day is never the day that ages out.
+        """
+        day = irrigation_day(configured_start).isoformat()
+        return 1 + sum(
+            1
+            for entry in self._history
+            if entry.get("irrigation_day") == day and entry.get("kind") == kind.value
+        )
 
     async def _command(self, *, on: bool, entity_id: str) -> tuple[bool, str | None]:
         """Command one entity, converting a leaked port exception into failure.
@@ -591,7 +660,6 @@ class Sequencer:
             "run": self._run.as_dict() if self._run is not None else None,
             "zone_index": self._zone_index,
             "last_run": last_run.as_dict() if last_run is not None else None,
-            "cycle_counts": dict(self._cycle_counts),
             "deferred": [
                 {"kind": kind.value, "reference": utc_iso(reference)}
                 for kind, reference in self._deferred

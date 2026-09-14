@@ -121,6 +121,9 @@ def test_history_entry_is_a_compact_serializable_outcome() -> None:
         "irrigation_day": "2026-07-31",
         "kind": "morning",
         "status": "completed",
+        # Story 2.1's marker, written explicitly on every record: a reader must
+        # not have to infer "scheduled" from a missing key.
+        "manual": False,
         "configured_start": "2026-07-31T05:00:00+00:00",
         "scheduled_start": "2026-07-31T05:00:00+00:00",
         "ended_at": "2026-07-31T05:26:00+00:00",

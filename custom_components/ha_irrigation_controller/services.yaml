@@ -8,6 +8,17 @@
 
 cancel_cycle:
 
+run_now:
+  fields:
+    cycle:
+      required: true
+      example: morning
+      selector:
+        select:
+          options:
+            - morning
+            - evening
+
 set_season:
   fields:
     enabled:

@@ -43,14 +43,17 @@ MAX_ACTUATION_TIMEOUT_S = 120
 
 # Verb-named actions (FR5, AD-10). Registered in `async_setup` and NEVER
 # removed on unload (`action-setup`), so an automation referencing one stays
-# editable while the entry is down. `run_now` joins them in Story 2.1.
+# editable while the entry is down.
 SERVICE_CANCEL_CYCLE = "cancel_cycle"
 SERVICE_SET_ZONE_DURATION = "set_zone_duration"
 SERVICE_SET_SEASON = "set_season"
+SERVICE_RUN_NOW = "run_now"
 
 # Service field names. `zone_id` is the subentry id — the zone key everywhere
 # (AD-8), so the services take the same identity the journal and the card do.
-# `duration` is MINUTES, matching every other duration UI surface.
+# `duration` is MINUTES, matching every other duration UI surface. `cycle` is
+# shared by `set_zone_duration` and `run_now`: both address one of the two
+# `CycleKind` values, and one field name keeps that one concept.
 ATTR_ZONE_ID = "zone_id"
 ATTR_CYCLE = "cycle"
 ATTR_DURATION = "duration"

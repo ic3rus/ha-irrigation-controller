@@ -750,6 +750,124 @@ async def test_cancelling_with_nothing_running_reports_false(
     runner.async_shutdown()
 
 
+async def test_run_now_starts_in_the_same_tick_and_arms_the_next_boundary(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 2.1: the runner's `advance` is what makes run-now immediate.
+
+    The new run is dispatched at `now`, so without the advance the pump would
+    wait for a re-armed timer to fire on an instant already in the past. The
+    boundary that follows is armed by the same `finally` every other command
+    uses, and the cycle then runs itself out through the ONE timer.
+    """
+    calls = register_switch_domain(hass)
+    freezer.move_to("2026-07-31 09:30:00+02:00")
+    runner, sequencer = make_runner(hass, make_plan())
+    await runner.async_start()
+
+    assert await runner.async_run_now(CycleKind.MORNING) is True
+
+    run = sequencer.current_run
+    assert run is not None
+    assert run.manual is True
+    assert run.status is CycleStatus.RUNNING
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls] == [
+        ("turn_on", PUMP),
+        ("turn_on", VALVE_1),
+    ]
+    assert sequencer.next_wakeup() == dt_util.parse_datetime(
+        "2026-07-31 09:40:00+02:00",
+    )
+
+    await fire_at(hass, freezer, "2026-07-31 09:40:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 09:50:00+02:00")
+
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls] == [
+        ("turn_on", PUMP),
+        ("turn_on", VALVE_1),
+        ("turn_off", VALVE_1),
+        ("turn_on", VALVE_2),
+        ("turn_off", VALVE_2),
+        ("turn_off", PUMP),
+    ]
+    finished = sequencer.last_run
+    assert finished is not None
+    assert finished.status is CycleStatus.COMPLETED
+    assert finished.manual is True
+    assert sequencer.next_wakeup() is None
+
+    runner.async_shutdown()
+
+
+async def test_a_refused_run_now_reports_false_and_leaves_the_timer_alone(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """The runner relays the engine's answer; the SERVICE is what raises.
+
+    The unconditional `advance` must not disturb the live cycle: the boundary
+    it was armed for is still the boundary it is armed for afterwards, and no
+    valve was commanded in between.
+    """
+    calls = register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, sequencer = make_runner(hass, make_plan())
+    await runner.async_start()
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    live = sequencer.current_run
+    commanded = len(calls)
+    wakeup = sequencer.next_wakeup()
+
+    freezer.move_to("2026-07-31 07:04:00+02:00")
+    assert await runner.async_run_now(CycleKind.EVENING) is False
+
+    assert sequencer.current_run is live
+    assert len(calls) == commanded
+    assert sequencer.next_wakeup() == wakeup
+
+    # And the boundary the live cycle was waiting for still fires.
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    assert len(calls) == commanded + 2
+
+    runner.async_shutdown()
+
+
+async def test_run_now_fires_the_pending_reload_once_the_cycle_completes(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    paris: None,
+) -> None:
+    """Story 1.7's deferral covers a manual cycle exactly as a scheduled one.
+
+    The `_async_maybe_reload` in the new command's `finally` is what makes the
+    refused path fire an already-pending reload immediately — a config change
+    must not wait behind a cycle that never started.
+    """
+    register_switch_domain(hass)
+    freezer.move_to("2026-07-31 09:30:00+02:00")
+    reloads = spy_reloads(hass, monkeypatch)
+    runner, sequencer = make_runner(hass, make_plan())
+    await runner.async_start()
+
+    await runner.async_run_now(CycleKind.MORNING)
+    runner.async_request_reload()
+    assert reloads == []
+    assert runner.reload_pending is True
+
+    await fire_at(hass, freezer, "2026-07-31 09:40:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 09:50:00+02:00")
+
+    assert sequencer.current_run is None
+    assert len(reloads) == 1
+    assert runner.reload_pending is False
+
+    runner.async_shutdown()
+
+
 async def test_a_command_wrapper_rearms_even_when_the_engine_raises(
     hass: HomeAssistant,
     freezer: FrozenDateTimeFactory,

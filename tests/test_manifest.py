@@ -13,6 +13,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+import pytest
 from homeassistant.util.yaml import parse_yaml
 
 from custom_components.ha_irrigation_controller.const import (
@@ -21,6 +22,7 @@ from custom_components.ha_irrigation_controller.const import (
     MIN_HA_VERSION,
     MIN_ZONE_DURATION_MINUTES,
     SERVICE_CANCEL_CYCLE,
+    SERVICE_RUN_NOW,
     SERVICE_SET_SEASON,
     SERVICE_SET_ZONE_DURATION,
 )
@@ -109,6 +111,7 @@ def test_services_yaml_declares_exactly_the_registered_actions() -> None:
     """
     assert set(_load_services_yaml()) == {
         SERVICE_CANCEL_CYCLE,
+        SERVICE_RUN_NOW,
         SERVICE_SET_SEASON,
         SERVICE_SET_ZONE_DURATION,
     }
@@ -128,11 +131,27 @@ def test_the_duration_selector_carries_the_const_bounds() -> None:
     assert number["max"] == MAX_ZONE_DURATION_MINUTES
 
 
-def test_the_cycle_selector_lists_exactly_the_engine_cycle_kinds() -> None:
-    """A third cycle kind must reach the picker, not only the schema."""
-    cycle = _fields_of(_load_services_yaml()[SERVICE_SET_ZONE_DURATION])["cycle"]
+@pytest.mark.parametrize(
+    "service",
+    [SERVICE_SET_ZONE_DURATION, SERVICE_RUN_NOW],
+)
+def test_the_cycle_selector_lists_exactly_the_engine_cycle_kinds(service: str) -> None:
+    """A third cycle kind must reach BOTH pickers, not only the schemas.
+
+    `run_now` reuses `set_zone_duration`'s selector verbatim rather than
+    describing the kinds a second way, and this is what keeps the copy honest.
+    """
+    cycle = _fields_of(_load_services_yaml()[service])["cycle"]
 
     assert cycle["selector"]["select"]["options"] == [kind.value for kind in CycleKind]
+
+
+def test_run_now_requires_the_cycle_field_and_takes_nothing_else() -> None:
+    """The caller NAMES the cycle: one required field, no defaulting rule."""
+    fields = _fields_of(_load_services_yaml()[SERVICE_RUN_NOW])
+
+    assert set(fields) == {"cycle"}
+    assert fields["cycle"]["required"] is True
 
 
 def test_the_translations_cover_every_service_and_field_both_ways() -> None:
@@ -162,6 +181,8 @@ def test_every_exception_translation_key_the_services_raise_exists() -> None:
 
     for key in (
         "no_cycle_running",
+        "cycle_already_running",
+        "no_zones",
         "unknown_zone",
         "invalid_duration",
         "cycles_overlap",

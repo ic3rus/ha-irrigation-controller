@@ -163,6 +163,16 @@
             "name": "Cancel cycle",
             "description": "Stops the cycle that is running right now. The open valve is closed, then the pump, and the cycle is recorded as cancelled. This is the only thing that stops a running cycle."
         },
+        "run_now": {
+            "name": "Run now",
+            "description": "Starts a full cycle immediately, exactly as a scheduled one: the pump first, then every zone in order on its configured duration for the cycle you name. It runs even when the season is off, and it is refused while another cycle is already running or waiting to start.",
+            "fields": {
+                "cycle": {
+                    "name": "Cycle",
+                    "description": "Which of the two daily cycles to run. Each zone stores a separate duration for each, so this is what decides how long every zone waters."
+                }
+            }
+        },
         "set_season": {
             "name": "Set season",
             "description": "Turns watering on or off in one action. With the season off no new cycle is scheduled and no anomaly is raised; a cycle already running still finishes.",
@@ -201,6 +211,12 @@
         },
         "no_cycle_running": {
             "message": "There is no cycle running, so there is nothing to cancel."
+        },
+        "cycle_already_running": {
+            "message": "A cycle is already running or waiting to start, and two zones must never water at once. Wait for it to finish, or cancel it first."
+        },
+        "no_zones": {
+            "message": "This controller has no zones configured, so there is nothing to water. Add a zone first."
         },
         "unknown_zone": {
             "message": "No zone has the id {zone_id}. The configured zones are: {known}."
