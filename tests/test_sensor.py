@@ -188,24 +188,28 @@ async def test_cycle_status_is_an_enum_with_a_coarse_summary(
 
     state = state_of(hass, status)
     assert state.attributes[ATTR_DEVICE_CLASS] == SensorDeviceClass.ENUM
-    # `cancelled` (Story 1.6) rides in through the CycleStatus comprehension.
-    # No push point can surface it today — the dispatcher fires after `advance`
-    # returns, by which point `current_run` is released — so what is asserted
-    # is that the sensor DECLARES it (HA raises on an unlisted state) and that
-    # it is translated; `test_cancelled_is_a_declared_and_translated_state`
-    # covers the translation half.
+    # `cancelled` (Story 1.6) and `waived` (Story 2.3) ride in through the
+    # CycleStatus comprehension. No push point can surface either today — the
+    # dispatcher fires after `advance` returns, by which point `current_run`
+    # is released, and a waived cycle is never `current_run` at all — so what
+    # is asserted is that the sensor DECLARES them (HA raises on an unlisted
+    # state) and that they are translated;
+    # `test_cancelled_is_a_declared_and_translated_state` covers the
+    # translation half.
     assert state.attributes[ATTR_OPTIONS] == [
         "idle",
         "pending",
         "running",
         "completed",
         "cancelled",
+        "waived",
     ]
     assert ATTR_STATE_CLASS not in state.attributes
     assert ATTR_UNIT_OF_MEASUREMENT not in state.attributes
     assert state.attributes["cycle_id"] is None
     assert state.attributes["current_zone"] is None
     assert state.attributes["config_change_pending"] is False
+    assert state.attributes["day_credit"] is None
 
     await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
     state = state_of(hass, status)
@@ -325,6 +329,54 @@ async def test_cancelled_is_a_declared_and_translated_state(
     )
     states = translations["entity"]["sensor"]["cycle_status"]["state"]
     assert set(states) == set(state_of(hass, status).attributes[ATTR_OPTIONS])
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_day_credit_attribute_shows_the_credit_until_it_is_consumed(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 2.3: the credit is observable on the cycle-status sensor, coarsely.
+
+    None before anything ran; the ISO day once the 05:00 run-now completes;
+    None again once the 07:00 morning has been waived by it — and the sensor
+    is `idle` throughout that decision, because a waived cycle is never
+    `current_run`. Same coarse-attribute precedent as Story 2.2.
+    """
+    freezer.move_to("2026-07-31 05:00:00+02:00")
+    entry = controller_with_zones(zone_subentry_data("Zone A", VALVE_A))
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switches(hass)
+    status = entity_id_for(hass, f"{entry.entry_id}_cycle_status")
+    assert state_of(hass, status).attributes["day_credit"] is None
+
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_RUN_NOW,
+        {ATTR_CYCLE: "morning"},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+    assert state_of(hass, status).state == "running"
+    assert state_of(hass, status).attributes["day_credit"] is None  # not settled yet
+
+    await fire_at(hass, freezer, "2026-07-31 05:10:00+02:00")
+
+    state = state_of(hass, status)
+    assert state.state == "idle"
+    assert state.attributes["day_credit"] == "2026-07-31"
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+
+    state = state_of(hass, status)
+    assert state.state == "idle"
+    assert state.attributes["cycle_id"] is None
+    assert state.attributes["day_credit"] is None
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

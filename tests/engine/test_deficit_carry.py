@@ -140,6 +140,7 @@ async def test_a_failed_open_extends_the_next_run_of_that_kind() -> None:
     assert sequencer.ledger.as_dict() == {
         "settled_cycle_id": "2026-08-01-morning",
         "deficits": {},
+        "day_credit": None,
     }
 
 
@@ -194,6 +195,7 @@ async def test_a_partial_cancel_books_each_zones_shortfall() -> None:
     assert sequencer.ledger.as_dict() == {
         "settled_cycle_id": "2026-07-31-morning",
         "deficits": {"zone-2": 480, "zone-3": 600},
+        "day_credit": None,
     }
 
 
@@ -243,7 +245,8 @@ async def test_the_completion_snapshot_already_carries_the_settlement() -> None:
     await sequencer.advance(clock.now())
     # Quoting wrote nothing: the ledger in every snapshot so far is untouched.
     assert all(
-        snapshot["ledger"] == {"settled_cycle_id": None, "deficits": {}}
+        snapshot["ledger"]
+        == {"settled_cycle_id": None, "deficits": {}, "day_credit": None}
         for snapshot in journal.snapshots
     )
 
@@ -259,6 +262,7 @@ async def test_the_completion_snapshot_already_carries_the_settlement() -> None:
     assert completion["ledger"] == {
         "settled_cycle_id": "2026-07-31-morning",
         "deficits": {"zone-1": 600},
+        "day_credit": None,
     }
     assert journal.snapshots[-1]["ledger"] == completion["ledger"]
 
@@ -311,6 +315,7 @@ async def test_a_suspend_settles_nothing_and_the_deficit_is_re_applied() -> None
     seed: dict[str, object] = {
         "settled_cycle_id": "2026-07-30-evening",
         "deficits": {"zone-1": 300},
+        "day_credit": None,
     }
     sequencer, _, journal, _ = make_sequencer(two_zone_plan(), ledger=seed)
     clock = VirtualClock(aware(7))
@@ -368,7 +373,8 @@ async def test_a_run_now_applies_and_settles_the_deficit() -> None:
     """FR11's "current durations" are the current EFFECTIVE durations.
 
     One arithmetic, no manual-run branch: the run-now after a failed morning
-    waters 1200 s on zone 1 and pays the debt off.
+    waters 1200 s on zone 1 and pays the debt off — and, having completed
+    with no shortfall, credits the day (Story 2.3) in the same settlement.
     """
     sequencer, switches, _, _ = make_sequencer(two_zone_plan())
     clock = VirtualClock(aware(7))
@@ -389,6 +395,10 @@ async def test_a_run_now_applies_and_settles_the_deficit() -> None:
     assert sequencer.ledger.as_dict() == {
         "settled_cycle_id": "2026-07-31-morning-2",
         "deficits": {},
+        "day_credit": {
+            "irrigation_day": "2026-07-31",
+            "cycle_id": "2026-07-31-morning-2",
+        },
     }
 
 
@@ -416,7 +426,11 @@ async def test_without_a_seed_the_first_run_is_quoted_on_base() -> None:
     await sequencer.request_cycle(CycleKind.MORNING, clock.now())
 
     assert [zone.duration_s for zone in current(sequencer).zone_runs] == [600, 600]
-    assert journal.snapshots[-1]["ledger"] == {"settled_cycle_id": None, "deficits": {}}
+    assert journal.snapshots[-1]["ledger"] == {
+        "settled_cycle_id": None,
+        "deficits": {},
+        "day_credit": None,
+    }
 
 
 async def test_a_deficit_for_a_removed_zone_is_dropped_at_the_next_settlement() -> None:

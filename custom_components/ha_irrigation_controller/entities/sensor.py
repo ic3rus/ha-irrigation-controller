@@ -91,7 +91,9 @@ class CycleStatusSensor(HaIrrigationControllerEntity, SensorEntity):
         # already released `current_run` (so a finished cycle reads `idle`).
         # Declaring the full CycleStatus keeps the sensor safe for Epic 3's
         # mid-advance pushes instead of making them a breaking change.
-        # CANCELLED joins CycleStatus in Story 1.6 and lands here for free.
+        # CANCELLED (Story 1.6) and WAIVED (Story 2.3) join CycleStatus and
+        # land here for free — WAIVED can never be the state either, since a
+        # waived cycle is never `current_run`, but it needs its translation.
         self._attr_options = [STATE_IDLE, *(status.value for status in CycleStatus)]
 
     @property
@@ -108,6 +110,12 @@ class CycleStatusSensor(HaIrrigationControllerEntity, SensorEntity):
         1.7): true from the moment a config edit lands during a cycle until
         the cycle completes and the reload fires. A projection pushed by the
         same dispatcher signal as everything else — no new entity.
+
+        `day_credit` (Story 2.3) is the irrigation day a completed run-now
+        has already watered — the ISO date, or None — read from the ledger,
+        never written (AD-6). It is the operator's only view of why the next
+        scheduled cycle of that day will be waived; it clears the moment that
+        decision is made. Same coarse-attribute precedent as Story 2.2.
         """
         run = self._sequencer.current_run
         zone = None if run is None else _live_zone(run)
@@ -115,6 +123,7 @@ class CycleStatusSensor(HaIrrigationControllerEntity, SensorEntity):
             "cycle_id": None if run is None else run.cycle_id,
             "current_zone": None if zone is None else zone.name,
             "config_change_pending": self._runner.reload_pending,
+            "day_credit": self._sequencer.ledger.day_credit,
         }
 
 

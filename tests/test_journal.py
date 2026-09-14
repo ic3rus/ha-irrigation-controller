@@ -44,7 +44,11 @@ def snapshot(marker: int) -> dict[str, object]:
 
 
 # The ledger section that owes nothing — what every unreadable section reads as.
-EMPTY_LEDGER: dict[str, object] = {"settled_cycle_id": None, "deficits": {}}
+EMPTY_LEDGER: dict[str, object] = {
+    "settled_cycle_id": None,
+    "deficits": {},
+    "day_credit": None,
+}
 
 
 async def test_transitions_coalesce_under_the_debounce(
@@ -293,9 +297,10 @@ async def test_load_seed_drops_records_the_engine_cannot_consume(
     }
 
     # The survivor comes back with the optional keys later stories added filled
-    # in — here Story 2.1's manual marker, defaulted to scheduled.
+    # in — Story 2.1's manual marker, defaulted to scheduled, and Story 2.3's
+    # `waived_by`, defaulted to None.
     assert (await JournalAdapter(hass).async_load_seed()).history == [
-        {**good, "manual": False},
+        {**good, "manual": False, "waived_by": None},
     ]
 
 
@@ -337,6 +342,46 @@ async def test_load_seed_defaults_a_missing_manual_marker_to_scheduled(
     seed = await JournalAdapter(hass).async_load_seed()
 
     assert seed.history[0]["manual"] is expected
+
+
+@pytest.mark.parametrize(
+    ("stored_waiver", "expected"),
+    [
+        ({}, None),  # a document written before Story 2.3
+        ({"waived_by": None}, None),
+        ({"waived_by": "2026-07-30-morning"}, "2026-07-30-morning"),
+        ({"waived_by": 7}, None),
+        ({"waived_by": True}, None),
+        ({"waived_by": ["2026-07-30-morning"]}, None),
+    ],
+    ids=["absent", "none", "str", "int", "bool", "list"],
+)
+async def test_load_seed_defaults_a_missing_waived_by_to_none(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    stored_waiver: dict[str, object],
+    expected: str | None,
+) -> None:
+    """A journal written before Story 2.3 loads with `waived_by` on every record.
+
+    `history_entry` promises the key on every record it writes; the seed
+    backfills it for records written before the promise, so no reader has to
+    defend against its absence. Only a `str` — a run-now's cycle id — is kept;
+    anything else reads as "this cycle was not waived".
+    """
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {
+            "history": [
+                {"irrigation_day": "2026-07-30", "cycle_id": "x", **stored_waiver},
+            ],
+        },
+    }
+
+    seed = await JournalAdapter(hass).async_load_seed()
+
+    assert seed.history[0]["waived_by"] == expected
 
 
 async def test_the_season_flag_round_trips_through_the_store(
@@ -625,7 +670,7 @@ async def test_a_journal_written_before_the_manual_marker_still_sets_up(
     await hass.async_block_till_done()
 
     stored = hass_storage[STORAGE_KEY]["data"]["history"]
-    assert stored[0] == {**legacy, "manual": False}
+    assert stored[0] == {**legacy, "manual": False, "waived_by": None}
     assert [record["cycle_id"] for record in stored] == [
         "2026-07-30-evening",
         "2026-07-31-morning",
@@ -716,6 +761,7 @@ async def test_load_seed_keeps_only_the_deficits_the_engine_can_consume(
     assert (await JournalAdapter(hass).async_load_seed()).ledger == {
         "settled_cycle_id": "2026-07-30-evening",
         "deficits": {"zone-1": 300, "zone-2": 0},
+        "day_credit": None,
     }
 
 
@@ -737,6 +783,7 @@ async def test_load_seed_accepts_a_ledger_with_deficits_but_no_settled_id(
     assert (await JournalAdapter(hass).async_load_seed()).ledger == {
         "settled_cycle_id": None,
         "deficits": {"zone-1": 300},
+        "day_credit": None,
     }
 
 
@@ -775,6 +822,7 @@ async def test_a_stored_ledger_round_trips_through_a_reload(
     assert hass_storage[STORAGE_KEY]["data"]["ledger"] == {
         "settled_cycle_id": "2026-07-31-morning",
         "deficits": {zone_id: 300},
+        "day_credit": None,
     }
 
     assert await hass.config_entries.async_setup(entry.entry_id)
@@ -790,3 +838,168 @@ async def test_a_stored_ledger_round_trips_through_a_reload(
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
+
+
+# --------------------------------------------------------------------------
+# The day credit in the ledger section (Story 2.3)
+# --------------------------------------------------------------------------
+
+
+# A section written before Story 2.3, and every malformed credit a hand edit or
+# a restored backup can produce: each reads as NO credit, and the zone's debt
+# next to it is kept — the section is never rejected for a bad credit.
+@pytest.mark.parametrize(
+    "credit",
+    [
+        {},  # a document written before Story 2.3: no key at all
+        {"day_credit": None},
+        {"day_credit": "2026-07-31"},
+        {"day_credit": []},
+        {"day_credit": {}},
+        {"day_credit": {"irrigation_day": 5, "cycle_id": "x"}},
+        {"day_credit": {"irrigation_day": "31-07-2026", "cycle_id": "x"}},
+        {"day_credit": {"irrigation_day": "2026-07-31"}},
+        {"day_credit": {"irrigation_day": "2026-07-31", "cycle_id": 7}},
+        {"day_credit": {"cycle_id": "2026-07-31-morning"}},
+    ],
+    ids=[
+        "absent",
+        "none",
+        "string",
+        "list",
+        "empty-mapping",
+        "day-int",
+        "day-not-iso",
+        "no-cycle-id",
+        "cycle-id-int",
+        "no-day",
+    ],
+)
+async def test_load_seed_reads_a_missing_or_malformed_day_credit_as_none(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    credit: dict[str, object],
+) -> None:
+    """Matrix "pre-2.3 / malformed section": no credit, the debt kept, nothing logged.
+
+    `JOURNAL_SCHEMA_VERSION` stays 1, so the key is optional on read; and a
+    doubtful credit reads as "not credited", which waters (AD-4). A bad
+    credit must not forget a zone's debt.
+    """
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {
+            "ledger": {
+                "settled_cycle_id": "2026-07-30-evening",
+                "deficits": {"zone-1": 300},
+                **credit,
+            },
+        },
+    }
+
+    assert (await JournalAdapter(hass).async_load_seed()).ledger == {
+        "settled_cycle_id": "2026-07-30-evening",
+        "deficits": {"zone-1": 300},
+        "day_credit": None,
+    }
+
+
+async def test_load_seed_accepts_a_valid_day_credit_and_keeps_only_its_two_keys(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+) -> None:
+    """A credit as the engine wrote it seeds back; a smuggled extra key does not."""
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {
+            "ledger": {
+                "settled_cycle_id": "2026-07-31-morning",
+                "deficits": {},
+                "day_credit": {
+                    "irrigation_day": "2026-07-31",
+                    "cycle_id": "2026-07-31-morning",
+                    "extra": True,
+                },
+            },
+        },
+    }
+
+    assert (await JournalAdapter(hass).async_load_seed()).ledger == {
+        "settled_cycle_id": "2026-07-31-morning",
+        "deficits": {},
+        "day_credit": {
+            "irrigation_day": "2026-07-31",
+            "cycle_id": "2026-07-31-morning",
+        },
+    }
+
+
+async def test_a_day_credit_round_trips_through_a_reload_and_waives_the_cycle(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 2.3 AC 3, end to end: written by the one writer, honoured after reload.
+
+    A run-now at 05:00 completes its 10 min zone; the unloaded document
+    carries the credit. After the reload the 07:00 morning start creates
+    nothing: history gains a `waived` record naming the run-now, and the
+    credit is consumed.
+    """
+    freezer.move_to("2026-07-31 05:00:00+02:00")
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[zone_subentry_data("Zone A", "switch.zone_1_valve")],
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_RUN_NOW,
+        {ATTR_CYCLE: "morning"},
+        blocking=True,
+    )
+    await fire_at(hass, freezer, "2026-07-31 05:10:00+02:00")
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass_storage[STORAGE_KEY]["data"]["ledger"] == {
+        "settled_cycle_id": "2026-07-31-morning",
+        "deficits": {},
+        "day_credit": {
+            "irrigation_day": "2026-07-31",
+            "cycle_id": "2026-07-31-morning",
+        },
+    }
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+    sequencer = entry.runtime_data.sequencer
+    assert sequencer.ledger.day_credit == "2026-07-31"
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+
+    assert sequencer.current_run is None
+    assert sequencer.last_run is None
+    assert sequencer.ledger.day_credit is None
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    stored = hass_storage[STORAGE_KEY]["data"]
+    assert [
+        (record["cycle_id"], record["status"], record["waived_by"])
+        for record in stored["history"]
+    ] == [
+        ("2026-07-31-morning", "completed", None),
+        ("2026-07-31-morning-2", "waived", "2026-07-31-morning"),
+    ]
+    assert stored["ledger"]["day_credit"] is None

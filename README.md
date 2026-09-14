@@ -78,6 +78,29 @@ already running *or* waiting to start (two zones must never water at once; use
 `cancel_cycle` first if you mean to replace it), and when the controller has no
 zones configured.
 
+**Credits the day.** A run-now that **completes every zone in full** credits
+its irrigation day, and the *next* scheduled cycle of that same day is then
+**waived**: no run is created, nothing is commanded, no anomaly is raised, and
+history records the cycle as `waived` with `waived_by` naming the run-now.
+The credit is consumed by that one decision, so the day's *other* scheduled
+cycle waters normally — a morning run-now waives the morning cycle if it has
+not started yet, or the evening one if it has. The credit does not care which
+cycle the run-now was: an evening run-now completed before the morning cycle
+waives the morning cycle. A scheduled cycle that falls
+due *while* the run-now is watering is queued as usual and waived when the
+run-now completes. The credit belongs to the calendar day of the cycle's
+configured start; if no scheduled cycle asks for it that day, it is simply
+discarded by the first one that does on a later day, and that cycle waters.
+
+A run-now that was **cancelled**, or that completed with a zone that failed
+to open, or that otherwise left any zone short of its quoted duration,
+credits **nothing** — doubt resolves toward watering — and its under-watered
+zones carry their shortfall forward (see [Water debt](#water-debt)). A
+second completed run-now on the same day refreshes the credit rather than
+adding one. The credit lives in the integration's journal, so it survives a
+reload and a Home Assistant restart, and the **Cycle status** sensor shows
+it as a `day_credit` attribute (the credited day, or none).
+
 ### `ha_irrigation_controller.set_season`
 
 | Field | Type | Required | Meaning |
@@ -144,7 +167,11 @@ next cycle completes. The ledger lives in the integration's own journal, so a
 deficit survives a reload and a Home Assistant restart.
 
 `run_now` uses the same arithmetic: a manual cycle applies, and then clears,
-outstanding deficits exactly like a scheduled one.
+outstanding deficits exactly like a scheduled one — and, when it completes
+with nothing left owed, it [credits the day](#ha_irrigation_controllerrun_now)
+so the next scheduled cycle is waived. A waived cycle is never settled: a
+deficit outstanding when a cycle is waived stays in the ledger and extends the
+next cycle that actually runs.
 
 Each zone's **Last watering duration** sensor carries two attributes:
 `carried_deficit`, the seconds that were added to the run the sensor is

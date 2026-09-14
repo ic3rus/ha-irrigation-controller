@@ -52,8 +52,12 @@ class JournalSeed:
     dataclass.
 
     `ledger` is the section in the shape `Ledger.as_dict` writes —
-    `{"settled_cycle_id": str | None, "deficits": {zone_id: int}}` — already
-    validated, so the engine can trust it.
+    `{"settled_cycle_id": str | None, "deficits": {zone_id: int},
+    "day_credit": {"irrigation_day": "YYYY-MM-DD", "cycle_id": str} | None}`
+    — already validated, so the engine can trust it. `day_credit` (Story
+    2.3) is the irrigation day a completed run-now has already watered, with
+    that run-now's id; it is optional on read, and a malformed one reads as
+    no credit without touching the rest of the section.
     """
 
     history: list[dict[str, object]]
@@ -190,9 +194,12 @@ def _seed_entry(entry: object) -> dict[str, object] | None:
     raise out of `prune_history` → `_complete_cycle` → `advance()` and abandon
     a cycle mid-flight with the pump on. The REWRITE fills in the keys later
     stories added, so a document written before them loads with their default
-    rather than making every reader defend itself: today that is Story 2.1's
-    manual marker, defaulted to scheduled by `is_manual` (the ONE place that
-    rule lives).
+    rather than making every reader defend itself: Story 2.1's manual marker,
+    defaulted to scheduled by `is_manual` (the ONE place that rule lives), and
+    Story 2.3's `waived_by`, kept only when it is a `str` (the id of the
+    run-now that excused a waived cycle) and `None` otherwise — a record that
+    ran, or one written before 2.3, reads the same as one `history_entry`
+    writes today.
 
     A SHALLOW copy, never the stored dict mutated in place: the top level is
     rebuilt so the caller's document keeps the keys it had, while nested values
@@ -208,12 +215,17 @@ def _seed_entry(entry: object) -> dict[str, object] | None:
         date.fromisoformat(day)
     except ValueError:
         return None
-    return {**entry, MANUAL_KEY: is_manual(entry)}
+    waived_by = entry.get("waived_by")
+    return {
+        **entry,
+        MANUAL_KEY: is_manual(entry),
+        "waived_by": waived_by if isinstance(waived_by, str) else None,
+    }
 
 
 def _empty_ledger() -> dict[str, object]:
-    """Return the section of a ledger that owes nothing."""
-    return {"settled_cycle_id": None, "deficits": {}}
+    """Return the section of a ledger that owes nothing and credits no day."""
+    return {"settled_cycle_id": None, "deficits": {}, "day_credit": None}
 
 
 def _seed_ledger(section: object) -> dict[str, object]:
@@ -228,6 +240,12 @@ def _seed_ledger(section: object) -> dict[str, object]:
       NOT kept). Entries that fail are dropped one by one — a hand edit that
       breaks one zone's debt must not forget every other zone's.
     - `settled_cycle_id` must be a `str` or `None`.
+    - `day_credit` (Story 2.3) is optional — absent in every document written
+      before it — and kept only as a mapping whose `irrigation_day` parses
+      with `date.fromisoformat` and whose `cycle_id` is a `str`; anything else
+      reads as NO credit, on its own, without rejecting the section. A bad
+      credit must not forget the zones' debts, and the fail-wet reading of a
+      doubtful credit is "not credited": the next cycle waters.
 
     Anything else about the section's shape — absent (every document written
     before this story), not a mapping, a `deficits` that is not a mapping, a
@@ -250,4 +268,27 @@ def _seed_ledger(section: object) -> dict[str, object]:
             and not isinstance(seconds, bool)
             and seconds >= 0
         },
+        "day_credit": _seed_day_credit(section.get("day_credit")),
     }
+
+
+def _seed_day_credit(credit: object) -> dict[str, object] | None:
+    """Return the day credit fit for the engine, or None when it cannot be.
+
+    The credit half of `_seed_ledger`'s trust boundary. `Ledger.__init__`
+    calls `date.fromisoformat` on the day it is handed, so it is parsed here
+    first — a malformed day would otherwise raise out of `async_setup_entry`.
+    Rebuilt with the two keys only, so a hand edit cannot smuggle extra
+    fields into the engine's section.
+    """
+    if not isinstance(credit, dict):
+        return None
+    day = credit.get("irrigation_day")
+    cycle_id = credit.get("cycle_id")
+    if not isinstance(day, str) or not isinstance(cycle_id, str):
+        return None
+    try:
+        date.fromisoformat(day)
+    except ValueError:
+        return None
+    return {"irrigation_day": day, "cycle_id": cycle_id}
