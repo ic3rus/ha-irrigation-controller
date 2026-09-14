@@ -40,6 +40,29 @@ class SwitchPort(Protocol):
         ...
 
 
+class RainPort(Protocol):
+    """Read seam for the rain gauge (Story 2.4, FR14) — the rain credit's ONE input.
+
+    `total_mm()` returns the gauge's CUMULATIVE precipitation total in
+    millimetres, or `None` when the reading is doubtful — missing entity,
+    unknown/unavailable, non-numeric, non-finite, negative, or an unknown
+    unit. Units and validation are the ADAPTER's job (`adapters/rain.py`
+    converts `cm` and `in` to mm); the engine never sees a unit. `None` means
+    "no modulation for this quote", never an anomaly: fail-wet (AD-4) reads a
+    doubtful gauge as "it did not rain".
+
+    Synchronous on purpose: a Home Assistant state read is synchronous, and
+    the sequencer quotes inside `_build_run`, which is synchronous too. The
+    engine reads the port exactly once per QUOTE (`_build_run` — a scheduled
+    dispatch that ends waived and a deferred pop are quotes too) and
+    snapshots the value on the run (AD-8) — never during or after a cycle.
+    """
+
+    def total_mm(self) -> float | None:
+        """Return the cumulative rain total in mm, or None when doubtful."""
+        ...
+
+
 class JournalPort(Protocol):
     """Persistence seam for the engine's serializable state snapshot.
 

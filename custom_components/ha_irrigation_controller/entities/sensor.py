@@ -21,7 +21,11 @@ from homeassistant.components.sensor import (
 from homeassistant.const import UnitOfTime
 
 from ..const import SUBENTRY_TYPE_ZONE  # noqa: TID252
-from ..engine.runs import CycleStatus, effective_seconds  # noqa: TID252
+from ..engine.runs import (  # noqa: TID252
+    CycleStatus,
+    ZoneRunStatus,
+    effective_seconds,
+)
 from .entity import HaIrrigationControllerEntity, HaIrrigationZoneEntity
 
 if TYPE_CHECKING:
@@ -158,19 +162,24 @@ class ZoneLastWateringSensor(HaIrrigationZoneEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, int]:
-        """Return the zone's water debt, COARSE (AD-10) — two integers.
+        """Return the zone's water debt and rain credit, COARSE (AD-10).
 
         `carried_deficit` is the deficit the ledger applied to the run this
         sensor is showing — the SAME slot `native_value` reads, so the two
         always describe one run — and `pending_deficit` is what the ledger
-        still holds for this zone right now. Both read 0 when there is
-        nothing to show: a zone that never watered and owes nothing has no
-        debt, not unknown debt. The ledger is READ here, never written (AD-6).
+        still holds for this zone right now. `rain_credit` (Story 2.4) is
+        the seconds of rain credit the ledger subtracted from that same run
+        — the operator's view of why a zone watered less, or not at all
+        (NFR8). All three read 0 when there is nothing to show: a zone that
+        never watered, owes nothing and was credited nothing has no debt and
+        no credit, not unknown ones. The ledger is READ here, never written
+        (AD-6).
         """
         zone = self._shown_zone()
         return {
             "carried_deficit": 0 if zone is None else zone.carried_s,
             "pending_deficit": self._sequencer.ledger.deficit_s(self._zone_id),
+            "rain_credit": 0 if zone is None else zone.rain_credit_s,
         }
 
     def _shown_zone(self) -> ZoneRun | None:
@@ -180,19 +189,25 @@ class ZoneLastWateringSensor(HaIrrigationZoneEntity, SensorEntity):
         it is fresher than `last_run`, and the operator watching a cycle
         should see the zone that just finished, not yesterday's figure.
 
-        A CANCELLED run is the one case where a zone with no `actual_end` is
-        still an ANSWER rather than missing data: the cancel stopped the cycle
-        before that zone's slot, so it watered zero seconds — which is what the
-        README documents and what `effective_seconds` returns for it. Without
-        this branch a cancel would flap every un-reached zone's MEASUREMENT
-        sensor to `unknown` and pollute its long-term statistics.
+        Two cases where a zone with no `actual_end` is still an ANSWER rather
+        than missing data — both water zero seconds, which is what the README
+        documents and what `effective_seconds` returns for them, and either
+        would otherwise flap a MEASUREMENT sensor to `unknown` and pollute
+        its long-term statistics:
+
+        - a CANCELLED run: the cancel stopped the cycle before that zone's
+          slot;
+        - a SKIPPED zone (Story 2.4): rain covered its whole base, so the
+          slot was never commanded — the `rain_credit` attribute says why.
         """
         for run in (self._sequencer.current_run, self._sequencer.last_run):
             if run is None:
                 continue
             zone = _zone_run(run, self._zone_id)
             if zone is not None and (
-                zone.actual_end is not None or run.status is CycleStatus.CANCELLED
+                zone.actual_end is not None
+                or run.status is CycleStatus.CANCELLED
+                or zone.status is ZoneRunStatus.SKIPPED
             ):
                 return zone
         return None

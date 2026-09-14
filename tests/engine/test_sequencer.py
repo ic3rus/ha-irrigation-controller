@@ -682,6 +682,7 @@ async def test_history_gets_one_entry_per_completed_cycle_oldest_first() -> None
             "status": "completed",
             "planned_s": 600,
             "carried_s": 0,
+            "rain_credit_s": 0,
             "effective_s": 600,
         },
     ]
@@ -742,6 +743,7 @@ async def test_history_records_zero_effective_seconds_for_a_failed_zone() -> Non
         "status": "failed",
         "planned_s": 600,
         "carried_s": 0,
+        "rain_credit_s": 0,
         "effective_s": 0,
     }
     assert history[-1]["zones"][1]["effective_s"] == 900

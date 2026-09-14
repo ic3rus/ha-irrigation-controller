@@ -164,7 +164,10 @@ configured duration in one cycle, and repeated failures never snowball. A zone
 that waters its full extended duration clears its debt. The debt of a zone
 removed from the configuration is never applied again and is dropped when the
 next cycle completes. The ledger lives in the integration's own journal, so a
-deficit survives a reload and a Home Assistant restart.
+deficit survives a reload and a Home Assistant restart. When a zone is both
+owed water and covered by [rain](#rain-credit), the rain credit is taken off
+the configured duration first and the debt is added afterwards — so a zone in
+debt always waters at least what it is owed, whatever the rainfall.
 
 `run_now` uses the same arithmetic: a manual cycle applies, and then clears,
 outstanding deficits exactly like a scheduled one — and, when it completes
@@ -179,6 +182,51 @@ showing, and `pending_deficit`, the seconds the zone is owed according to the
 ledger. The ledger only moves when a cycle completes (or is cancelled), so
 while the run that is paying a debt is still in progress `pending_deficit`
 keeps showing that debt; it drops once the run finishes.
+
+## Rain credit
+
+The controller reads the configured **rain sensor** — any sensor reporting an
+accumulated precipitation total — once per cycle, when the cycle is quoted,
+and turns the rain that has fallen since each zone's *previous cycle* into a
+per-zone credit. What counts is the sensor's cumulative total: the value at the
+zone's previous cycle is remembered as that zone's baseline, and the
+difference to the current value is the rain credited to this cycle. A zone
+that has no baseline yet — the first cycle after installation, or a newly
+added zone — always waters in full and only banks the gauge reading for the
+next cycle. Rain that falls *during* a cycle is not lost; it is counted for
+the next one. Baselines live in the integration's journal and survive a
+reload and a restart. Every zone advances its baseline at every cycle,
+sheltered and factor-0 zones included, so switching a zone to exposed only
+credits rain fallen since its last cycle.
+
+Only zones marked **exposed to rain** are reduced; a sheltered zone waters its
+full duration whatever the rainfall. The conversion is the zone's **rain
+factor**, in minutes of watering per millimetre of rain (default 1 min/mm; 0
+disables the reduction for that zone). The credit is rounded down to whole
+seconds, and a zone's duration can be reduced all the way to **zero**: such a
+zone is **skipped** — its valve is never commanded, no anomaly is raised and
+no deficit is recorded, since real fallen water is the one safe reason to
+water nothing. Credit beyond a zone's configured duration is not carried
+over: heavy rain excuses one cycle, never two. When every zone of a cycle is
+skipped, the pump is not started either; the cycle still completes and is
+filed in history with each zone marked `skipped`.
+
+Each zone's **Last watering duration** sensor carries a `rain_credit`
+attribute: the seconds of credit applied to the run the sensor is showing (0
+when none). A skipped zone shows `0` seconds watered with its credit next to
+it.
+
+If the rain sensor is missing, `unknown`, `unavailable`, reports something that
+is not a finite non-negative number, or reports a unit the controller does not
+understand, rain modulation is simply disabled for that cycle: every zone
+waters its full duration and no anomaly is raised. A sensor total that
+*decreases* (a gauge reset) credits nothing. Sensors reporting in `mm`, `cm`
+and `in` are all read correctly.
+
+`run_now` is rain-reduced like any other cycle: it runs the *current* effective
+durations. A run-now fired after rain that covers every zone completes at once
+with every zone skipped, waters nothing and — having left no debt — still
+[credits the day](#ha_irrigation_controllerrun_now).
 
 ## Configuration changes and running cycles
 

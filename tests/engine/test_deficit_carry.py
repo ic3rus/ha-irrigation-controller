@@ -141,6 +141,7 @@ async def test_a_failed_open_extends_the_next_run_of_that_kind() -> None:
         "settled_cycle_id": "2026-08-01-morning",
         "deficits": {},
         "day_credit": None,
+        "rain_baselines": {},
     }
 
 
@@ -196,6 +197,7 @@ async def test_a_partial_cancel_books_each_zones_shortfall() -> None:
         "settled_cycle_id": "2026-07-31-morning",
         "deficits": {"zone-2": 480, "zone-3": 600},
         "day_credit": None,
+        "rain_baselines": {},
     }
 
 
@@ -246,7 +248,12 @@ async def test_the_completion_snapshot_already_carries_the_settlement() -> None:
     # Quoting wrote nothing: the ledger in every snapshot so far is untouched.
     assert all(
         snapshot["ledger"]
-        == {"settled_cycle_id": None, "deficits": {}, "day_credit": None}
+        == {
+            "settled_cycle_id": None,
+            "deficits": {},
+            "day_credit": None,
+            "rain_baselines": {},
+        }
         for snapshot in journal.snapshots
     )
 
@@ -263,6 +270,7 @@ async def test_the_completion_snapshot_already_carries_the_settlement() -> None:
         "settled_cycle_id": "2026-07-31-morning",
         "deficits": {"zone-1": 600},
         "day_credit": None,
+        "rain_baselines": {},
     }
     assert journal.snapshots[-1]["ledger"] == completion["ledger"]
 
@@ -301,6 +309,7 @@ async def test_history_records_the_quoted_and_carried_seconds() -> None:
         "status": "completed",
         "planned_s": 1200,
         "carried_s": 600,
+        "rain_credit_s": 0,
         "effective_s": 1200,
     }
 
@@ -316,6 +325,7 @@ async def test_a_suspend_settles_nothing_and_the_deficit_is_re_applied() -> None
         "settled_cycle_id": "2026-07-30-evening",
         "deficits": {"zone-1": 300},
         "day_credit": None,
+        "rain_baselines": {},
     }
     sequencer, _, journal, _ = make_sequencer(two_zone_plan(), ledger=seed)
     clock = VirtualClock(aware(7))
@@ -399,6 +409,7 @@ async def test_a_run_now_applies_and_settles_the_deficit() -> None:
             "irrigation_day": "2026-07-31",
             "cycle_id": "2026-07-31-morning-2",
         },
+        "rain_baselines": {},
     }
 
 
@@ -430,6 +441,7 @@ async def test_without_a_seed_the_first_run_is_quoted_on_base() -> None:
         "settled_cycle_id": None,
         "deficits": {},
         "day_credit": None,
+        "rain_baselines": {},
     }
 
 

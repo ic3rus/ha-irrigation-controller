@@ -23,10 +23,12 @@ from homeassistant.helpers.storage import Store
 
 from .adapters.anomalies import AnomalyManager
 from .adapters.journal import STORAGE_KEY, JournalAdapter
+from .adapters.rain import RainSensorAdapter
 from .adapters.registry import ConfiguredEntityTracker
 from .adapters.switches import VerifiedSwitchAdapter
 from .adapters.timing import CycleRunner, HaClock
 from .const import (
+    CONF_RAIN_SENSOR,
     DOMAIN,
     LOGGER,
     MIN_HA_MAJOR,
@@ -210,13 +212,25 @@ async def async_setup_entry(
             name=subentry.title,
         )
 
-    # The engine and its four adapters. The switch adapter's cycle_id provider
+    # The engine and its five adapters. The switch adapter's cycle_id provider
     # closes over the sequencer built on the next statement — late-bound on
     # purpose, since the two reference each other (AD-7 needs the running
     # cycle's id to mint its one Context).
     clock = HaClock()
     journal = JournalAdapter(hass)
     anomalies = AnomalyManager(hass)
+    # The rain gauge (Story 2.4): read by the engine at quote time only, so
+    # nothing is subscribed here and no `after_dependencies` is declared. The
+    # option is required by the flow, but a stored entry is unvalidated input
+    # — anything but an entity id string means no gauge, and every cycle is
+    # quoted on full durations (fail-wet). A registry rename rewrites the
+    # option and reloads, so the adapter is rebuilt with the new id.
+    rain_entity_id = entry.options.get(CONF_RAIN_SENSOR)
+    rain = (
+        RainSensorAdapter(hass, rain_entity_id)
+        if isinstance(rain_entity_id, str)
+        else None
+    )
     switches = VerifiedSwitchAdapter(
         hass,
         timeout_s=actuation_timeout_s,
@@ -245,6 +259,7 @@ async def async_setup_entry(
         switches=switches,
         journal=journal,
         anomalies=anomalies,
+        rain=rain,
         history=seed.history,
         season_enabled=seed.season_enabled,
         ledger=seed.ledger,
