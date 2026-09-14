@@ -79,6 +79,9 @@ class CycleStatusSensor(HaIrrigationControllerEntity, SensorEntity):
         """Bind the projection to the controller entry and its sequencer."""
         super().__init__(entry, "cycle_status")
         self._sequencer = sequencer
+        # The runner is where a deferred reload lives; rebuilt with this
+        # entity on every load, so reading it off `runtime_data` once is safe.
+        self._runner = entry.runtime_data.runner
         # Every state this sensor can report MUST be listed — HA raises on an
         # unlisted one — and each listed value needs a translation entry.
         #
@@ -98,13 +101,20 @@ class CycleStatusSensor(HaIrrigationControllerEntity, SensorEntity):
         return STATE_IDLE if run is None else run.status.value
 
     @property
-    def extra_state_attributes(self) -> dict[str, str | None]:
-        """Return a COARSE summary — AD-10 forbids the timeline in attributes."""
+    def extra_state_attributes(self) -> dict[str, str | bool | None]:
+        """Return a COARSE summary — AD-10 forbids the timeline in attributes.
+
+        `config_change_pending` is the runner's deferred-reload flag (Story
+        1.7): true from the moment a config edit lands during a cycle until
+        the cycle completes and the reload fires. A projection pushed by the
+        same dispatcher signal as everything else — no new entity.
+        """
         run = self._sequencer.current_run
         zone = None if run is None else _live_zone(run)
         return {
             "cycle_id": None if run is None else run.cycle_id,
             "current_zone": None if zone is None else zone.name,
+            "config_change_pending": self._runner.reload_pending,
         }
 
 
@@ -167,10 +177,11 @@ def _live_zone(run: CycleRun) -> ZoneRun | None:
     zone is indistinguishable by status from a finished one, and it is still
     the live slot until its planned end (fail-wet consumes the slot, AD-4).
 
-    The SAME rule is encoded in `engine/sequencer.py::_close_live_zone`, which
-    is what a cancel closes. The duplication is deliberate (the engine may not
-    import from `entities/`), so the two must be edited together — promoting it
-    to a shared `engine/runs.py` helper is the clean follow-up.
+    The SAME rule is encoded in `engine/sequencer.py::_live_zone`, which is
+    what a cancel and a suspend close. The duplication is deliberate (the
+    engine may not import from `entities/`), so the two must be edited
+    together — promoting it to a shared `engine/runs.py` helper is the clean
+    follow-up.
     """
     return next(
         (

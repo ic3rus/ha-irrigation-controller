@@ -841,6 +841,545 @@ async def test_a_command_wrapper_pushes_the_dispatcher_signal(
     runner.async_shutdown()
 
 
+# --------------------------------------------------------------------------
+# Deferred reload and suspend (Story 1.7)
+# --------------------------------------------------------------------------
+
+
+def spy_reloads(hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Replace `async_schedule_reload` with a recorder.
+
+    The runner-level entries are never added to hass, so the real method would
+    raise `UnknownEntry`; what these tests pin is WHEN the runner asks for a
+    reload, not what HA does with it.
+    """
+    reloads: list[str] = []
+
+    def _spy(entry_id: str) -> None:
+        reloads.append(entry_id)
+
+    monkeypatch.setattr(hass.config_entries, "async_schedule_reload", _spy)
+    return reloads
+
+
+def make_entry_runner(
+    hass: HomeAssistant,
+    plan: ControllerPlan,
+) -> tuple[CycleRunner, Sequencer, MockConfigEntry]:
+    """`make_runner`, also returning the entry whose id the reload must carry."""
+    entry = MockConfigEntry(domain="ha_irrigation_controller")
+    sequencer = Sequencer(
+        plan,
+        switches=VerifiedSwitchAdapter(
+            hass,
+            timeout_s=5,
+            cycle_id_provider=lambda: (
+                sequencer.current_run.cycle_id if sequencer.current_run else None
+            ),
+        ),
+        journal=JournalAdapter(hass),
+        anomalies=AnomalyManager(hass),
+    )
+    runner = CycleRunner(hass, entry, sequencer=sequencer, clock=HaClock())
+    return runner, sequencer, entry
+
+
+async def test_request_reload_while_idle_reloads_at_once(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    paris: None,
+) -> None:
+    """Nothing to protect: an idle request is the pre-1.7 immediate reload."""
+    reloads = spy_reloads(hass, monkeypatch)
+    register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, _, entry = make_entry_runner(hass, make_plan())
+    await runner.async_start()
+
+    runner.async_request_reload()
+
+    assert reloads == [entry.entry_id]
+    assert runner.reload_pending is False
+
+    runner.async_shutdown()
+
+
+async def test_request_reload_while_busy_waits_for_the_cycle_to_complete(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    paris: None,
+) -> None:
+    """AC 1: no reload before `_complete_cycle`, exactly one after it.
+
+    The flag is visible while it waits (`reload_pending`) and cleared by the
+    very step that completes the cycle, so the sensor's last push of that
+    cycle already reads false.
+    """
+    reloads = spy_reloads(hass, monkeypatch)
+    calls = register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, sequencer, entry = make_entry_runner(hass, make_plan())
+    await runner.async_start()
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+
+    runner.async_request_reload()
+    assert reloads == []
+    assert runner.reload_pending is True
+
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    # A zone boundary is not the end of the cycle.
+    assert reloads == []
+    assert runner.reload_pending is True
+
+    await fire_at(hass, freezer, "2026-07-31 07:20:00+02:00")
+    assert sequencer.current_run is None
+    assert [call.service for call in calls][-1] == "turn_off"
+    assert reloads == [entry.entry_id]
+    assert runner.reload_pending is False
+
+    runner.async_shutdown()
+
+
+async def test_several_requests_during_one_cycle_coalesce_into_one_reload(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    paris: None,
+) -> None:
+    """Three edits, one flag, one reload."""
+    reloads = spy_reloads(hass, monkeypatch)
+    register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, _, entry = make_entry_runner(hass, make_plan())
+    await runner.async_start()
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+
+    for _ in range(3):
+        runner.async_request_reload()
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 07:20:00+02:00")
+
+    assert reloads == [entry.entry_id]
+
+    runner.async_shutdown()
+
+
+async def test_a_pending_run_counts_as_busy(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    paris: None,
+) -> None:
+    """A PENDING run holds a snapshot too — the reload waits for it as well."""
+    reloads = spy_reloads(hass, monkeypatch)
+    register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, sequencer, _ = make_entry_runner(hass, make_plan())
+    await runner.async_start()
+    # Requested at 06:59 for the 07:00 start: PENDING until then.
+    await sequencer.request_cycle(CycleKind.MORNING, dt_util.now())
+    run = sequencer.current_run
+    assert run is not None
+    assert run.status is CycleStatus.PENDING
+
+    runner.async_request_reload()
+
+    assert reloads == []
+    assert runner.reload_pending is True
+
+    runner.async_shutdown()
+
+
+async def test_replan_rearms_the_daily_starts_from_the_new_plan(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    paris: None,
+) -> None:
+    """A start time edited mid-cycle is honoured the same day, not skipped.
+
+    The daily trackers were armed from the old plan; after the listener swaps
+    the plan it calls `async_replan`, and an evening start moved to 07:15 —
+    inside the running morning cycle — must request the evening cycle at
+    07:15 (deferred behind the morning one) and run it with the new plan once
+    the morning cycle completes. Still exactly one point-in-time registration.
+    """
+    live = 0
+    real = getattr(timing, "async_track_point_in_time")  # noqa: B009 — an import, not an export
+
+    def _tracked(*args: Any, **kwargs: Any) -> Callable[[], None]:
+        nonlocal live
+        unsubscribe = real(*args, **kwargs)
+        live += 1
+
+        def _wrapped() -> None:
+            nonlocal live
+            live -= 1
+            unsubscribe()
+
+        return _wrapped
+
+    monkeypatch.setattr(timing, "async_track_point_in_time", _tracked)
+    reloads = spy_reloads(hass, monkeypatch)
+    calls = register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, sequencer, entry = make_entry_runner(hass, make_plan())
+    await runner.async_start()
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+
+    runner.async_request_reload()
+    new_plan = ControllerPlan(
+        pump_entity_id=PUMP,
+        morning_enabled=True,
+        morning_start=time(7, 0),
+        evening_start=time(7, 15),
+        zones=(
+            ZoneSpec(
+                zone_id="zone-1",
+                name="Front Lawn",
+                valve_entity_id=VALVE_1,
+                morning_duration_s=600,
+                evening_duration_s=120,
+                rain_exposed=True,
+                rain_factor=1.0,
+            ),
+        ),
+    )
+    sequencer.plan = new_plan
+    runner.async_replan()
+
+    await fire_at(hass, freezer, "2026-07-31 07:15:00+02:00")
+    assert sequencer.deferred_kinds == (CycleKind.EVENING,)
+    assert live == 1
+
+    await fire_at(hass, freezer, "2026-07-31 07:20:00+02:00")
+    # The morning cycle completed and the evening one started from the NEW
+    # plan (one zone, two minutes) — the reload still waits for it.
+    evening = sequencer.current_run
+    assert evening is not None
+    assert evening.kind is CycleKind.EVENING
+    assert [zone.duration_s for zone in evening.zone_runs] == [120]
+    assert reloads == []
+    assert live == 1
+
+    await fire_at(hass, freezer, "2026-07-31 07:22:00+02:00")
+    assert sequencer.current_run is None
+    assert reloads == [entry.entry_id]
+    assert live == 0
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls][-3:] == [
+        ("turn_on", VALVE_1),
+        ("turn_off", VALVE_1),
+        ("turn_off", PUMP),
+    ]
+
+    runner.async_shutdown()
+
+
+async def test_replan_after_shutdown_arms_nothing(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Re-arming behind an unload would leak a daily timer per reload."""
+    calls = register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, sequencer, _ = make_entry_runner(hass, make_plan())
+    await runner.async_start()
+    runner.async_shutdown()
+
+    runner.async_replan()
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    assert calls == []
+    assert sequencer.current_run is None
+
+
+async def test_cancel_fires_the_pending_reload(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    paris: None,
+) -> None:
+    """The cancel wrapper's `finally` is the same tail: cancel, then the reload."""
+    reloads = spy_reloads(hass, monkeypatch)
+    calls = register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, sequencer, entry = make_entry_runner(hass, make_plan())
+    await runner.async_start()
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    runner.async_request_reload()
+
+    freezer.move_to("2026-07-31 07:04:00+02:00")
+    assert await runner.async_cancel_cycle() is True
+
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls][-2:] == [
+        ("turn_off", VALVE_1),
+        ("turn_off", PUMP),
+    ]
+    assert sequencer.current_run is None
+    assert reloads == [entry.entry_id]
+    assert runner.reload_pending is False
+
+    runner.async_shutdown()
+
+
+async def test_a_pending_reload_never_fires_after_shutdown(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    paris: None,
+) -> None:
+    """The shutdown guard covers the reload too, not only the re-arm.
+
+    The unload lands while the LAST step of the cycle is in flight (awaiting
+    the pump-off): that step completes the cycle after shutdown ran, and it
+    must schedule nothing — a reload from a dying runner would race the one
+    replacing it.
+    """
+    reloads = spy_reloads(hass, monkeypatch)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, sequencer, _ = make_entry_runner(hass, make_plan())
+
+    async def _handle(call: ServiceCall) -> None:
+        if call.service == "turn_off" and call.data[ATTR_ENTITY_ID] == PUMP:
+            runner.async_shutdown()
+        state = STATE_ON if call.service == "turn_on" else STATE_OFF
+        hass.states.async_set(call.data[ATTR_ENTITY_ID], state, context=call.context)
+
+    hass.services.async_register("switch", "turn_on", _handle)
+    hass.services.async_register("switch", "turn_off", _handle)
+    for entity_id in (PUMP, VALVE_1, VALVE_2):
+        hass.states.async_set(entity_id, STATE_OFF)
+    await runner.async_start()
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    runner.async_request_reload()
+    assert runner.reload_pending is True
+
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 07:20:00+02:00")
+
+    assert sequencer.current_run is None
+    assert reloads == []
+
+
+async def test_request_reload_after_shutdown_is_a_no_op(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    paris: None,
+) -> None:
+    """A request reaching a shut-down runner neither reloads nor flags."""
+    reloads = spy_reloads(hass, monkeypatch)
+    register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, _, _ = make_entry_runner(hass, make_plan())
+    await runner.async_start()
+    runner.async_shutdown()
+
+    runner.async_request_reload()
+
+    assert reloads == []
+    assert runner.reload_pending is False
+
+
+async def test_request_reload_while_busy_pushes_the_dispatcher_signal_at_once(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    paris: None,
+) -> None:
+    """The sensor attribute flips the moment the edit lands, not at the next step.
+
+    Idempotent: a second request while already pending pushes nothing new.
+    """
+    spy_reloads(hass, monkeypatch)
+    register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, _, entry = make_entry_runner(hass, make_plan())
+    pushes = 0
+
+    def _on_signal() -> None:
+        nonlocal pushes
+        pushes += 1
+
+    unsubscribe = async_dispatcher_connect(
+        hass,
+        engine_state_signal(entry.entry_id),
+        _on_signal,
+    )
+    await runner.async_start()
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    assert pushes == 1
+
+    runner.async_request_reload()
+    await hass.async_block_till_done()
+    assert pushes == 2
+
+    runner.async_request_reload()
+    await hass.async_block_till_done()
+    assert pushes == 2
+
+    unsubscribe()
+    runner.async_shutdown()
+
+
+async def test_suspend_drives_the_real_switch_services_and_arms_nothing(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    paris: None,
+) -> None:
+    """Forced unload mid-cycle: valve then pump off, timers gone, run untouched.
+
+    The registration counter proves "arms nothing"; the bus proves the
+    interruption was reported; the run's status proves nothing was mutated.
+    """
+    live = 0
+    real = getattr(timing, "async_track_point_in_time")  # noqa: B009 — an import, not an export
+
+    def _tracked(*args: Any, **kwargs: Any) -> Callable[[], None]:
+        nonlocal live
+        unsubscribe = real(*args, **kwargs)
+        live += 1
+
+        def _wrapped() -> None:
+            nonlocal live
+            live -= 1
+            unsubscribe()
+
+        return _wrapped
+
+    monkeypatch.setattr(timing, "async_track_point_in_time", _tracked)
+    events: list[Event] = []
+    unsubscribe_bus = hass.bus.async_listen(
+        EVENT_HA_IRRIGATION_CONTROLLER,
+        events.append,
+    )
+
+    calls = register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, sequencer, _ = make_entry_runner(hass, make_plan())
+    await runner.async_start()
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    assert live == 1
+
+    freezer.move_to("2026-07-31 07:04:00+02:00")
+    assert await runner.async_suspend() is True
+    await hass.async_block_till_done()
+    unsubscribe_bus()
+
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls] == [
+        ("turn_on", PUMP),
+        ("turn_on", VALVE_1),
+        ("turn_off", VALVE_1),
+        ("turn_off", PUMP),
+    ]
+    assert live == 0
+    assert [event.data["anomaly"] for event in events] == ["cycle_interrupted"]
+    run = sequencer.current_run
+    assert run is not None
+    assert run.status is CycleStatus.RUNNING
+
+    # Neither the zone boundary nor a daily start survives the suspend.
+    commanded = len(calls)
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 20:00:00+02:00")
+    assert len(calls) == commanded
+
+
+async def test_suspend_while_idle_is_a_no_op_that_still_shuts_down(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Our own deferred reload always unloads idle: False, no command, timers gone."""
+    calls = register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, _, _ = make_entry_runner(hass, make_plan())
+    await runner.async_start()
+
+    assert await runner.async_suspend() is False
+
+    assert calls == []
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    assert calls == []
+
+
+async def test_suspend_during_an_in_flight_advance_arms_nothing_and_reloads_nothing(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    paris: None,
+) -> None:
+    """Unloading mid-step: the step must not re-arm, reopen or reload behind it.
+
+    Modelled on the shutdown-during-advance test. The suspend lands while the
+    engine is awaiting the first valve's confirmation, with a reload already
+    pending; `async_shutdown()` runs before the suspend waits for the lock,
+    so when the in-flight step finishes its `finally` arms nothing and
+    schedules nothing — and only then does the suspend close what the step
+    opened.
+    """
+    live = 0
+    real = getattr(timing, "async_track_point_in_time")  # noqa: B009 — an import, not an export
+
+    def _tracked(*args: Any, **kwargs: Any) -> Callable[[], None]:
+        nonlocal live
+        unsubscribe = real(*args, **kwargs)
+        live += 1
+
+        def _wrapped() -> None:
+            nonlocal live
+            live -= 1
+            unsubscribe()
+
+        return _wrapped
+
+    monkeypatch.setattr(timing, "async_track_point_in_time", _tracked)
+    reloads = spy_reloads(hass, monkeypatch)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, sequencer, _ = make_entry_runner(hass, make_plan())
+    calls: list[ServiceCall] = []
+    suspends: list[asyncio.Task[bool]] = []
+
+    async def _handle(call: ServiceCall) -> None:
+        calls.append(call)
+        if call.service == "turn_on" and call.data[ATTR_ENTITY_ID] == VALVE_1:
+            # An edit landed, then the unload — both while this call is in flight.
+            runner.async_request_reload()
+            suspends.append(hass.async_create_task(runner.async_suspend()))
+        state = STATE_ON if call.service == "turn_on" else STATE_OFF
+        hass.states.async_set(call.data[ATTR_ENTITY_ID], state, context=call.context)
+
+    hass.services.async_register("switch", "turn_on", _handle)
+    hass.services.async_register("switch", "turn_off", _handle)
+    for entity_id in (PUMP, VALVE_1, VALVE_2):
+        hass.states.async_set(entity_id, STATE_OFF)
+
+    await runner.async_start()
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    assert len(suspends) == 1
+    assert await suspends[0] is True
+
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls] == [
+        ("turn_on", PUMP),
+        ("turn_on", VALVE_1),
+        ("turn_off", VALVE_1),
+        ("turn_off", PUMP),
+    ]
+    assert live == 0
+    assert reloads == []
+    run = sequencer.current_run
+    assert run is not None
+    assert run.status is CycleStatus.RUNNING
+
+    commanded = len(calls)
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    assert len(calls) == commanded
+
+
 def test_ha_clock_returns_aware_local_time(hass: HomeAssistant) -> None:
     """The engine's contract: aware, HA-local — never `datetime.now()`."""
     moment = HaClock().now()

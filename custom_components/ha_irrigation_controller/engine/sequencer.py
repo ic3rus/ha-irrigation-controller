@@ -85,7 +85,10 @@ class Sequencer:
         """
         # Public and replaceable on purpose: a new plan applies to the NEXT
         # requested cycle; the running cycle only ever reads its own snapshot
-        # (AD-8 — Story 1.7's reload deferral builds on this seam).
+        # (AD-8 — Story 1.7's reload deferral builds on this seam). The update
+        # listener swaps it here while a reload is deferred behind a running
+        # cycle, so a cycle popped from the deferred queue inside
+        # `_complete_cycle` is already created from the edited plan.
         self.plan = plan
         self._switches = switches
         self._journal = journal
@@ -239,27 +242,86 @@ class Sequencer:
             )
             return True
 
+    async def async_suspend(self, now: datetime) -> bool:  # noqa: ARG002
+        """Make the hardware safe for a forced unload; return False when idle.
+
+        The entry is being unloaded by something other than the engine's own
+        deferred reload — the integration disabled or removed, a forced
+        `async_reload` — while a cycle is active. The live valve is closed
+        first and the pump second (the same valve-before-pump order as a
+        cancel), each through the verified port, and `CYCLE_INTERRUPTED` is
+        reported so the loss is never silent (AD-4).
+
+        Deliberately NOT a cancel: nothing here mutates the run, bumps the
+        zone index, appends history or saves. The journal therefore still
+        holds the RUNNING (or PENDING) intent exactly as the last transition
+        wrote it, which is what Story 3.2's reconciler resumes from (AD-11).
+        Completing or cancelling the run here would turn an interrupted cycle
+        into an honest-looking finished one and steal that recovery.
+
+        A PENDING run has commanded nothing, so nothing is un-commanded — but
+        it is still a scheduled cycle that will be lost pre-3.2, hence the
+        anomaly. `now` is accepted for symmetry with every other engine entry
+        point and is unused: no timestamp is written because nothing is.
+
+        Never raises: the caller is the unload path, and an exception there
+        would leave the entry in FAILED_UNLOAD with the timers already gone.
+        """
+        async with self._lock:
+            run = self._run
+            if run is None:
+                return False
+            zone: ZoneRun | None = None
+            if run.status is CycleStatus.RUNNING:
+                zone = _live_zone(run)
+                if zone is not None:
+                    confirmed, error = await self._command(
+                        on=False,
+                        entity_id=zone.valve_entity_id,
+                    )
+                    if not confirmed:
+                        self._report(
+                            AnomalyKind.VALVE_CLOSE_UNCONFIRMED,
+                            {
+                                "cycle_id": run.cycle_id,
+                                "zone_id": zone.zone_id,
+                                "entity_id": zone.valve_entity_id,
+                            },
+                            error,
+                        )
+                confirmed, error = await self._command(
+                    on=False,
+                    entity_id=run.pump_entity_id,
+                )
+                if not confirmed:
+                    self._report(
+                        AnomalyKind.PUMP_OFF_UNCONFIRMED,
+                        {"cycle_id": run.cycle_id, "entity_id": run.pump_entity_id},
+                        error,
+                    )
+            self._report(
+                AnomalyKind.CYCLE_INTERRUPTED,
+                {
+                    "cycle_id": run.cycle_id,
+                    "kind": run.kind.value,
+                    "zone_id": None if zone is None else zone.zone_id,
+                },
+            )
+            return True
+
     async def _close_live_zone(self, run: CycleRun, now: datetime) -> None:
         """Close the zone whose slot is open, if any — the cancel's valve half.
 
-        The live zone is found by "started but not finished", never by status:
-        a FAILED zone is indistinguishable by status from a finished one and
-        still owns the open slot (the same rule `entities/sensor.py::_live_zone`
-        encodes for the projection).
+        The live zone is found by `_live_zone`'s "started but not finished"
+        rule, never by status: a FAILED zone is indistinguishable by status
+        from a finished one and still owns the open slot.
 
         The next zone is deliberately NOT opened and `_zone_index` is NOT
         bumped: the zones never reached keep PENDING, so `effective_seconds`
         returns 0 for them and Epic 2's deficit reads the shortfall from the
         ONE helper that owns the math (AD-5).
         """
-        zone = next(
-            (
-                candidate
-                for candidate in run.zone_runs
-                if candidate.actual_start is not None and candidate.actual_end is None
-            ),
-            None,
-        )
+        zone = _live_zone(run)
         if zone is None:
             return
         confirmed, error = await self._command(on=False, entity_id=zone.valve_entity_id)
@@ -541,3 +603,25 @@ class Sequencer:
             await self._journal.async_save(snapshot)
         except Exception as err:  # noqa: BLE001 — a failed save must not stop the water
             self._report(AnomalyKind.JOURNAL_SAVE_FAILED, {}, repr(err))
+
+
+def _live_zone(run: CycleRun) -> ZoneRun | None:
+    """Return the zone whose slot is currently open, or None.
+
+    Identified by "started but not finished" rather than by status: a FAILED
+    zone is indistinguishable by status from a finished one, and it is still
+    the live slot until its planned end (fail-wet consumes the slot, AD-4).
+
+    Shared by the cancel (which closes and mutates it) and the suspend (which
+    closes and mutates nothing). `entities/sensor.py::_live_zone` encodes the
+    SAME rule for the projection — the engine may not import from
+    `entities/`, so the two must be edited together.
+    """
+    return next(
+        (
+            zone
+            for zone in run.zone_runs
+            if zone.actual_start is not None and zone.actual_end is None
+        ),
+        None,
+    )

@@ -31,7 +31,7 @@ from ..const import engine_state_signal  # noqa: TID252
 from ..engine.plan import CycleKind  # noqa: TID252
 
 if TYPE_CHECKING:
-    from datetime import datetime
+    from datetime import datetime, time
 
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import CALLBACK_TYPE, HomeAssistant
@@ -71,10 +71,27 @@ class CycleRunner:
         self._hass = hass
         self._sequencer = sequencer
         self._clock = clock
+        self._entry_id = entry.entry_id
         self._signal = engine_state_signal(entry.entry_id)
         self._unsub_point: CALLBACK_TYPE | None = None
-        self._unsub_daily: list[CALLBACK_TYPE] = []
+        # One daily tracker per enabled cycle kind, with the start it was
+        # armed for — `async_replan` only touches the kinds whose start
+        # changed (see there for why).
+        self._daily: dict[CycleKind, tuple[time, CALLBACK_TYPE]] = {}
         self._shutdown = False
+        # A config change landed while a cycle was active (Story 1.7): the
+        # reload it needs waits for the cycle to complete, and several edits
+        # coalesce into this ONE flag — hence one reload.
+        self._reload_pending = False
+
+    @property
+    def reload_pending(self) -> bool:
+        """Return whether a config change is waiting for the cycle to end.
+
+        Read-only: the cycle-status sensor projects it as
+        `config_change_pending` (AD-6 — a projection, never a second state).
+        """
+        return self._reload_pending
 
     async def async_start(self) -> None:
         """Arm the daily cycle starts from the plan's configured times.
@@ -82,18 +99,59 @@ class CycleRunner:
         Read off `plan.morning_start`/`plan.evening_start` (`datetime.time`):
         `async_track_time_change` re-computes the next occurrence in local
         time after every fire, which is what survives a DST transition.
-        Edited start times reach these timers for free — a config change
-        reloads the entry and rebuilds this runner (FR8's restart-free half).
+        Edited start times reach these timers through a reload (FR8's
+        restart-free half) or, while a reload is deferred behind a running
+        cycle, through `async_replan`.
+        """
+        self._arm_daily()
+
+    @callback
+    def async_replan(self) -> None:
+        """Re-arm the daily starts from the CURRENT plan (Story 1.7).
+
+        Called by the update listener right after it swapped
+        `sequencer.plan` during a deferral: the daily trackers were armed
+        from the old plan, and a start time edited to an instant that passes
+        before the deferred reload lands would otherwise be skipped for the
+        day with no anomaly. Still the same two primitives and still the one
+        point-in-time registration — only daily handles are replaced.
+
+        ONLY the kinds whose start (or enabled state) changed are re-armed.
+        `async_track_time_change` fires at once when armed within the very
+        second its pattern matches, so blindly re-arming an unchanged tracker
+        during the second of its own daily start would request that cycle a
+        second time (and a duration edit landing right at 07:00 is exactly
+        the mid-cycle case this story exists for).
+
+        A no-op after shutdown: nothing may be armed behind an unload.
+        """
+        if self._shutdown:
+            return
+        self._arm_daily()
+
+    @callback
+    def _arm_daily(self) -> None:
+        """Bring the daily trackers in line with the CURRENT plan.
+
+        One `async_track_time_change` per enabled cycle kind; a tracker whose
+        start is unchanged is left alone, one whose start changed (or whose
+        kind is now disabled) is cancelled first.
         """
         plan = self._sequencer.plan
         # The evening cycle always runs; the morning one is opt-in (spring is
         # evening-only), and a disabled morning start is simply never armed.
-        kinds = [CycleKind.EVENING]
+        wanted = {CycleKind.EVENING: plan.start_time(CycleKind.EVENING)}
         if plan.morning_enabled:
-            kinds.append(CycleKind.MORNING)
-        for kind in kinds:
-            start = plan.start_time(kind)
-            self._unsub_daily.append(
+            wanted[CycleKind.MORNING] = plan.start_time(CycleKind.MORNING)
+        for kind, (armed_start, unsubscribe) in list(self._daily.items()):
+            if wanted.get(kind) != armed_start:
+                unsubscribe()
+                del self._daily[kind]
+        for kind, start in wanted.items():
+            if kind in self._daily:
+                continue
+            self._daily[kind] = (
+                start,
                 async_track_time_change(
                     self._hass,
                     partial(self._async_daily_start, kind),
@@ -118,6 +176,7 @@ class CycleRunner:
             return await self._sequencer.async_cancel_cycle(self._clock.now())
         finally:
             self._rearm()
+            self._async_maybe_reload()
             self._async_push_state()
 
     async def async_set_season(self, *, enabled: bool) -> None:
@@ -135,7 +194,71 @@ class CycleRunner:
             )
         finally:
             self._rearm()
+            self._async_maybe_reload()
             self._async_push_state()
+
+    @callback
+    def async_request_reload(self) -> None:
+        """Reload the entry now if idle, otherwise once the cycle completes.
+
+        The ONE update listener calls this on every config change that
+        matters (Story 1.7). A reload tears the engine down, and a running
+        cycle torn down mid-flight leaves its valve and the pump energized
+        with no timer left to close them — so while a run is active (PENDING
+        counts: it holds a snapshot too) the request only raises the flag,
+        and `_async_maybe_reload` fires it from the `finally` tail of the
+        step that completes the cycle. Several requests raise one flag.
+
+        A no-op after shutdown: the entry is already on its way out, and a
+        reload scheduled from a dying runner would race the one replacing it.
+        """
+        if self._shutdown:
+            return
+        if self._sequencer.current_run is None:
+            self._hass.config_entries.async_schedule_reload(self._entry_id)
+            return
+        if not self._reload_pending:
+            self._reload_pending = True
+            # Pushed at once, not at the next engine step: the sensor's
+            # `config_change_pending` must flip the moment the edit lands.
+            self._async_push_state()
+
+    @callback
+    def _async_maybe_reload(self) -> None:
+        """Fire the deferred reload once nothing is running (Story 1.7).
+
+        Sits in every `finally` tail AFTER `_rearm` and BEFORE the push: the
+        last push of a completed cycle then already reads
+        `config_change_pending: false`. The shutdown guard is the same one
+        `_rearm` has — an in-flight step finishing after unload must schedule
+        nothing.
+        """
+        if (
+            self._reload_pending
+            and not self._shutdown
+            and self._sequencer.current_run is None
+        ):
+            self._reload_pending = False
+            self._hass.config_entries.async_schedule_reload(self._entry_id)
+
+    async def async_suspend(self) -> bool:
+        """Cancel the timers, then make the hardware safe — the forced-unload hook.
+
+        `async_shutdown()` runs FIRST: it cancels the point-in-time and daily
+        handles and sets the shutdown flag, so an `advance` still in flight
+        when the unload landed cannot re-arm a timer (or schedule a reload)
+        from its `finally` while the engine is closing the valve — a re-armed
+        boundary would reopen a valve on a manifold whose pump was just
+        switched off. Only then does the engine command the live valve and
+        the pump off; the run and the journal stay untouched (see
+        `Sequencer.async_suspend`).
+
+        Awaited from `async_unload_entry` as an ordinary lifecycle step, NOT
+        from an HA-stop handler: AD-11's "nothing closes valves in shutdown
+        handlers" is untouched, because HA stop never unloads entries.
+        """
+        self.async_shutdown()
+        return await self._sequencer.async_suspend(self._clock.now())
 
     @callback
     def async_shutdown(self) -> None:
@@ -149,9 +272,9 @@ class CycleRunner:
         if self._unsub_point is not None:
             self._unsub_point()
             self._unsub_point = None
-        for unsubscribe in self._unsub_daily:
+        for _, unsubscribe in self._daily.values():
             unsubscribe()
-        self._unsub_daily.clear()
+        self._daily.clear()
 
     async def _async_daily_start(self, kind: CycleKind, _now: datetime) -> None:
         """Request `kind` and drive it: the daily-start half of AD-3.
@@ -170,6 +293,7 @@ class CycleRunner:
             await self._sequencer.advance(self._clock.now())
         finally:
             self._rearm()
+            self._async_maybe_reload()
             self._async_push_state()
 
     async def _async_fire(self, _now: datetime) -> None:
@@ -192,6 +316,7 @@ class CycleRunner:
             await self._sequencer.advance(self._clock.now())
         finally:
             self._rearm()
+            self._async_maybe_reload()
             self._async_push_state()
 
     @callback

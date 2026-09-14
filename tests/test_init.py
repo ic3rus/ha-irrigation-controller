@@ -10,11 +10,13 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.device_registry import DeviceEntryType
+from homeassistant.helpers.entity_registry import EVENT_ENTITY_REGISTRY_UPDATED
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ha_irrigation_controller import (
     HaIrrigationRuntimeData,
     _async_entry_updated,
+    config_fingerprint,
 )
 from custom_components.ha_irrigation_controller.adapters.anomalies import AnomalyManager
 from custom_components.ha_irrigation_controller.adapters.journal import JournalAdapter
@@ -24,6 +26,8 @@ from custom_components.ha_irrigation_controller.adapters.switches import (
 from custom_components.ha_irrigation_controller.adapters.timing import CycleRunner
 from custom_components.ha_irrigation_controller.const import (
     CONF_ACTUATION_TIMEOUT,
+    CONF_EVENING_START,
+    CONF_MORNING_DURATION,
     DEFAULT_ACTUATION_TIMEOUT_S,
     DOMAIN,
     MAX_ACTUATION_TIMEOUT_S,
@@ -42,12 +46,24 @@ from custom_components.ha_irrigation_controller.engine.config import (
     parse_actuation_timeout,
 )
 from custom_components.ha_irrigation_controller.engine.plan import ControllerPlan
+from custom_components.ha_irrigation_controller.engine.ports import AnomalyKind
+from custom_components.ha_irrigation_controller.engine.runs import CycleStatus
 from custom_components.ha_irrigation_controller.engine.sequencer import Sequencer
-from tests.common import CONTROLLER_OPTIONS, controller_entry, zone_subentry_data
+from tests.common import (
+    CONTROLLER_OPTIONS,
+    PUMP,
+    VALVE_1,
+    VALVE_2,
+    controller_entry,
+    fire_at,
+    register_switch_domain,
+    zone_subentry_data,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from freezegun.api import FrozenDateTimeFactory
     from homeassistant.core import HomeAssistant
 
 _MODULE = "custom_components.ha_irrigation_controller"
@@ -431,6 +447,375 @@ async def test_setup_succeeds_at_exact_min_ha_version(
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
     assert entry.state is ConfigEntryState.LOADED
+
+
+# --------------------------------------------------------------------------
+# Config edits never interrupt a running cycle (Story 1.7)
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def running_entry(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> MockConfigEntry:
+    """Set up a two-zone controller and start its morning cycle at 07:00."""
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    entry = _entry_with_zones(
+        zone_subentry_data("Zone A", VALVE_1),
+        zone_subentry_data("Zone B", VALVE_2),
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    run = entry.runtime_data.sequencer.current_run
+    assert run is not None
+    assert run.status is CycleStatus.RUNNING
+    return entry
+
+
+async def test_a_mid_cycle_options_edit_is_applied_after_the_cycle(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    running_entry: MockConfigEntry,
+) -> None:
+    """AC 1/2 through the real listener: no reload until the cycle ends, then one.
+
+    `runtime_data` is the proof of "not reloaded": HA rebuilds it on every
+    setup, so the same object means the engine was never torn down.
+    """
+    entry = running_entry
+    runtime_data_before = entry.runtime_data
+    sequencer_before = runtime_data_before.sequencer
+
+    hass.config_entries.async_update_entry(
+        entry,
+        options={**CONTROLLER_OPTIONS, CONF_EVENING_START: "21:30:00"},
+    )
+    await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert entry.runtime_data is runtime_data_before
+    assert entry.runtime_data.runner.reload_pending is True
+    # The engine already holds the new plan for the NEXT cycle...
+    assert sequencer_before.plan.evening_start == time(21, 30)
+    assert entry.runtime_data.plan is sequencer_before.plan
+    # ...while the running one is untouched.
+    assert sequencer_before.current_run is not None
+
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    assert entry.runtime_data is runtime_data_before
+
+    await fire_at(hass, freezer, "2026-07-31 07:20:00+02:00")
+
+    assert sequencer_before.current_run is None
+    assert entry.state is ConfigEntryState.LOADED
+    assert entry.runtime_data is not runtime_data_before
+    assert entry.runtime_data.plan.evening_start == time(21, 30)
+    assert entry.runtime_data.runner.reload_pending is False
+
+
+async def test_a_title_rename_neither_reloads_nor_defers(
+    hass: HomeAssistant,
+    running_entry: MockConfigEntry,
+) -> None:
+    """A cosmetic update fires the listener too; an equal fingerprint costs nothing."""
+    entry = running_entry
+    runtime_data_before = entry.runtime_data
+
+    hass.config_entries.async_update_entry(entry, title="Garden")
+    await hass.async_block_till_done()
+
+    assert entry.title == "Garden"
+    assert entry.runtime_data is runtime_data_before
+    assert entry.runtime_data.runner.reload_pending is False
+
+
+async def test_a_zone_deleted_mid_cycle_is_still_watered_by_the_running_cycle(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    running_entry: MockConfigEntry,
+) -> None:
+    """The run's AD-8 snapshot outlives the zone's subentry (matrix: zone deleted).
+
+    Deleting Zone B while Zone A waters removes its subentry at once; the
+    running cycle still opens Zone B's valve at 07:10 from its snapshot, and
+    the ONE reload after completion rebuilds the engine on a one-zone plan.
+    """
+    entry = running_entry
+    runtime_data_before = entry.runtime_data
+    zone_b = next(
+        subentry for subentry in entry.subentries.values() if subentry.title == "Zone B"
+    )
+
+    assert hass.config_entries.async_remove_subentry(entry, zone_b.subentry_id)
+    await hass.async_block_till_done()
+
+    assert [subentry.title for subentry in entry.subentries.values()] == ["Zone A"]
+    assert entry.runtime_data is runtime_data_before
+    assert entry.runtime_data.runner.reload_pending is True
+    # The engine already holds the one-zone plan for the NEXT cycle...
+    assert [zone.name for zone in entry.runtime_data.sequencer.plan.zones] == ["Zone A"]
+
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+
+    # ...while the running one still waters the deleted zone from its snapshot.
+    assert entry.runtime_data is runtime_data_before
+    assert hass.states.is_state(VALVE_1, "off")
+    assert hass.states.is_state(VALVE_2, "on")
+
+    await fire_at(hass, freezer, "2026-07-31 07:20:00+02:00")
+
+    assert hass.states.is_state(VALVE_2, "off")
+    assert hass.states.is_state(PUMP, "off")
+    assert entry.runtime_data is not runtime_data_before
+    assert [zone.name for zone in entry.runtime_data.plan.zones] == ["Zone A"]
+
+
+async def test_an_invalid_mid_cycle_edit_keeps_the_old_plan_until_the_reload_fails(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    running_entry: MockConfigEntry,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Fail-wet: the engine keeps its plan, warns, and the deferred reload reports.
+
+    Nothing writing through `async_update_subentry` validates, so a broken
+    value can land mid-cycle. The running engine must not swap to a plan it
+    cannot build; the reload after the cycle then fails setup with the
+    existing `invalid_stored_config`, exactly as a restart would.
+    """
+    entry = running_entry
+    runtime_data_before = entry.runtime_data
+    plan_before = runtime_data_before.plan
+    zone_b = next(
+        subentry for subentry in entry.subentries.values() if subentry.title == "Zone B"
+    )
+
+    hass.config_entries.async_update_subentry(
+        entry,
+        zone_b,
+        data={**zone_b.data, CONF_MORNING_DURATION: "ten"},
+    )
+    await hass.async_block_till_done()
+
+    assert entry.runtime_data is runtime_data_before
+    assert entry.runtime_data.plan is plan_before
+    assert entry.runtime_data.sequencer.plan is plan_before
+    assert entry.runtime_data.runner.reload_pending is True
+    assert "does not validate" in caplog.text
+    assert "morning_duration" in caplog.text
+
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 07:20:00+02:00")
+
+    assert entry.state is ConfigEntryState.SETUP_ERROR
+    assert entry.reason is not None
+    assert "morning_duration" in entry.reason
+
+
+async def test_a_forced_reload_mid_cycle_closes_the_valve_and_the_pump(
+    hass: HomeAssistant,
+    running_entry: MockConfigEntry,
+) -> None:
+    """Decision 1 end to end: `async_reload` while RUNNING suspends, then reloads.
+
+    The live valve and the pump are commanded off through the real services
+    before the engine is torn down, the OLD manager holds `cycle_interrupted`,
+    and the entry comes back LOADED — idle, because nothing restores the run
+    before Story 3.2.
+    """
+    entry = running_entry
+    anomalies_before = entry.runtime_data.anomalies
+    # The fake was registered by the fixture; its calls are what `switch.*`
+    # now resolve to, so a fresh recorder is not needed — read the states.
+    assert hass.states.is_state(PUMP, "on")
+    assert hass.states.is_state(VALVE_1, "on")
+
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert hass.states.is_state(VALVE_1, "off")
+    assert hass.states.is_state(PUMP, "off")
+    assert AnomalyKind.CYCLE_INTERRUPTED in anomalies_before.open_anomalies
+    last = anomalies_before.last_anomaly
+    assert last is not None
+    assert last.context["zone_id"] == next(
+        subentry.subentry_id
+        for subentry in entry.subentries.values()
+        if subentry.title == "Zone A"
+    )
+    assert entry.state is ConfigEntryState.LOADED
+    assert entry.runtime_data.anomalies is not anomalies_before
+    assert entry.runtime_data.sequencer.current_run is None
+
+
+async def test_the_listener_reloads_at_once_when_the_entry_has_no_runtime(
+    hass: HomeAssistant,
+) -> None:
+    """The listener guards its own precondition: no runtime → reload now.
+
+    Exercised DIRECTLY, because no HA path reaches the listener after a
+    failed setup: HA runs the on-unload hooks on failure, which removes it.
+    The guard exists for the mid-setup window (the listener is registered
+    before `runtime_data` exists) and for any caller reaching it on a
+    non-LOADED entry — both must fall back to the pre-1.7 reload-now.
+    """
+    entry = _entry_with_zones(
+        zone_subentry_data("Zone A", VALVE_1, morning_duration="ten"),
+    )
+    entry.add_to_hass(hass)
+    assert not await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.SETUP_ERROR
+    assert not hasattr(entry, "runtime_data")
+
+    zone = next(iter(entry.subentries.values()))
+    hass.config_entries.async_update_subentry(
+        entry,
+        zone,
+        data={**zone.data, CONF_MORNING_DURATION: 10},
+    )
+    await _async_entry_updated(hass, entry)
+    await hass.async_block_till_done()
+
+    # mypy narrowed entry.state to SETUP_ERROR above and cannot see the reload.
+    assert entry.state is ConfigEntryState.LOADED  # type: ignore[comparison-overlap]
+    assert isinstance(entry.runtime_data, HaIrrigationRuntimeData)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+def test_the_fingerprint_covers_options_and_every_subentry_field() -> None:
+    """The fingerprint is what the plan is built from — and nothing else.
+
+    Every input of the plan moves it (an option, a zone's title, a zone's
+    data, the zone ORDER — which is the watering order); the entry title,
+    which nothing reads, does not.
+    """
+    zone_a = zone_subentry_data("Zone A", VALVE_1)
+    zone_b = zone_subentry_data("Zone B", VALVE_2)
+    entry = _entry_with_zones(zone_a, zone_b)
+    before = config_fingerprint(entry)
+    zones = list(entry.subentries.values())
+
+    assert config_fingerprint(entry) == before
+    assert before == (
+        dict(CONTROLLER_OPTIONS),
+        tuple(
+            (zone.subentry_id, "zone", zone.title, dict(zone.data)) for zone in zones
+        ),
+    )
+
+    def _variant(**overrides: Any) -> MockConfigEntry:
+        return MockConfigEntry(
+            domain=DOMAIN,
+            title=overrides.get("title", "Irrigation Controller"),
+            data={},
+            options=overrides.get("options", dict(CONTROLLER_OPTIONS)),
+            subentries_data=overrides.get("subentries", [zone_a, zone_b]),
+        )
+
+    # The subentry ids are minted per entry, so the variants are compared on
+    # the id-free projection of the fingerprint.
+    def _shape(
+        fingerprint: tuple[
+            dict[str, Any], tuple[tuple[str, str, str, dict[str, Any]], ...]
+        ],
+    ) -> tuple[dict[str, Any], tuple[tuple[str, str, dict[str, Any]], ...]]:
+        options, subentries = fingerprint
+        return options, tuple(
+            (subentry_type, title, data) for _, subentry_type, title, data in subentries
+        )
+
+    same_shape = _shape(before)
+    assert _shape(config_fingerprint(_variant())) == same_shape
+    assert _shape(config_fingerprint(_variant(title="Garden"))) == same_shape
+    assert (
+        _shape(
+            config_fingerprint(
+                _variant(
+                    options={**CONTROLLER_OPTIONS, CONF_EVENING_START: "21:30:00"}
+                ),
+            ),
+        )
+        != same_shape
+    )
+    assert (
+        _shape(
+            config_fingerprint(
+                _variant(subentries=[zone_subentry_data("Zone Z", VALVE_1), zone_b]),
+            ),
+        )
+        != same_shape
+    )
+    assert (
+        _shape(
+            config_fingerprint(
+                _variant(
+                    subentries=[
+                        zone_subentry_data("Zone A", VALVE_1, morning_duration=3),
+                        zone_b,
+                    ],
+                ),
+            ),
+        )
+        != same_shape
+    )
+    assert (
+        _shape(config_fingerprint(_variant(subentries=[zone_b, zone_a]))) != same_shape
+    )
+
+
+async def test_a_forced_unload_mid_cycle_closes_the_valve_and_the_pump(
+    hass: HomeAssistant,
+    running_entry: MockConfigEntry,
+) -> None:
+    """Decision 1 for a plain unload (disable/remove): suspend, then torn down.
+
+    Same hardware outcome as the forced reload, but the entry stays down:
+    NOT_LOADED, the OLD manager holding `cycle_interrupted`.
+    """
+    entry = running_entry
+    anomalies_before = entry.runtime_data.anomalies
+    assert hass.states.is_state(PUMP, "on")
+    assert hass.states.is_state(VALVE_1, "on")
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert hass.states.is_state(VALVE_1, "off")
+    assert hass.states.is_state(PUMP, "off")
+    assert AnomalyKind.CYCLE_INTERRUPTED in anomalies_before.open_anomalies
+    assert entry.state is ConfigEntryState.NOT_LOADED
+    assert not hasattr(entry, "runtime_data")
+
+
+async def test_the_tracker_leaks_no_registry_listener_across_a_reload(
+    hass: HomeAssistant,
+) -> None:
+    """A reload per config change must not accumulate registry listeners.
+
+    `verify_cleanup` cannot see bus listeners, so the count is asserted
+    directly: after setup → reload → unload it is back to the baseline.
+    """
+    baseline = hass.bus.async_listeners().get(EVENT_ENTITY_REGISTRY_UPDATED, 0)
+    entry = _entry_with_zones(zone_subentry_data("Zone A", VALVE_1))
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert hass.bus.async_listeners().get(EVENT_ENTITY_REGISTRY_UPDATED, 0) == baseline
 
 
 async def test_setup_succeeds_on_prerelease_of_min_ha_version(
