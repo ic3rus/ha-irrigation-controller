@@ -7,8 +7,9 @@ https://github.com/ic3rus/ha-irrigation-controller
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import (
     MAJOR_VERSION as HA_MAJOR_VERSION,
     MINOR_VERSION as HA_MINOR_VERSION,
@@ -22,10 +23,12 @@ from homeassistant.helpers.storage import Store
 
 from .adapters.anomalies import AnomalyManager
 from .adapters.journal import STORAGE_KEY, JournalAdapter
+from .adapters.registry import ConfiguredEntityTracker
 from .adapters.switches import VerifiedSwitchAdapter
 from .adapters.timing import CycleRunner, HaClock
 from .const import (
     DOMAIN,
+    LOGGER,
     MIN_HA_MAJOR,
     MIN_HA_MINOR,
     MIN_HA_VERSION,
@@ -43,6 +46,37 @@ if TYPE_CHECKING:
     from .engine.plan import ControllerPlan
 
 type HaIrrigationConfigEntry = ConfigEntry[HaIrrigationRuntimeData]
+
+# What the engine is built from: the options plus every subentry's identity,
+# type, title and data, in watering order. Deliberately NOT the entry title or
+# its prefs — nothing of ours reads them, and a rename of the entry must not
+# reload (let alone defer) anything.
+type ConfigFingerprint = tuple[
+    dict[str, Any],
+    tuple[tuple[str, str, str, dict[str, Any]], ...],
+]
+
+
+def config_fingerprint(entry: ConfigEntry) -> ConfigFingerprint:
+    """Return the comparable snapshot of everything the plan is built from.
+
+    A pure function of the entry, taken at setup and compared on every update
+    listener call: an equal fingerprint is a cosmetic update (title, prefs)
+    and costs nothing; a different one is a real config change.
+    """
+    return (
+        dict(entry.options),
+        tuple(
+            (
+                subentry.subentry_id,
+                subentry.subentry_type,
+                subentry.title,
+                dict(subentry.data),
+            )
+            for subentry in entry.subentries.values()
+        ),
+    )
+
 
 # Required the moment `async_setup` exists on a config-entry-only integration:
 # it declares that nothing of ours may be configured from `configuration.yaml`.
@@ -68,6 +102,10 @@ class HaIrrigationRuntimeData:
     runner: CycleRunner
     journal: JournalAdapter
     anomalies: AnomalyManager
+    tracker: ConfiguredEntityTracker
+    # The config the running engine was built from (or last given, when a
+    # reload is deferred): the update listener's "did anything change?" test.
+    config_fingerprint: ConfigFingerprint
 
 
 async def async_setup(
@@ -128,9 +166,12 @@ async def async_setup_entry(
 
     # The ONE update listener of this integration: every config change —
     # options edit, zone subentry add/edit/remove (including UI deletion, which
-    # never touches flow code) — fires it, and it schedules a reload so the
-    # change applies without restarting HA (FR8). No flow performs its own
-    # reload; Story 1.7 will teach this seam to defer while a cycle runs.
+    # never touches flow code), `set_zone_duration`, a registry rename the
+    # tracker rewrote — fires it, and it is the ONE seam that decides how the
+    # change applies without restarting HA (FR8): a reload at once while the
+    # engine is idle, a reload deferred until the running cycle completes
+    # otherwise (Story 1.7). No flow and no service performs its own reload,
+    # and none of them refuses an edit because a cycle is running.
     entry.async_on_unload(entry.add_update_listener(_async_entry_updated))
 
     device_registry = dr.async_get(hass)
@@ -203,6 +244,15 @@ async def async_setup_entry(
         season_enabled=seed.season_enabled,
     )
     runner = CycleRunner(hass, entry, sequencer=sequencer, clock=clock)
+    # Follows the configured entities through the registry: renames rewrite
+    # the stored ids (which fires the listener above), disappearance raises an
+    # anomaly. Built here, started below once the unload hooks can own it.
+    tracker = ConfiguredEntityTracker(
+        hass,
+        entry,
+        anomalies=anomalies,
+        switches=switches,
+    )
 
     # BEFORE forwarding: platform setup reads runtime_data.
     entry.runtime_data = HaIrrigationRuntimeData(
@@ -211,22 +261,29 @@ async def async_setup_entry(
         runner=runner,
         journal=journal,
         anomalies=anomalies,
+        tracker=tracker,
+        config_fingerprint=config_fingerprint(entry),
     )
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # Both must run on every unload path: a surviving timer fails PHCC's
-    # verify_cleanup and leaks per reload, and a dropped flush loses the last
-    # transition (the reload regime runs constantly).
+    # All three must run on every unload path: a surviving timer fails PHCC's
+    # verify_cleanup and leaks per reload, a dropped flush loses the last
+    # transition (the reload regime runs constantly), and a surviving registry
+    # subscription would keep rewriting a dead entry's options.
     #
     # ORDER CONTRACT: HA processes these LIFO, so the LAST registration runs
-    # FIRST — the timers are cancelled before the journal is flushed, and the
-    # flush therefore persists a state nothing can still move.
+    # FIRST — the timers are cancelled before the tracker stops and the
+    # journal is flushed, and the flush therefore persists a state nothing
+    # can still move.
     #
     # Registered BEFORE the timers are armed: HA runs the on-unload callbacks
     # when setup itself fails (`ConfigEntry.async_setup`'s `finally`), so a
     # daily start armed while a later one raises would otherwise have no
-    # registered cancel and leak for the process lifetime.
+    # registered cancel and leak for the process lifetime. The tracker's stop
+    # is registered IMMEDIATELY after its start for the same reason.
     entry.async_on_unload(journal.async_flush)
+    tracker.async_start()
+    entry.async_on_unload(tracker.async_stop)
     entry.async_on_unload(runner.async_shutdown)
     await runner.async_start()
     return True
@@ -236,8 +293,68 @@ async def _async_entry_updated(
     hass: HomeAssistant,
     entry: HaIrrigationConfigEntry,
 ) -> None:
-    """Reload the entry on any config change — the restart-free half of FR8."""
-    hass.config_entries.async_schedule_reload(entry.entry_id)
+    """Apply a config change: reload now when idle, after the cycle otherwise.
+
+    The restart-free half of FR8, made cycle-aware (Story 1.7). Three gates,
+    in order:
+
+    1. **No runtime to consult** — a defensive guard. The listener is
+       registered before `runtime_data` exists, so an update landing in the
+       mid-setup window (setup awaits the journal seed and the platform
+       forwarding) reaches it on a SETUP_IN_PROGRESS entry; any call on a
+       non-LOADED entry falls back to the pre-1.7 behaviour, a reload now.
+       (A failed setup does NOT leave the listener behind: HA runs the
+       on-unload hooks on failure, so a SETUP_ERROR entry has no listener
+       and the operator's fix still needs the manual reload the
+       `invalid_stored_config` message asks for.)
+    2. **Nothing the plan is built from changed** — a title rename or a pref
+       flip fires the listener too; an equal fingerprint costs nothing.
+    3. **Idle or busy** — idle reloads at once through the runner. Busy swaps
+       the engine's plan so a cycle created before the reload lands (a
+       deferred-queue pop inside `_complete_cycle`, a daily start firing
+       meanwhile) already uses the new parameters, re-arms the daily starts
+       from it (an edited start time must not be skipped for the day), then
+       asks the runner to reload once the cycle completes. The running cycle
+       itself only ever reads its AD-8 snapshot. A new plan that does not
+       validate keeps the old one in the engine (fail-wet) and lets the
+       eventual reload fail setup with the existing `invalid_stored_config`.
+       The tracker re-subscribes either way, so an entity configured
+       mid-cycle is followed before the reload too.
+    """
+    if entry.state is not ConfigEntryState.LOADED or not hasattr(
+        entry,
+        "runtime_data",
+    ):
+        hass.config_entries.async_schedule_reload(entry.entry_id)
+        return
+    data = entry.runtime_data
+    fingerprint = config_fingerprint(entry)
+    if fingerprint == data.config_fingerprint:
+        return
+    if data.sequencer.current_run is None:
+        data.runner.async_request_reload()
+        return
+    try:
+        plan = build_plan(
+            entry.options,
+            [
+                (subentry.subentry_id, subentry.title, subentry.data)
+                for subentry in entry.get_subentries_of_type(SUBENTRY_TYPE_ZONE)
+            ],
+        )
+    except PlanValidationError as err:
+        LOGGER.warning(
+            "Configuration edited mid-cycle does not validate; the running cycle "
+            "keeps its plan and the reload after it will report the problem: %s",
+            err,
+        )
+    else:
+        data.sequencer.plan = plan
+        data.plan = plan
+        data.runner.async_replan()
+    data.config_fingerprint = fingerprint
+    data.tracker.async_start()
+    data.runner.async_request_reload()
 
 
 async def async_unload_entry(
@@ -246,9 +363,19 @@ async def async_unload_entry(
 ) -> bool:
     """Unload a config entry.
 
-    The timer cancel and the journal flush ride on `async_on_unload`, so they
-    are deliberately NOT repeated here — one registration, one home.
+    `runner.async_suspend()` runs FIRST, while the engine and its adapters are
+    still whole: when this unload is anything but the engine's own deferred
+    reload (which only ever fires idle), a cycle may be RUNNING, and the live
+    valve and the pump must be commanded off before the platforms and the
+    timers go — the run itself is left in the journal for Story 3.2. Idle, it
+    is a no-op.
+
+    The timer cancel, the tracker stop and the journal flush ride on
+    `async_on_unload`, so they are deliberately NOT repeated here — one
+    registration, one home (the suspend's own shutdown call makes the timer
+    cancel idempotent).
     """
+    await entry.runtime_data.runner.async_suspend()
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 

@@ -23,9 +23,16 @@ from custom_components.ha_irrigation_controller.const import (
     CONF_TEMPERATURE_SENSOR,
     DOMAIN,
 )
-from tests.common import CONTROLLER_OPTIONS, controller_entry, zone_subentry_data
+from tests.common import (
+    CONTROLLER_OPTIONS,
+    controller_entry,
+    fire_at,
+    register_switch_domain,
+    zone_subentry_data,
+)
 
 if TYPE_CHECKING:
+    from freezegun.api import FrozenDateTimeFactory
     from homeassistant.core import HomeAssistant
 
 _FLOW_MODULE = "custom_components.ha_irrigation_controller.config_flow"
@@ -308,6 +315,55 @@ async def test_options_flow_edit_applies_without_restart(hass: HomeAssistant) ->
     # async_setup_entry really ran again (fresh runtime_data), no HA restart.
     assert entry.state is ConfigEntryState.LOADED
     assert entry.runtime_data is not runtime_data_before
+
+
+async def test_options_flow_edit_mid_cycle_applies_after_the_cycle(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """The options flow is unchanged; the listener defers the reload (Story 1.7).
+
+    Same flow as the idle variant above, submitted while a cycle runs: the
+    options are written at once, the entry is not reloaded until the cycle
+    completes, then exactly once.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[zone_subentry_data("Zone A", "switch.zone_1_valve")],
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    runtime_data_before = entry.runtime_data
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={**CONTROLLER_OPTIONS, CONF_EVENING_START: "21:30:00"},
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_EVENING_START] == "21:30:00"
+    assert entry.state is ConfigEntryState.LOADED
+    assert entry.runtime_data is runtime_data_before
+    assert entry.runtime_data.runner.reload_pending is True
+
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert entry.runtime_data is not runtime_data_before
+    assert entry.runtime_data.plan.evening_start.hour == 21
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
 
 
 async def test_options_flow_clears_optional_sensor(hass: HomeAssistant) -> None:

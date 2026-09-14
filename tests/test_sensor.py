@@ -198,12 +198,49 @@ async def test_cycle_status_is_an_enum_with_a_coarse_summary(
     assert ATTR_UNIT_OF_MEASUREMENT not in state.attributes
     assert state.attributes["cycle_id"] is None
     assert state.attributes["current_zone"] is None
+    assert state.attributes["config_change_pending"] is False
 
     await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
     state = state_of(hass, status)
     assert state.state in state.attributes[ATTR_OPTIONS]
     assert state.attributes["cycle_id"] == "2026-07-31-morning"
     assert state.attributes["current_zone"] == "Zone A"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_config_change_pending_follows_the_deferred_reload(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    entry: MockConfigEntry,
+) -> None:
+    """Decision 2: the pending reload is observable — false, true, false.
+
+    False while idle, true the moment an edit lands during a cycle (pushed at
+    once, not at the next engine step), and false again once the cycle
+    completes and the reload fires — the rebuilt entity starts clean.
+    """
+    register_switches(hass)
+    status = entity_id_for(hass, f"{entry.entry_id}_cycle_status")
+    assert state_of(hass, status).attributes["config_change_pending"] is False
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    assert state_of(hass, status).attributes["config_change_pending"] is False
+
+    hass.config_entries.async_update_entry(
+        entry,
+        options={**entry.options, CONF_MORNING_ENABLED: False},
+    )
+    await hass.async_block_till_done()
+    assert state_of(hass, status).state == "running"
+    assert state_of(hass, status).attributes["config_change_pending"] is True
+
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+
+    assert state_of(hass, status).state == "idle"
+    assert state_of(hass, status).attributes["config_change_pending"] is False
+    assert entry.runtime_data.plan.morning_enabled is False
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

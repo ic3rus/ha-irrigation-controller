@@ -65,6 +65,12 @@ class VerifiedSwitchAdapter:
         self._cycle_id_provider = cycle_id_provider
         self._context_cycle_id: str | None = None
         self._context: Context | None = None
+        # Renames followed since this adapter was built: stored id → the id
+        # the registry now knows the entity by (Story 1.7). A running cycle
+        # keeps commanding the id in its AD-8 snapshot; this map is the one
+        # place that knows Home Assistant renamed the target underneath it.
+        # Cleared for free on every reload (the adapter is rebuilt).
+        self._aliases: dict[str, str] = {}
 
     async def async_turn_on(self, entity_id: str) -> bool:
         """Command `entity_id` on; return True iff the actuation confirmed."""
@@ -73,6 +79,23 @@ class VerifiedSwitchAdapter:
     async def async_turn_off(self, entity_id: str) -> bool:
         """Command `entity_id` off; return True iff the actuation confirmed."""
         return await self._command(entity_id, target_state=STATE_OFF)
+
+    @callback
+    def async_rename(self, old_entity_id: str, new_entity_id: str) -> None:
+        """Route every future command for `old_entity_id` to `new_entity_id`.
+
+        Earlier aliases that resolved to `old_entity_id` are re-pointed too,
+        so a valve renamed twice during one cycle (a → b → c) still closes
+        under its snapshot id `a`, and a → b → a yields the identity `a → a`
+        by the same loop. No alias is ever dropped: when two configured ids
+        are SWAPPED (a → tmp, b → a, tmp → b) the snapshot `a` must keep
+        following its own hardware to `b`, and deleting the entry for the id
+        just renamed onto would send it to the other valve instead.
+        """
+        for stored, current in self._aliases.items():
+            if current == old_entity_id:
+                self._aliases[stored] = new_entity_id
+        self._aliases[old_entity_id] = new_entity_id
 
     def _command_context(self) -> Context:
         """Return the cycle's one `Context`, minted lazily per cycle id (AD-7).
@@ -89,7 +112,14 @@ class VerifiedSwitchAdapter:
         return self._context
 
     async def _command(self, entity_id: str, *, target_state: str) -> bool:
-        """Run the pinned command-and-verify sequence for one entity."""
+        """Run the pinned command-and-verify sequence for one entity.
+
+        The alias is resolved FIRST, before the watch and the call: both must
+        address the id the registry knows now, or a renamed valve would be
+        commanded under a dead id (a no-op call) and watched under it too (a
+        guaranteed timeout).
+        """
+        entity_id = self._aliases.get(entity_id, entity_id)
         future: asyncio.Future[None] = self._hass.loop.create_future()
 
         @callback

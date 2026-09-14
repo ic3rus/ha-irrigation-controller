@@ -583,15 +583,17 @@ async def test_set_zone_duration_does_not_refuse_a_running_cycle(
 ) -> None:
     """FR8 says "edit durations at any moment" — refusing would contradict it.
 
-    The reload this triggers abandons the in-flight cycle with its valve and
-    pump energized. That is the known, measured seam **Story 1.7 owns**; the
-    service deliberately grows no "is a cycle running?" branch, and this test
-    pins that deliberate choice so a well-meaning guard cannot slip in
-    unnoticed.
+    The service grows no "is a cycle running?" branch (this test pins that
+    deliberate choice so a well-meaning guard cannot slip in unnoticed): the
+    write lands at once, the ONE update listener defers the reload until the
+    running cycle completes (Story 1.7), the cycle waters its snapshotted
+    durations, and the new value reaches the engine after it.
     """
     register_switch_domain(hass)
     await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
-    assert entry.runtime_data.sequencer.current_run is not None
+    runtime_data_before = entry.runtime_data
+    sequencer_before = runtime_data_before.sequencer
+    assert sequencer_before.current_run is not None
 
     await call(
         hass,
@@ -604,7 +606,25 @@ async def test_set_zone_duration_does_not_refuse_a_running_cycle(
     )
     await hass.async_block_till_done()
 
+    # Written at once, no reload while running, the flag raised.
     assert zone_of(entry, "Zone A").data[CONF_MORNING_DURATION] == 12
+    assert entry.runtime_data is runtime_data_before
+    assert entry.runtime_data.runner.reload_pending is True
+
+    # Zone A still closes at its snapshotted 07:10 (ten minutes, not twelve).
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    run = sequencer_before.current_run
+    assert run is not None
+    assert run.zone_runs[0].actual_end is not None
+    assert run.zone_runs[0].duration_s == 600
+    await fire_at(hass, freezer, "2026-07-31 07:20:00+02:00")
+
+    # The cycle completed and the ONE reload rebuilt the engine on 12 minutes.
+    assert run.status is CycleStatus.COMPLETED
+    assert entry.runtime_data is not runtime_data_before
+    plan = entry.runtime_data.plan
+    zone = next(one for one in plan.zones if one.name == "Zone A")
+    assert zone.morning_duration_s == 12 * 60
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

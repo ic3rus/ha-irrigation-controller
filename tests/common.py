@@ -59,7 +59,12 @@ VALVE_1 = "switch.zone_1_valve"
 VALVE_2 = "switch.zone_2_valve"
 
 
-def register_switch_domain(hass: HomeAssistant) -> list[ServiceCall]:
+def register_switch_domain(
+    hass: HomeAssistant,
+    *,
+    extra_hardware: tuple[str, ...] = (),
+    seed_states: bool = True,
+) -> list[ServiceCall]:
     """Register switch services that actually flip state, and record calls.
 
     A recorder alone would never confirm: the verified adapter watches for the
@@ -76,11 +81,23 @@ def register_switch_domain(hass: HomeAssistant) -> list[ServiceCall]:
     replaced, so the fake hardware and the integration's own season switch can
     both be driven from one test. `Service.job.target` is the function HA
     registered; calling it is exactly what `async_call` does.
+
+    REGISTRY-MANAGED HARDWARE (Story 1.7's rename tests) has a second order
+    contract. `EntityRegistry.async_generate_entity_id` refuses an id already
+    present in the state machine, so a registry entry must exist BEFORE the
+    state does — and a renamed id must be owned by the fake hardware or its
+    close is unconfirmed. The sequence is therefore: create the registry
+    entries → set up the entry → `register_switch_domain(hass,
+    extra_hardware=(<new ids>,), seed_states=False)` → `hass.states.async_set`
+    each stored id → rename in the registry → `hass.states.async_set(new_id)`.
+    `extra_hardware` names the ids the fake will own in addition to the three
+    representative switches; `seed_states=False` skips the initial OFF states
+    so the caller can set them after the registry entries exist.
     """
     calls: list[ServiceCall] = []
     # A tuple, not a set: the seeding loop below sets initial states, and a set
     # would order them by PYTHONHASHSEED.
-    fake_hardware = (PUMP, VALVE_1, VALVE_2)
+    fake_hardware = (PUMP, VALVE_1, VALVE_2, *extra_hardware)
     replaced = {
         name: service.job.target
         for name, service in hass.services.async_services_for_domain("switch").items()
@@ -117,8 +134,9 @@ def register_switch_domain(hass: HomeAssistant) -> list[ServiceCall]:
 
     hass.services.async_register("switch", "turn_on", _handle)
     hass.services.async_register("switch", "turn_off", _handle)
-    for entity_id in fake_hardware:
-        hass.states.async_set(entity_id, STATE_OFF)
+    if seed_states:
+        for entity_id in fake_hardware:
+            hass.states.async_set(entity_id, STATE_OFF)
     return calls
 
 

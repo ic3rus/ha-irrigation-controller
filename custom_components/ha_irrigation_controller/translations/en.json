@@ -175,7 +175,7 @@
         },
         "set_zone_duration": {
             "name": "Set zone duration",
-            "description": "Changes how long one zone waters during one cycle. The change applies without restarting Home Assistant. Note: it reloads the integration, so a cycle running at that moment is abandoned — avoid calling it mid-cycle until that is fixed.",
+            "description": "Changes how long one zone waters during one cycle. The change applies without restarting Home Assistant. A cycle running at that moment finishes with its original durations; the new value is applied when the running cycle completes.",
             "fields": {
                 "zone_id": {
                     "name": "Zone",

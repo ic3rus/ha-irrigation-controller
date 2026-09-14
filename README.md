@@ -82,13 +82,56 @@ The change applies without restarting Home Assistant. The call is rejected —
 with a translated error and no write — when the duration is outside 1–120
 minutes, or when it would make the morning and evening cycles overlap.
 
-> **⚠️ Caveat (fixed in a later release):** applying a duration change reloads
-> the integration, and a reload currently abandons a cycle that is running at
-> that moment. The open valve and the pump are **left switched on, with no
-> timer left to close them** — they stay energized until you turn them off
-> yourself. Do not call this action while a cycle is running until that is
-> handled. The action deliberately does *not* refuse the call, because
-> durations are meant to be editable at any moment.
+Like every other configuration change, it follows the rules below when a
+cycle is running. The action deliberately does *not* refuse the call, because
+durations are meant to be editable at any moment.
+
+## Configuration changes and running cycles
+
+Every configuration change — the options form, adding, editing or deleting a
+zone, `set_zone_duration` — is applied by reloading the integration. That
+reload is **cycle-aware**:
+
+- **Nothing running:** the reload happens at once, as before.
+- **A cycle is running (or waiting for its start):** the reload waits. The
+  running cycle finishes with the parameters it started with — a zone whose
+  duration you shortened still waters its original time — and the integration
+  reloads exactly once, however many edits you made meanwhile. Any cycle
+  created before that reload lands (one queued behind the running one, or the
+  other daily start firing meanwhile) already uses the new configuration, and
+  is itself completed before the reload — so the reload fires once nothing is
+  running any more, which can be the end of that next cycle.
+
+While a reload is waiting, the **Cycle status** sensor carries the attribute
+`config_change_pending: true`; it returns to `false` when the last running
+cycle completes and the reload fires.
+
+**Forced reloads are different.** Reloading the integration yourself (the
+"Reload" menu entry, `homeassistant.reload_config_entry`), disabling it or
+removing it while a cycle runs does not wait: the open valve is closed, then
+the pump, and a `cycle_interrupted` anomaly is raised. The interrupted cycle
+is not resumed in this version — but the hardware is left safe and you are
+told.
+
+## Entity renames
+
+The controller stores the *entity ids* of the pump, the rain, temperature and
+humidity sensors and every zone's valve. Renaming one of them in the entity
+registry (Settings → Devices & services → Entities) is followed
+automatically: the stored id is rewritten and the change applies through the
+normal cycle-aware reload. A valve renamed while its zone is watering is still
+closed correctly under its new id.
+
+Two limits:
+
+- Only entities that have an entity-registry entry (a `unique_id`) fire rename
+  events. An entity defined without one cannot be tracked; if you rename such
+  an entity, reconfigure the controller or the zone by hand.
+- A configured entity that is **removed** from the registry, or **disabled**,
+  raises a `configured_entity_missing` anomaly naming the entity and its role.
+  Nothing is skipped or unscheduled: the next cycle still commands it and
+  raises the usual unconfirmed-actuation anomalies. Like every anomaly in this
+  version, it stays open until the integration reloads.
 
 ## Development
 

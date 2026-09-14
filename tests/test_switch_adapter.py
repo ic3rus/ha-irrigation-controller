@@ -186,6 +186,104 @@ async def test_commands_within_one_cycle_share_one_context(
     assert on_calls[1].context.id != on_calls[0].context.id
 
 
+async def test_a_renamed_entity_is_commanded_and_watched_under_its_new_id(
+    hass: HomeAssistant,
+) -> None:
+    """The alias resolves BEFORE the service call and the state watch (Story 1.7).
+
+    A running cycle's snapshot keeps naming the old id; the adapter is the
+    one place that knows the registry renamed it. Both directions, both
+    halves: the call carries the new id and the confirmation is read off it.
+    """
+    on_calls = async_mock_service(hass, "switch", "turn_on")
+    off_calls = async_mock_service(hass, "switch", "turn_off")
+    adapter = make_adapter(hass)
+    adapter.async_rename(VALVE, "switch.front_valve")
+
+    # Confirmed off the NEW id's state — the old id has no state at all.
+    hass.states.async_set("switch.front_valve", STATE_ON)
+    assert await adapter.async_turn_on(VALVE) is True
+    assert on_calls[0].data[ATTR_ENTITY_ID] == "switch.front_valve"
+
+    hass.states.async_set("switch.front_valve", STATE_OFF)
+    assert await adapter.async_turn_off(VALVE) is True
+    assert off_calls[0].data[ATTR_ENTITY_ID] == "switch.front_valve"
+
+    # The watch is on the new id too: a late confirmation lands there.
+    hass.states.async_set("switch.front_valve", STATE_OFF)
+    task = hass.async_create_task(adapter.async_turn_on(VALVE))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not task.done()
+    hass.states.async_set("switch.front_valve", STATE_ON)
+    assert await task is True
+
+
+async def test_unaliased_ids_pass_through_untouched(hass: HomeAssistant) -> None:
+    """An alias for one entity changes nothing for the others."""
+    calls = async_mock_service(hass, "switch", "turn_on")
+    adapter = make_adapter(hass)
+    adapter.async_rename("switch.other_valve", "switch.renamed_valve")
+    hass.states.async_set(VALVE, STATE_ON)
+
+    assert await adapter.async_turn_on(VALVE) is True
+
+    assert calls[0].data[ATTR_ENTITY_ID] == VALVE
+
+
+async def test_chained_renames_resolve_to_the_last_id(hass: HomeAssistant) -> None:
+    """Chained a → b → c: snapshot id `a` reaches `c`, so does `b`, `c` is itself."""
+    calls = async_mock_service(hass, "switch", "turn_on")
+    adapter = make_adapter(hass)
+    adapter.async_rename(VALVE, "switch.b")
+    adapter.async_rename("switch.b", "switch.c")
+    hass.states.async_set("switch.c", STATE_ON)
+
+    assert await adapter.async_turn_on(VALVE) is True
+    assert await adapter.async_turn_on("switch.b") is True
+    assert await adapter.async_turn_on("switch.c") is True
+
+    assert [call.data[ATTR_ENTITY_ID] for call in calls] == ["switch.c"] * 3
+
+
+async def test_renaming_back_to_an_earlier_id_resolves_to_itself(
+    hass: HomeAssistant,
+) -> None:
+    """Renamed a → b → a: the re-pointing loop yields `a → a`, `b → a`."""
+    calls = async_mock_service(hass, "switch", "turn_on")
+    adapter = make_adapter(hass)
+    adapter.async_rename(VALVE, "switch.b")
+    adapter.async_rename("switch.b", VALVE)
+    hass.states.async_set(VALVE, STATE_ON)
+
+    assert await adapter.async_turn_on(VALVE) is True
+    assert await adapter.async_turn_on("switch.b") is True
+
+    assert [call.data[ATTR_ENTITY_ID] for call in calls] == [VALVE, VALVE]
+
+
+async def test_swapping_two_ids_keeps_each_snapshot_on_its_own_hardware(
+    hass: HomeAssistant,
+) -> None:
+    """Swap a → tmp, b → a, tmp → b: snapshot `a` reaches `b`, `b` reaches `a`.
+
+    Dropping the alias for an id just renamed onto would send snapshot `a` to
+    the OTHER valve with no anomaly — which is why no alias is ever removed.
+    """
+    calls = async_mock_service(hass, "switch", "turn_on")
+    adapter = make_adapter(hass)
+    adapter.async_rename("switch.a", "switch.tmp")
+    adapter.async_rename("switch.b", "switch.a")
+    adapter.async_rename("switch.tmp", "switch.b")
+    hass.states.async_set("switch.a", STATE_ON)
+    hass.states.async_set("switch.b", STATE_ON)
+
+    assert await adapter.async_turn_on("switch.a") is True
+    assert await adapter.async_turn_on("switch.b") is True
+
+    assert [call.data[ATTR_ENTITY_ID] for call in calls] == ["switch.b", "switch.a"]
+
+
 async def test_commands_outside_a_cycle_get_fresh_contexts(
     hass: HomeAssistant,
 ) -> None:

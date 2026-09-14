@@ -158,13 +158,15 @@ async def _async_set_zone_duration(call: ServiceCall) -> None:
 
     Deliberately NOT routed through the runner: a duration is *configuration*,
     and configuration has exactly one write path (AD-8) — `async_update_subentry`
-    then the ONE update listener, which reloads the entry on the next tick.
+    then the ONE update listener, which reloads the entry at once when the
+    engine is idle and defers the reload until the running cycle completes
+    otherwise (Story 1.7).
 
-    Deliberately NOT refused while a cycle is running either. That reload
-    abandons the in-flight cycle with its valve and pump energized — the known,
-    measured seam **Story 1.7 owns**, and it must handle the physical state
-    rather than be papered over here. Refusing the call would contradict FR8's
-    "edit durations at any moment".
+    Deliberately NOT refused while a cycle is running either: the running
+    cycle keeps its snapshotted durations and the new value applies to the
+    next one, so there is nothing to protect the operator from. Refusing the
+    call would contradict FR8's "edit durations at any moment", and the
+    cycle-aware branch lives in the listener, never in a service.
     """
     entry = _loaded_entry(call)
     zone_id: str = call.data[ATTR_ZONE_ID]
@@ -213,8 +215,8 @@ async def _async_set_zone_duration(call: ServiceCall) -> None:
         )
 
     # The ONLY write path for configuration (AD-8): never by assigning to
-    # `subentry.data`. Returns immediately — the ONE update listener reloads
-    # the entry on the next tick.
+    # `subentry.data`. Returns immediately — the ONE update listener applies
+    # the change (a reload now, or after the running cycle) on the next tick.
     call.hass.config_entries.async_update_subentry(entry, subentry, data=proposed)
 
 

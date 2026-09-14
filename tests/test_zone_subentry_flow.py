@@ -33,10 +33,13 @@ from tests.common import (
     ZONE_INPUT,
     add_zone,
     controller_entry,
+    fire_at,
+    register_switch_domain,
     zone_subentry_data,
 )
 
 if TYPE_CHECKING:
+    from freezegun.api import FrozenDateTimeFactory
     from homeassistant.core import HomeAssistant
 
 
@@ -776,6 +779,57 @@ async def test_reconfigure_zone_reloads_entry_without_restart(
     await hass.async_block_till_done()
 
     assert entry.runtime_data is not runtime_data_before
+
+
+async def test_reconfigure_zone_mid_cycle_applies_after_the_cycle(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """The flow itself is unchanged; the listener defers the reload (Story 1.7).
+
+    The idle variant above proves the reload; this one proves the SAME flow,
+    submitted while the zone waters, writes at once and reloads once the
+    cycle completes — the watering zone keeps its snapshotted duration.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[zone_subentry_data("Front Lawn", "switch.zone_1_valve")],
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    runtime_data_before = entry.runtime_data
+    zone = next(iter(entry.subentries.values()))
+
+    result = await entry.start_subentry_reconfigure_flow(hass, zone.subentry_id)
+    result = await hass.config_entries.subentries.async_configure(
+        result["flow_id"],
+        user_input={**ZONE_INPUT, CONF_MORNING_DURATION: 3},
+    )
+    assert result["type"] is FlowResultType.ABORT
+    await hass.async_block_till_done()
+
+    assert zone.data[CONF_MORNING_DURATION] == 3
+    assert entry.runtime_data is runtime_data_before
+    assert entry.runtime_data.runner.reload_pending is True
+
+    # Ten snapshotted minutes, not three: the cycle ends at 07:10.
+    await fire_at(hass, freezer, "2026-07-31 07:03:00+02:00")
+    assert entry.runtime_data is runtime_data_before
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+
+    assert entry.runtime_data is not runtime_data_before
+    assert entry.runtime_data.plan.zones[0].morning_duration_s == 3 * 60
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
 
 
 async def test_remove_zone_reloads_and_cleans_up(hass: HomeAssistant) -> None:

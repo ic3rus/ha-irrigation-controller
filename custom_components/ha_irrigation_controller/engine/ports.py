@@ -62,6 +62,23 @@ class AnomalyKind(StrEnum):
     so it treats a raise as "not confirmed" and adds an `error` key to the
     context. JOURNAL_SAVE_FAILED has no confirmation equivalent — a journal
     write either happened or did not.
+
+    Two kinds (Story 1.7) are raised about the CONFIGURATION rather than about
+    a command, so that the anomaly seam stays the one vocabulary every fault
+    speaks (AD-9) instead of growing a second channel per feature:
+
+    - CONFIGURED_ENTITY_MISSING — a pump, valve or sensor the entry stores has
+      been removed from (or disabled in) Home Assistant's entity registry.
+      Nothing is skipped or unscheduled: the stored id stays, and the next
+      cycle's commands raise the usual *_UNCONFIRMED kinds (fail-wet). Context:
+      `entity_id`, `role` (the option / subentry key) and `zone_id` for a
+      valve.
+    - CYCLE_INTERRUPTED — an active cycle was suspended because the entry was
+      unloaded from outside the engine's control (integration disabled or
+      removed, a forced reload). The live valve and the pump were commanded
+      off but the run itself was NOT completed or cancelled: the journal
+      keeps its RUNNING/PENDING intent for Story 3.2's reconciler. Context:
+      `cycle_id`, `kind`, `zone_id` (the live zone, None when PENDING).
     """
 
     PUMP_ON_UNCONFIRMED = "pump_on_unconfirmed"
@@ -69,6 +86,8 @@ class AnomalyKind(StrEnum):
     VALVE_OPEN_UNCONFIRMED = "valve_open_unconfirmed"
     VALVE_CLOSE_UNCONFIRMED = "valve_close_unconfirmed"
     JOURNAL_SAVE_FAILED = "journal_save_failed"
+    CONFIGURED_ENTITY_MISSING = "configured_entity_missing"
+    CYCLE_INTERRUPTED = "cycle_interrupted"
 
 
 class AnomalyPort(Protocol):
