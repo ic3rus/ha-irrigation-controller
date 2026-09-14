@@ -45,6 +45,13 @@ updates:
           - vitest
           - "@vitest/*"
           - playwright
+    ignore:
+      # TypeScript 7 is the native (Go) compiler and no longer exposes the JS
+      # compiler API (`ts.ScriptTarget` and friends) that
+      # @rollup/plugin-typescript needs. The card build fails at config load
+      # time on TS 7 (PR #14). Drop this once the plugin supports TS 7.
+      - dependency-name: typescript
+        versions: [">=7"]
 
   - package-ecosystem: github-actions
     directory: /
