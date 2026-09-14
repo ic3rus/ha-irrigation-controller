@@ -95,8 +95,9 @@ if TYPE_CHECKING:
 
 # device_class filter strings. Kept as literals rather than importing
 # SensorDeviceClass so the integration declares no dependency on the sensor
-# component. Verified against HA 2026.7.4: SensorDeviceClass.PRECIPITATION.value
-# == "precipitation" — accumulated mm, which is what the rain credit needs.
+# component. Verified against HA 2026.7.4 and 2026.9.2:
+# SensorDeviceClass.PRECIPITATION.value == "precipitation" — accumulated mm,
+# which is what the rain credit needs.
 # NOT "precipitation_intensity", which is a mm/h rate.
 _DEVICE_CLASS_PRECIPITATION = "precipitation"
 _DEVICE_CLASS_TEMPERATURE = "temperature"

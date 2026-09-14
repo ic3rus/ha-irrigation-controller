@@ -22,6 +22,7 @@ from custom_components.ha_irrigation_controller.const import (
     CONF_RAIN_SENSOR,
     CONF_TEMPERATURE_SENSOR,
     DOMAIN,
+    MIN_HA_VERSION,
 )
 from tests.common import (
     CONTROLLER_OPTIONS,
@@ -267,7 +268,7 @@ async def test_user_flow_aborts_below_min_ha_version(
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "unsupported_ha_version"
     assert result["description_placeholders"] == {
-        "required": "2026.7.0",
+        "required": MIN_HA_VERSION,
         "running": "2026.6.4",
     }
 

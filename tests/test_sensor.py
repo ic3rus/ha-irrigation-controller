@@ -126,7 +126,8 @@ def device_of(hass: HomeAssistant, entity: RegistryEntry) -> DeviceEntry:
     """Return the device an entity is attached to."""
     assert entity.device_id is not None
     device = dr.async_get(hass).async_get(entity.device_id)
-    assert device is not None
+    # HA 2026.9 returns `DeviceEntry | ChildDeviceEntry`; ours are top-level.
+    assert isinstance(device, dr.DeviceEntry)
     return device
 
 

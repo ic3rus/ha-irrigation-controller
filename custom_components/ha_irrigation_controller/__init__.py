@@ -175,8 +175,10 @@ async def async_setup_entry(
     entry.async_on_unload(entry.add_update_listener(_async_entry_updated))
 
     device_registry = dr.async_get(hass)
-    # The controller is a virtual service device; zone devices link to it below.
-    device_registry.async_get_or_create(
+    # The controller is a virtual service device; zone devices link to it below
+    # by device id (`via_device_id` — the identifier-tuple form was deprecated
+    # in HA 2026.9), so its registry entry is kept.
+    controller_device = device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, entry.entry_id)},
         entry_type=DeviceEntryType.SERVICE,
@@ -203,7 +205,7 @@ async def async_setup_entry(
             config_entry_id=entry.entry_id,
             config_subentry_id=subentry.subentry_id,
             identifiers={(DOMAIN, subentry.subentry_id)},
-            via_device=(DOMAIN, entry.entry_id),
+            via_device_id=controller_device.id,
             manufacturer="ha-irrigation-controller",
             name=subentry.title,
         )
