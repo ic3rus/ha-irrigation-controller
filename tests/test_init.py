@@ -939,7 +939,11 @@ async def test_a_journal_written_before_the_ledger_sets_up_and_quotes_on_base(
     await hass.async_block_till_done()
     register_switch_domain(hass)
     sequencer = entry.runtime_data.sequencer
-    assert sequencer.ledger.as_dict() == {"settled_cycle_id": None, "deficits": {}}
+    assert sequencer.ledger.as_dict() == {
+        "settled_cycle_id": None,
+        "deficits": {},
+        "day_credit": None,
+    }
 
     await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
 
@@ -1007,3 +1011,94 @@ async def test_a_seeded_ledger_reaches_the_engine_and_extends_the_first_cycle(
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
+
+
+# --------------------------------------------------------------------------
+# The day credit seed reaches the engine (Story 2.3)
+# --------------------------------------------------------------------------
+
+
+async def test_a_seeded_day_credit_waives_the_same_days_first_scheduled_cycle(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 2.3 AC 3: a credit recorded before an HA restart waives after setup.
+
+    `async_setup_entry` hands `seed.ledger` — credit included — to the
+    sequencer. The 07:00 start then creates no run and commands nothing;
+    the waived record names the run-now the previous life completed, and the
+    seeded history record it sits next to is untouched.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    run_now = {
+        "cycle_id": "2026-07-31-morning",
+        "irrigation_day": "2026-07-31",
+        "kind": "morning",
+        "status": "completed",
+        "manual": True,
+        "waived_by": None,
+        "configured_start": "2026-07-31T05:00:00+00:00",
+        "scheduled_start": "2026-07-31T03:00:00+00:00",
+        "ended_at": "2026-07-31T03:10:00+00:00",
+        "zones": [
+            {
+                "zone_id": "zone-a",
+                "status": "completed",
+                "planned_s": 600,
+                "carried_s": 0,
+                "effective_s": 600,
+            },
+        ],
+    }
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {
+            "schema_version": JOURNAL_SCHEMA_VERSION,
+            "history": [run_now],
+            "ledger": {
+                "settled_cycle_id": "2026-07-31-morning",
+                "deficits": {},
+                "day_credit": {
+                    "irrigation_day": "2026-07-31",
+                    "cycle_id": "2026-07-31-morning",
+                },
+            },
+        },
+    }
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[
+            {**zone_subentry_data("Zone A", VALVE_1), "subentry_id": "zone-a"},
+        ],
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    calls = register_switch_domain(hass)
+    sequencer = entry.runtime_data.sequencer
+    assert sequencer.ledger.day_credit == "2026-07-31"
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+
+    assert sequencer.current_run is None
+    assert sequencer.last_run is None
+    assert calls == []
+    assert sequencer.ledger.day_credit is None
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    stored = hass_storage[STORAGE_KEY]["data"]["history"]
+    assert stored[0] == run_now
+    assert [
+        (record["cycle_id"], record["status"], record["waived_by"]) for record in stored
+    ] == [
+        ("2026-07-31-morning", "completed", None),
+        ("2026-07-31-morning-2", "waived", "2026-07-31-morning"),
+    ]

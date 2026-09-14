@@ -29,17 +29,23 @@ MANUAL_KEY: Final = "manual"
 class CycleStatus(StrEnum):
     """Lifecycle of a cycle run.
 
-    Two TERMINAL statuses: COMPLETED (the cycle ran its course) and CANCELLED
+    Three TERMINAL statuses: COMPLETED (the cycle ran its course), CANCELLED
     (Story 1.6's explicit operator cancel, the only thing that stops a running
-    cycle). Nothing anywhere assumes "terminal == completed" — the completion
-    path is shared and takes the terminal status as a parameter, and every
-    reader keys off the value rather than off the absence of a run.
+    cycle) and WAIVED (Story 2.3: a scheduled cycle the ledger's day credit
+    excused because a completed run-now had already watered its irrigation
+    day). WAIVED is terminal AT BIRTH — such a run is built, filed to history
+    and dropped in one step; it is never `current_run`, never `last_run`,
+    never settled and commands nothing. Nothing anywhere assumes "terminal ==
+    completed" — the completion path is shared and takes the terminal status
+    as a parameter, and every reader keys off the value rather than off the
+    absence of a run.
     """
 
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
+    WAIVED = "waived"
 
 
 class ZoneRunStatus(StrEnum):

@@ -467,9 +467,15 @@ async def test_a_scheduled_cycle_falling_due_during_a_run_now_still_defers() -> 
     """Story 2.1 changes nothing about deferral — 2.3 owns the day credit.
 
     The evening start arriving while a run-now is watering queues the evening
-    cycle exactly as it would behind any other run: delayed, never skipped.
+    cycle exactly as it would behind any other run: it is never started on
+    top of the running cycle and never dropped at request time. What happens
+    to it when it is popped is the ledger's decision (Story 2.3): this
+    run-now completes every zone, so the popped evening is WAIVED — filed to
+    history naming the run-now, and `last_run` stays the run-now. The
+    deferral itself is what this test pins; `test_day_credit.py` owns the
+    waiver.
     """
-    sequencer, _, _, _ = make_sequencer(two_zone_plan())
+    sequencer, _, journal, _ = make_sequencer(two_zone_plan())
     clock = VirtualClock(aware(19, 55))
 
     await sequencer.async_run_now(CycleKind.MORNING, clock.now())
@@ -478,10 +484,18 @@ async def test_a_scheduled_cycle_falling_due_during_a_run_now_still_defers() -> 
     await sequencer.request_cycle(CycleKind.EVENING, clock.now())
 
     assert sequencer.deferred_kinds == (CycleKind.EVENING,)
+    assert sequencer.current_run is not None
+    assert sequencer.current_run.manual is True
 
     await run_to_idle(sequencer, clock)
 
+    assert not sequencer.deferred_kinds
     finished = sequencer.last_run
     assert finished is not None
-    assert finished.kind is CycleKind.EVENING
-    assert finished.manual is False
+    assert finished.manual is True
+    history = journal.snapshots[-1]["history"]
+    assert isinstance(history, list)
+    assert [(record["kind"], record["status"]) for record in history] == [
+        ("morning", "completed"),
+        ("evening", "waived"),
+    ]

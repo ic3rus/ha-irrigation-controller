@@ -125,6 +125,9 @@ def test_history_entry_is_a_compact_serializable_outcome() -> None:
         # Story 2.1's marker, written explicitly on every record: a reader must
         # not have to infer "scheduled" from a missing key.
         "manual": False,
+        # Story 2.3: the id of the run-now that excused a waived cycle — on
+        # every record, None for one that ran, so Epic 4 reads one shape.
+        "waived_by": None,
         "configured_start": "2026-07-31T05:00:00+00:00",
         "scheduled_start": "2026-07-31T05:00:00+00:00",
         "ended_at": "2026-07-31T05:26:00+00:00",
@@ -147,6 +150,40 @@ def test_history_entry_is_a_compact_serializable_outcome() -> None:
             },
         ],
     }
+
+
+def test_a_waived_record_names_the_run_now_that_excused_it() -> None:
+    """Story 2.3: a waived cycle is a history record — the same shape, never run.
+
+    Built from a run that never started: `status` is `waived`, `waived_by`
+    is the crediting run-now's id, every zone is still PENDING with its
+    quoted duration and 0 s watered, and `ended_at` is the decision instant.
+    Epic 3's watchdog reads this as a permitted non-watering cause.
+    """
+    zone = zone_run()
+    zone.status = ZoneRunStatus.PENDING
+    zone.actual_start = None
+    zone.actual_end = None
+    run = cycle_run(zone)
+    run.cycle_id = "2026-07-31-morning-2"
+    run.status = CycleStatus.WAIVED
+
+    entry = history_entry(run, aware(7), waived_by="2026-07-31-morning")
+
+    assert entry["status"] == "waived"
+    assert entry["waived_by"] == "2026-07-31-morning"
+    assert entry["manual"] is False
+    assert entry["cycle_id"] == "2026-07-31-morning-2"
+    assert entry["ended_at"] == "2026-07-31T05:00:00+00:00"
+    assert entry["zones"] == [
+        {
+            "zone_id": "zone-1",
+            "status": "pending",
+            "planned_s": 600,
+            "carried_s": 0,
+            "effective_s": 0,
+        },
+    ]
 
 
 def test_ended_at_is_the_completion_instant_not_the_last_zone_close() -> None:

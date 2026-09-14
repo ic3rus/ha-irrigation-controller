@@ -145,7 +145,8 @@
                     "pending": "Pending",
                     "running": "Running",
                     "completed": "Completed",
-                    "cancelled": "Cancelled"
+                    "cancelled": "Cancelled",
+                    "waived": "Waived"
                 }
             },
             "last_watering_duration": {

@@ -114,8 +114,10 @@ class Sequencer:
         # running cycle mid-flight — which AC 1 forbids.
         self._season_enabled = season_enabled
         # THE water-debt ledger (AD-5): every cycle is quoted through it in
-        # `_create_run` and settled through it in `_complete_cycle`, and those
-        # two are its only call sites. Journalled with the rest of the state.
+        # `_build_run`, settled through it in `_complete_cycle`, and every
+        # SCHEDULED dispatch asks it for the day credit in
+        # `_dispatch_scheduled` (Story 2.3) — those three are its only call
+        # sites. Journalled with the rest of the state.
         self._ledger = Ledger.from_dict(ledger)
         # Each deferred entry keeps the reference instant of its ORIGINAL
         # request: that is what its configured start (and therefore its
@@ -196,6 +198,13 @@ class Sequencer:
         Story 2.1's `run_now` does NOT reuse this method: it runs with the
         season OFF by design, so it has its own entry point
         (`async_run_now`) rather than bypassing the guard from inside here.
+
+        A request that would create a run is a SCHEDULED dispatch decision
+        (Story 2.3): it goes through `_dispatch_scheduled`, which asks the
+        ledger whether a completed run-now has already credited the day. A
+        deferred request is not decided here — it is decided when it is
+        popped, in `_complete_cycle`, so the credit the running run-now is
+        about to record can excuse it.
         """
         async with self._lock:
             if not self._season_enabled:
@@ -206,7 +215,7 @@ class Sequencer:
             if self._run is not None:
                 self._deferred.append((kind, now))
             else:
-                self._create_run(kind, now)
+                self._dispatch_scheduled(kind, now, dispatch_at=None, now=now)
             await self._save()
 
     async def async_run_now(self, kind: CycleKind, now: datetime) -> bool:
@@ -221,7 +230,9 @@ class Sequencer:
         snapshot, so windows, pump orchestration, actuation verification,
         journalling and history all come from code this story never touches.
         The run is tagged `manual` so history — and Story 2.3's day credit —
-        can tell it apart without a third `CycleKind`.
+        can tell it apart without a third `CycleKind`. It calls `_create_run`
+        DIRECTLY, never `_dispatch_scheduled`: a manual cycle is never waived,
+        and it never consumes the credit either — the operator asked.
 
         A disabled morning cycle is not a refusal either, for the same reason
         the season is not: `morning_enabled` suppresses the daily START, and
@@ -513,7 +524,12 @@ class Sequencer:
 
         A deferred cycle is re-created immediately, dispatched at completion —
         ``advance``'s loop starts it in the same call, so a deferred cycle is
-        delayed, never skipped (AD-4).
+        delayed, never skipped (AD-4). The pop is a scheduled dispatch
+        DECISION (Story 2.3): it runs after this run's settlement, so a
+        scheduled cycle that fell due behind a run-now is waived by the credit
+        that run-now just recorded, in this same call. A waived pop leaves
+        `self._run` empty, so the loop lets the next deferred entry through
+        rather than stranding it behind a cycle that never existed.
 
         `status` is the TERMINAL status to file the run under: COMPLETED for
         the normal path, CANCELLED for `async_cancel_cycle`. Both go through
@@ -554,10 +570,51 @@ class Sequencer:
         self._last_run = run
         self._run = None
         self._zone_index = 0
-        if self._deferred:
+        while self._deferred and self._run is None:
             kind, reference = self._deferred.pop(0)
-            self._create_run(kind, reference, dispatch_at=now)
+            self._dispatch_scheduled(kind, reference, dispatch_at=now, now=now)
             await self._save()
+
+    def _dispatch_scheduled(
+        self,
+        kind: CycleKind,
+        reference: datetime,
+        *,
+        dispatch_at: datetime | None,
+        now: datetime,
+    ) -> None:
+        """Decide a SCHEDULED cycle: install it, or file it waived (Story 2.3).
+
+        The only two scheduled call sites — `request_cycle` creating a run and
+        the deferred pop in `_complete_cycle` — come through here; a run-now
+        never does. The run is built first, by the same snapshot code as a
+        real run, so a waived record carries the quoted durations and an id
+        from `_next_occurrence` exactly as if it had run. Then the LEDGER
+        decides (AD-5): `waive` returns the crediting run-now's id iff its
+        credit is for this cycle's irrigation day — `configured_start`'s, the
+        ONE definition — and clears the credit either way.
+
+        Credit → the run is filed to history as `waived` naming the run-now,
+        pruned like any record, and DROPPED: never `current_run` (so nothing
+        is commanded and `next_wakeup()` stays None), never `last_run` (the
+        zone sensors keep showing the real last watering), never settled
+        (the quote was pure, so an outstanding deficit stays for the next
+        real cycle), and no anomaly — a credited day is a permitted
+        non-watering cause (AD-4). The caller saves; the record is already in
+        `_history` by then. That debounced save is the decision's ONLY
+        persistence: a crash inside its window re-seeds the credit on the next
+        setup, and the day's other scheduled cycle is waived instead — bounded
+        by construction, since the run-now really did water the day.
+        """
+        run = self._build_run(kind, reference, dispatch_at=dispatch_at)
+        credit = self._ledger.waive(irrigation_day(run.configured_start))
+        if credit is None:
+            self._run = run
+            self._zone_index = 0
+            return
+        run.status = CycleStatus.WAIVED
+        self._history.append(history_entry(run, now, waived_by=credit))
+        self._history = prune_history(self._history, irrigation_day(now))
 
     def _create_run(
         self,
@@ -567,7 +624,31 @@ class Sequencer:
         dispatch_at: datetime | None = None,
         manual: bool = False,
     ) -> None:
+        """Install a new pending run built from the plan (see `_build_run`).
+
+        The run-now path: `async_run_now` installs unconditionally, because a
+        manual cycle is never waived. Scheduled callers go through
+        `_dispatch_scheduled`, which builds the same run and asks the ledger
+        first.
+        """
+        self._run = self._build_run(
+            kind, reference, dispatch_at=dispatch_at, manual=manual
+        )
+        self._zone_index = 0
+
+    def _build_run(
+        self,
+        kind: CycleKind,
+        reference: datetime,
+        *,
+        dispatch_at: datetime | None = None,
+        manual: bool = False,
+    ) -> CycleRun:
         """Snapshot the plan into a new pending run (AD-8: owned copies).
+
+        PURE apart from the ledger's own pure quote: it assigns nothing on
+        `self`, so a run built here and then waived leaves the machine
+        exactly as it found it.
 
         The run's windows come from the plan's configured start time on
         `reference`'s day — the plan is the single source of the schedule
@@ -599,7 +680,7 @@ class Sequencer:
             scheduled_start,
             [quote.quoted_s for quote in quotes],
         )
-        self._run = CycleRun(
+        return CycleRun(
             cycle_id=cycle_id_for(
                 kind,
                 schedule.start,
@@ -629,7 +710,6 @@ class Sequencer:
             ),
             manual=manual,
         )
-        self._zone_index = 0
 
     def _next_occurrence(self, kind: CycleKind, configured_start: datetime) -> int:
         """Return this run's occurrence number for its irrigation day and kind.
@@ -644,9 +724,11 @@ class Sequencer:
         cycle id. History is the one piece of this state that already survives
         a reload, so the count comes from there.
 
-        Every terminal run reaches history, cancelled ones included, and
-        `_complete_cycle` appends BEFORE it pops the deferred queue — so the
-        count is already right for a cycle created inside that same call.
+        Every terminal run reaches history, cancelled and waived ones
+        included (a waived cycle consumed an id, so the next one must not
+        reuse it), and `_complete_cycle` appends BEFORE it pops the deferred
+        queue — so the count is already right for a cycle created inside that
+        same call.
         Retention cannot interfere: pruning is by irrigation DAY over a 7-day
         window, so a run's own day is never the day that ages out.
         """

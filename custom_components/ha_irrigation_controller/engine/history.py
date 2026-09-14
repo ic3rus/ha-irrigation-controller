@@ -26,7 +26,12 @@ if TYPE_CHECKING:
 HISTORY_RETENTION_DAYS: Final = 7
 
 
-def history_entry(run: CycleRun, ended_at: datetime) -> dict[str, object]:
+def history_entry(
+    run: CycleRun,
+    ended_at: datetime,
+    *,
+    waived_by: str | None = None,
+) -> dict[str, object]:
     """Build one compact, serializable outcome record for a finished cycle.
 
     The irrigation day comes from the ONE `irrigation_day` helper applied to
@@ -46,6 +51,16 @@ def history_entry(run: CycleRun, ended_at: datetime) -> dict[str, object]:
     the ledger applied to it (`carried_s`) next to what it actually watered
     (Story 2.2): Epic 4's history view reads the three together to show why a
     zone ran longer than its base and how much of the plan it met.
+
+    `waived_by` (Story 2.3) is the id of the completed run-now whose day
+    credit excused this cycle, on a record filed with `status: "waived"`; it
+    is written on EVERY record — `None` for a cycle that ran — so Epic 4's
+    reader gets one shape. A waived cycle never started, so its zone records
+    keep their pre-run values: `status: "pending"`, `effective_s: 0`, and
+    `planned_s` the duration the ledger quoted (with `carried_s` the deficit
+    it would have applied). Epic 3's watchdog reads a waived record as a
+    PERMITTED non-watering cause, never as a missed cycle: the water it
+    accounts for flowed in the run-now it names.
     """
     zone_runs = run.zone_runs
     return {
@@ -54,6 +69,7 @@ def history_entry(run: CycleRun, ended_at: datetime) -> dict[str, object]:
         "kind": run.kind.value,
         "status": run.status.value,
         MANUAL_KEY: run.manual,
+        "waived_by": waived_by,
         "configured_start": utc_iso(run.configured_start),
         "scheduled_start": utc_iso(run.scheduled_start),
         "ended_at": utc_iso(ended_at),

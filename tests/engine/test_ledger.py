@@ -1,14 +1,15 @@
-"""Pure unit tests of the water-debt ledger (Story 2.2, AD-5).
+"""Pure unit tests of the water-debt ledger (Stories 2.2 and 2.3, AD-5).
 
 No clock, no sequencer, no Home Assistant: `Ledger` is arithmetic over plan
 zones and run objects, and every matrix row that is ledger-only is pinned
 here — the caps at both ends, replay, zero drop, the removed zone, the dict
-round-trip and the (empty) rain slot.
+round-trip and the (empty) rain slot — plus Story 2.3's day credit: who
+earns it, who consumes it, and how it survives the journal.
 """
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import date, timedelta
 
 from custom_components.ha_irrigation_controller.engine.ledger import (
     NO_RAIN_CREDIT,
@@ -72,8 +73,9 @@ def cycle_run(
     *zones: ZoneRun,
     cycle_id: str = "2026-07-31-morning",
     status: CycleStatus = CycleStatus.COMPLETED,
+    manual: bool = False,
 ) -> CycleRun:
-    """Build one terminal cycle run carrying `zones`."""
+    """Build one terminal cycle run carrying `zones`; `manual` marks a run-now."""
     return CycleRun(
         cycle_id=cycle_id,
         kind=CycleKind.MORNING,
@@ -82,7 +84,15 @@ def cycle_run(
         pump_entity_id="switch.pool_pump",
         zone_runs=zones,
         status=status,
+        manual=manual,
     )
+
+
+# The credit a completed run-now of 2026-07-31's morning cycle leaves behind.
+CREDIT: dict[str, object] = {
+    "irrigation_day": "2026-07-31",
+    "cycle_id": "2026-07-31-morning",
+}
 
 
 # --------------------------------------------------------------------------
@@ -151,6 +161,7 @@ def test_quote_is_pure() -> None:
     assert ledger.as_dict() == {
         "settled_cycle_id": "2026-07-30-evening",
         "deficits": {"zone-1": 300},
+        "day_credit": None,
     }
 
 
@@ -262,6 +273,7 @@ def test_full_watering_removes_the_deficit_entry() -> None:
     assert ledger.as_dict() == {
         "settled_cycle_id": "2026-07-31-morning",
         "deficits": {},
+        "day_credit": None,
     }
 
 
@@ -323,6 +335,7 @@ def test_settling_the_same_cycle_id_twice_is_a_no_op() -> None:
         == {
             "settled_cycle_id": "2026-07-31-morning",
             "deficits": {"zone-1": 600},
+            "day_credit": None,
         }
     )
 
@@ -385,7 +398,11 @@ def test_from_dict_of_none_is_an_empty_ledger() -> None:
     """A journal written before this story seeds nothing — quotes on base."""
     ledger = Ledger.from_dict(None)
 
-    assert ledger.as_dict() == {"settled_cycle_id": None, "deficits": {}}
+    assert ledger.as_dict() == {
+        "settled_cycle_id": None,
+        "deficits": {},
+        "day_credit": None,
+    }
     assert ledger.deficit_s("zone-1") == 0
 
 
@@ -405,3 +422,289 @@ def test_as_dict_returns_a_copy() -> None:
     deficits["zone-1"] = 1
 
     assert ledger.deficit_s("zone-1") == 300
+
+
+# --------------------------------------------------------------------------
+# Day credit (Story 2.3): only settle() writes it
+# --------------------------------------------------------------------------
+
+
+def test_a_completed_run_now_with_no_shortfall_credits_its_day() -> None:
+    """Manual + COMPLETED + every zone watered its quote → the day is credited.
+
+    The credit names the run-now, so the waived record can point back at it.
+    """
+    ledger = Ledger()
+    run = cycle_run(zone_run("zone-1"), zone_run("zone-2"), manual=True)
+
+    assert ledger.settle(run) is True
+
+    assert ledger.day_credit == "2026-07-31"
+    assert ledger.as_dict() == {
+        "settled_cycle_id": "2026-07-31-morning",
+        "deficits": {},
+        "day_credit": CREDIT,
+    }
+
+
+def test_a_scheduled_cycle_never_credits_however_well_it_watered() -> None:
+    """The marker is the gate: a perfect scheduled cycle leaves no credit."""
+    ledger = Ledger()
+
+    ledger.settle(cycle_run(zone_run("zone-1"), zone_run("zone-2")))
+
+    assert ledger.day_credit is None
+    assert ledger.as_dict()["day_credit"] is None
+
+
+def test_a_run_now_with_a_failed_zone_credits_nothing() -> None:
+    """Matrix "partial run-now": one FAILED open is a shortfall, so no credit.
+
+    The status is COMPLETED — the cycle ran its course — but the settlement
+    booked a deficit, and "no shortfall" is the rule. Doubt waters.
+    """
+    ledger = Ledger()
+    run = cycle_run(
+        zone_run("zone-1"),
+        zone_run("zone-2", status=ZoneRunStatus.FAILED, watered_s=0),
+        manual=True,
+    )
+
+    ledger.settle(run)
+
+    assert ledger.day_credit is None
+    assert ledger.deficit_s("zone-2") == 600
+
+
+def test_a_cancelled_run_now_credits_nothing() -> None:
+    """Matrix "cancelled run-now": CANCELLED never credits, and the debt is booked."""
+    ledger = Ledger()
+    run = cycle_run(
+        zone_run("zone-1"),
+        zone_run("zone-2", watered_s=120),
+        zone_run("zone-3", watered_s=None),
+        status=CycleStatus.CANCELLED,
+        manual=True,
+    )
+
+    ledger.settle(run)
+
+    assert ledger.day_credit is None
+    assert ledger.as_dict()["deficits"] == {"zone-2": 480, "zone-3": 600}
+
+
+def test_a_zero_dwell_run_now_credits_nothing() -> None:
+    """A late catch-up that opened and closed at one instant watered nothing.
+
+    It is COMPLETED and manual, but the ledger reads 0 s and books the whole
+    quote — the same rule that stops it from clearing a debt stops it from
+    crediting the day.
+    """
+    ledger = Ledger()
+
+    ledger.settle(cycle_run(zone_run(watered_s=0), manual=True))
+
+    assert ledger.day_credit is None
+    assert ledger.deficit_s("zone-1") == 600
+
+
+def test_a_jittery_but_healthy_run_now_still_credits() -> None:
+    """599.6 s reads 600 (rounded `effective_seconds`) — no deficit, so a credit.
+
+    Without the rounding, timer jitter would disqualify roughly every other
+    healthy run-now from crediting its day.
+    """
+    zone = zone_run(watered_s=0)
+    zone.actual_end = aware(7) + timedelta(seconds=599, milliseconds=600)
+    ledger = Ledger()
+
+    ledger.settle(cycle_run(zone, manual=True))
+
+    assert ledger.day_credit == "2026-07-31"
+
+
+def test_a_settlement_that_credits_nothing_leaves_an_existing_credit_untouched() -> (
+    None
+):
+    """Only `waive` consumes: a later FAILED or scheduled settlement is not a reader.
+
+    A credit recorded at 06:00 must survive whatever settles next without
+    asking — otherwise a cancelled second run-now would silently un-credit the
+    day the first one watered.
+    """
+    ledger = Ledger(day_credit=CREDIT)
+
+    ledger.settle(
+        cycle_run(
+            zone_run(status=ZoneRunStatus.FAILED, watered_s=0),
+            cycle_id="2026-07-31-morning-2",
+            manual=True,
+        ),
+    )
+    ledger.settle(cycle_run(zone_run(), cycle_id="2026-07-31-evening"))
+
+    assert ledger.as_dict()["day_credit"] == CREDIT
+
+
+def test_a_later_completed_run_now_refreshes_the_credit() -> None:
+    """Matrix "two run-nows same day": ONE credit, naming the second run-now."""
+    ledger = Ledger()
+
+    ledger.settle(cycle_run(zone_run(), manual=True))
+    ledger.settle(cycle_run(zone_run(), cycle_id="2026-07-31-morning-2", manual=True))
+
+    assert ledger.as_dict()["day_credit"] == {
+        "irrigation_day": "2026-07-31",
+        "cycle_id": "2026-07-31-morning-2",
+    }
+
+
+def test_a_replayed_settlement_changes_neither_debt_nor_credit() -> None:
+    """Matrix "replay": the same cycle id settling again is a no-op for the credit too.
+
+    Pinned with a replay that would NOT qualify (a FAILED zone): were the
+    guard missing, the replay would book a debt and — worse for this story —
+    the credit would survive next to it.
+    """
+    ledger = Ledger()
+    assert ledger.settle(cycle_run(zone_run(), manual=True)) is True
+    replay = cycle_run(zone_run(status=ZoneRunStatus.FAILED, watered_s=0), manual=True)
+
+    assert ledger.settle(replay) is False
+
+    assert ledger.as_dict() == {
+        "settled_cycle_id": "2026-07-31-morning",
+        "deficits": {},
+        "day_credit": CREDIT,
+    }
+
+
+def test_the_credit_is_the_configured_starts_day_not_the_completion_day() -> None:
+    """Matrix "past midnight": a run-now started 23:50 credits day D.
+
+    `configured_start` is the plan's evening start on the fire day — the
+    same instant the cycle id and the history record key off — so the credit
+    files under 2026-07-31 even though every zone closed on 2026-08-01.
+    """
+    ledger = Ledger()
+    zone = zone_run(watered_s=0)
+    zone.actual_start = aware(23, 50)
+    zone.actual_end = aware(0, day=1, month=8)
+    run = CycleRun(
+        cycle_id="2026-07-31-evening",
+        kind=CycleKind.EVENING,
+        configured_start=aware(20),
+        scheduled_start=aware(23, 50),
+        pump_entity_id="switch.pool_pump",
+        zone_runs=(zone,),
+        status=CycleStatus.COMPLETED,
+        manual=True,
+    )
+
+    ledger.settle(run)
+
+    assert ledger.day_credit == "2026-07-31"
+
+
+# --------------------------------------------------------------------------
+# Day credit: only waive() reads it, and reading consumes it
+# --------------------------------------------------------------------------
+
+
+def test_waive_on_the_credited_day_returns_the_run_now_and_clears_the_credit() -> None:
+    """Match: the crediting run-now's id comes back, and the credit is gone.
+
+    One credit, one decision — the second scheduled cycle of the same day
+    asks and gets nothing.
+    """
+    ledger = Ledger(day_credit=CREDIT)
+
+    assert ledger.waive(date(2026, 7, 31)) == "2026-07-31-morning"
+
+    assert ledger.day_credit is None
+    assert ledger.waive(date(2026, 7, 31)) is None
+
+
+def test_waive_on_another_day_returns_none_and_clears_the_stale_credit() -> None:
+    """Matrix "stale credit": mismatch → the cycle runs AND the credit is discarded.
+
+    Keeping it would need an expiry policy; discarding it at the first
+    decision means the operator can only lose a waiver, never water.
+    """
+    ledger = Ledger(day_credit=CREDIT)
+
+    assert ledger.waive(date(2026, 8, 1)) is None
+
+    assert ledger.day_credit is None
+    assert ledger.as_dict()["day_credit"] is None
+
+
+def test_waive_with_no_credit_is_none_and_harmless() -> None:
+    """The common case: nothing credited, the scheduled cycle simply runs."""
+    ledger = Ledger()
+
+    assert ledger.waive(date(2026, 7, 31)) is None
+    assert ledger.day_credit is None
+
+
+def test_waive_touches_neither_the_deficits_nor_the_settled_id() -> None:
+    """Matrix "outstanding deficit + waiver": the debt stays for the next real cycle.
+
+    A waived cycle is never settled, so whatever the ledger owes before the
+    decision it still owes after it — and the replay guard is untouched too.
+    """
+    ledger = Ledger(
+        {"zone-1": 300},
+        settled_cycle_id="2026-07-30-evening",
+        day_credit=CREDIT,
+    )
+
+    ledger.waive(date(2026, 7, 31))
+
+    assert ledger.as_dict() == {
+        "settled_cycle_id": "2026-07-30-evening",
+        "deficits": {"zone-1": 300},
+        "day_credit": None,
+    }
+
+
+def test_reading_day_credit_consumes_nothing() -> None:
+    """The sensor's property is a projection: reading it twice is the same answer."""
+    ledger = Ledger(day_credit=CREDIT)
+
+    assert ledger.day_credit == ledger.day_credit == "2026-07-31"
+    assert ledger.as_dict()["day_credit"] == CREDIT
+
+
+# --------------------------------------------------------------------------
+# Day credit: the journal round-trip
+# --------------------------------------------------------------------------
+
+
+def test_as_dict_from_dict_round_trip_with_a_credit() -> None:
+    """Matrix "restart between credit and cycle": the credit survives the journal."""
+    ledger = Ledger({"zone-1": 300}, settled_cycle_id="2026-07-31-morning")
+    ledger.settle(cycle_run(zone_run(), cycle_id="2026-07-31-morning-2", manual=True))
+
+    rebuilt = Ledger.from_dict(ledger.as_dict())
+
+    assert rebuilt.as_dict() == ledger.as_dict()
+    assert rebuilt.waive(date(2026, 7, 31)) == "2026-07-31-morning-2"
+
+
+def test_from_dict_of_a_pre_2_3_section_has_no_credit() -> None:
+    """A section written before this story has no `day_credit` key — and loads."""
+    ledger = Ledger.from_dict({"settled_cycle_id": None, "deficits": {"zone-1": 300}})
+
+    assert ledger.day_credit is None
+    assert ledger.deficit_s("zone-1") == 300
+
+
+def test_from_dict_narrows_a_credit_of_the_wrong_type_to_none() -> None:
+    """Type narrowing of the serialized `object` values, not validation.
+
+    The adapter refuses such a section before it gets here; the engine
+    merely has to stay type-safe on the values it is handed.
+    """
+    assert Ledger.from_dict({"day_credit": "2026-07-31"}).day_credit is None
+    assert Ledger(day_credit={"irrigation_day": 5, "cycle_id": "x"}).day_credit is None
