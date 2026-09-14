@@ -225,17 +225,20 @@ async def async_setup_entry(
         ),
     )
     # The ONLY things read back from storage here: the outcome history AC 4
-    # promises to retain for 7 days, and the season mode flag (Story 1.6).
-    # Without the history seed the first journal write of every reload
-    # overwrites the stored section with an empty list, and without the season
-    # seed a reload would silently resume watering after the operator ended
-    # the season — the reload regime runs on every config change.
+    # promises to retain for 7 days, the season mode flag (Story 1.6) and the
+    # water-debt ledger (Story 2.2). Without the history seed the first
+    # journal write of every reload overwrites the stored section with an
+    # empty list, without the season seed a reload would silently resume
+    # watering after the operator ended the season, and without the ledger
+    # seed a zone's deficit would vanish on every reload — the reload regime
+    # runs on every config change — let alone across an HA restart (FR13).
     #
-    # Neither is machine state, which is why this is NOT AD-11's recovery
-    # path: a 7-day outcome list is history and the season is a runtime mode,
-    # so neither resumes an in-flight cycle. `run`, `last_run`, `zone_index`
-    # and `deferred` stay unread — restoring those is Story 3.2's, and it
-    # extends this ONE seed read rather than adding a second reader.
+    # None is machine state, which is why this is NOT AD-11's recovery path:
+    # a 7-day outcome list is history, the season is a runtime mode and the
+    # ledger is accounting between cycles, so none resumes an in-flight
+    # cycle. `run`, `last_run`, `zone_index` and `deferred` stay unread —
+    # restoring those is Story 3.2's, and it extends this ONE seed read
+    # rather than adding a second reader.
     seed = await journal.async_load_seed()
     sequencer = Sequencer(
         plan,
@@ -244,6 +247,7 @@ async def async_setup_entry(
         anomalies=anomalies,
         history=seed.history,
         season_enabled=seed.season_enabled,
+        ledger=seed.ledger,
     )
     runner = CycleRunner(hass, entry, sequencer=sequencer, clock=clock)
     # Follows the configured entities through the registry: renames rewrite

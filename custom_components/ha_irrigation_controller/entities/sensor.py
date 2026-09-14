@@ -140,12 +140,36 @@ class ZoneLastWateringSensor(HaIrrigationZoneEntity, SensorEntity):
     def native_value(self) -> int | None:
         """Return this zone's last effective watering seconds, None if never.
 
+        The value itself always comes from `effective_seconds` — the ONE
+        helper Epic 2's deficit also reads (AD-5) — applied to the slot
+        `_shown_zone` selects.
+        """
+        zone = self._shown_zone()
+        return None if zone is None else effective_seconds(zone)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, int]:
+        """Return the zone's water debt, COARSE (AD-10) — two integers.
+
+        `carried_deficit` is the deficit the ledger applied to the run this
+        sensor is showing — the SAME slot `native_value` reads, so the two
+        always describe one run — and `pending_deficit` is what the ledger
+        still holds for this zone right now. Both read 0 when there is
+        nothing to show: a zone that never watered and owes nothing has no
+        debt, not unknown debt. The ledger is READ here, never written (AD-6).
+        """
+        zone = self._shown_zone()
+        return {
+            "carried_deficit": 0 if zone is None else zone.carried_s,
+            "pending_deficit": self._sequencer.ledger.deficit_s(self._zone_id),
+        }
+
+    def _shown_zone(self) -> ZoneRun | None:
+        """Return the slot this sensor reports on, or None when it has none.
+
         The running cycle is consulted FIRST: once this zone's slot has closed
         it is fresher than `last_run`, and the operator watching a cycle
         should see the zone that just finished, not yesterday's figure.
-
-        The value itself always comes from `effective_seconds` — the ONE
-        helper Epic 2's deficit also reads (AD-5).
 
         A CANCELLED run is the one case where a zone with no `actual_end` is
         still an ANSWER rather than missing data: the cancel stopped the cycle
@@ -161,7 +185,7 @@ class ZoneLastWateringSensor(HaIrrigationZoneEntity, SensorEntity):
             if zone is not None and (
                 zone.actual_end is not None or run.status is CycleStatus.CANCELLED
             ):
-                return effective_seconds(zone)
+                return zone
         return None
 
 

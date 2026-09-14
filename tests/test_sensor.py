@@ -34,12 +34,18 @@ from homeassistant.helpers import (
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 import custom_components.ha_irrigation_controller
+from custom_components.ha_irrigation_controller.adapters.journal import STORAGE_KEY
 from custom_components.ha_irrigation_controller.const import (
+    ATTR_CYCLE,
     CONF_MORNING_ENABLED,
     CONF_VALVE_SWITCH,
     DOMAIN,
     SERVICE_CANCEL_CYCLE,
+    SERVICE_RUN_NOW,
     SUBENTRY_TYPE_ZONE,
+)
+from custom_components.ha_irrigation_controller.engine.sequencer import (
+    JOURNAL_SCHEMA_VERSION,
 )
 from tests.common import CONTROLLER_OPTIONS, fire_at, zone_subentry_data
 
@@ -435,6 +441,140 @@ async def test_a_cancelled_cycle_reports_zero_for_the_zones_it_never_reached(
 
     assert state_of(hass, duration_a).state == "300"
     assert state_of(hass, duration_b).state == "0"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+# --------------------------------------------------------------------------
+# Water debt attributes (Story 2.2)
+# --------------------------------------------------------------------------
+
+
+async def test_zone_sensor_debt_attributes_read_zero_with_no_run_and_no_debt(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    entry: MockConfigEntry,
+) -> None:
+    """A zone that never watered and owes nothing has NO debt — 0, not unknown.
+
+    Pinned before any cycle (state unknown) and after a full one (state 600):
+    neither shows a deficit, because none was carried and none is owed.
+    """
+    register_switches(hass)
+    zone = zone_of(entry, "Zone A")
+    duration = entity_id_for(
+        hass,
+        f"{entry.entry_id}_{zone.subentry_id}_last_watering_duration",
+    )
+    state = state_of(hass, duration)
+    assert state.state == "unknown"
+    assert state.attributes["carried_deficit"] == 0
+    assert state.attributes["pending_deficit"] == 0
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+
+    state = state_of(hass, duration)
+    assert state.state == "600"
+    assert state.attributes["carried_deficit"] == 0
+    assert state.attributes["pending_deficit"] == 0
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_zone_sensor_shows_the_deficit_a_run_produced_then_carried(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    entry: MockConfigEntry,
+) -> None:
+    """AC 4, end to end: `pending_deficit` is the ledger, `carried_deficit` the run.
+
+    The failed cycle shows 0 s watered, carried 0 (it applied no debt) and
+    pending 600 (it produced one). The run-now that follows is quoted 1200 s
+    — the debt is applied but still pending while the cycle runs — and once
+    it completes the sensor shows 1200 s, carried 600, pending 0.
+    """
+    register_switches(hass, failing=VALVE_A)
+    zone = zone_of(entry, "Zone A")
+    duration = entity_id_for(
+        hass,
+        f"{entry.entry_id}_{zone.subentry_id}_last_watering_duration",
+    )
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+
+    state = state_of(hass, duration)
+    assert state.state == "0"
+    assert state.attributes["carried_deficit"] == 0
+    assert state.attributes["pending_deficit"] == 600
+
+    # The valve recovers: the fake hardware is re-registered without the
+    # failure (`async_register` is last-wins), and the operator fires a
+    # run-now — quoted like any cycle, so it carries the 600 s.
+    register_switches(hass)
+    freezer.move_to("2026-07-31 07:30:00+02:00")
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_RUN_NOW,
+        {ATTR_CYCLE: "morning"},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+    state = state_of(hass, duration)
+    assert state.state == "0"  # the running slot has not closed: still the old run
+    assert state.attributes["carried_deficit"] == 0
+    assert state.attributes["pending_deficit"] == 600  # quoting writes nothing
+
+    await fire_at(hass, freezer, "2026-07-31 07:50:00+02:00")
+
+    state = state_of(hass, duration)
+    assert state.state == "1200"
+    assert state.attributes["carried_deficit"] == 600
+    assert state.attributes["pending_deficit"] == 0
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_zone_sensor_shows_a_pending_deficit_with_no_run_at_all(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """A deficit seeded from the journal is visible before any cycle has run.
+
+    The restart case: the ledger owes 300 s from a previous life, nothing has
+    watered yet in this one — the state is unknown and the debt is pending.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {
+            "schema_version": JOURNAL_SCHEMA_VERSION,
+            "history": [],
+            "ledger": {
+                "settled_cycle_id": "2026-07-30-evening",
+                "deficits": {"zone-a": 300},
+            },
+        },
+    }
+    entry = controller_with_zones(
+        {**zone_subentry_data("Zone A", VALVE_A), "subentry_id": "zone-a"},
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    duration = entity_id_for(hass, f"{entry.entry_id}_zone-a_last_watering_duration")
+
+    state = state_of(hass, duration)
+    assert state.state == "unknown"
+    assert state.attributes["carried_deficit"] == 0
+    assert state.attributes["pending_deficit"] == 300
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

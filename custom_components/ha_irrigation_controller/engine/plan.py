@@ -18,6 +18,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from datetime import date, time
 
 
@@ -96,6 +97,7 @@ def zone_windows(
     plan: ControllerPlan,
     kind: CycleKind,
     start: datetime,
+    durations: Sequence[int] | None = None,
 ) -> tuple[ZoneWindow, ...]:
     """Derive back-to-back zone windows for one cycle starting at `start`.
 
@@ -103,17 +105,26 @@ def zone_windows(
     "no start-time arithmetic for the operator" behavior (FR1). Zone order is
     the plan's order, exactly as given.
 
+    `durations` are the per-zone seconds to accumulate, in plan order; they
+    default to the plan's own durations for `kind`. The sequencer passes the
+    ledger's QUOTED durations (Story 2.2) so a carried deficit shifts every
+    following zone's window — and `next_wakeup()` with it. Schedule
+    derivation and overlap validation keep the default: they describe the
+    plan, not a particular run.
+
     Durations are ELAPSED seconds, so the accumulation runs in UTC and the
     windows are converted back to `start`'s timezone. Adding a `timedelta` to a
     `ZoneInfo`-aware datetime is wall-clock arithmetic: across a spring-forward
     a 3600 s zone would span 02:30+01:00 → 03:30+02:00 and receive no water at
     all, and across a fall-back it would water twice as long.
     """
+    if durations is None:
+        durations = [zone.duration_s(kind) for zone in plan.zones]
     windows: list[ZoneWindow] = []
     local_tz = start.tzinfo
     cursor = start.astimezone(UTC)
-    for zone in plan.zones:
-        end = cursor + timedelta(seconds=zone.duration_s(kind))
+    for zone, duration_s in zip(plan.zones, durations, strict=True):
+        end = cursor + timedelta(seconds=duration_s)
         windows.append(
             ZoneWindow(
                 zone_id=zone.zone_id,

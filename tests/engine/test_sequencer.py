@@ -677,7 +677,13 @@ async def test_history_gets_one_entry_per_completed_cycle_oldest_first() -> None
         "2026-07-31-evening",
     ]
     assert history[0]["zones"] == [
-        {"zone_id": "zone-1", "status": "completed", "effective_s": 600},
+        {
+            "zone_id": "zone-1",
+            "status": "completed",
+            "planned_s": 600,
+            "carried_s": 0,
+            "effective_s": 600,
+        },
     ]
     json.dumps(history)  # serializable, or this raises
 
@@ -734,6 +740,8 @@ async def test_history_records_zero_effective_seconds_for_a_failed_zone() -> Non
     assert history[-1]["zones"][0] == {
         "zone_id": "zone-1",
         "status": "failed",
+        "planned_s": 600,
+        "carried_s": 0,
         "effective_s": 0,
     }
     assert history[-1]["zones"][1]["effective_s"] == 900

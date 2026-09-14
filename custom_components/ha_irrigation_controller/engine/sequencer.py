@@ -27,6 +27,7 @@ import contextlib
 from typing import TYPE_CHECKING, Final
 
 from .history import history_entry, prune_history
+from .ledger import Ledger
 from .plan import derive_schedule, irrigation_day, zone_windows
 from .ports import AnomalyKind
 from .runs import (
@@ -58,7 +59,7 @@ class Sequencer:
     skipped (AD-4, runtime half of the overlap defense).
     """
 
-    def __init__(  # noqa: PLR0913 — three injected ports plus the two seeds; collapsing them into a config object would hide which are ports and which are state
+    def __init__(  # noqa: PLR0913 — three injected ports plus the three seeds; collapsing them into a config object would hide which are ports and which are state
         self,
         plan: ControllerPlan,
         *,
@@ -67,21 +68,27 @@ class Sequencer:
         anomalies: AnomalyPort,
         history: list[dict[str, object]] | None = None,
         season_enabled: bool = True,
+        ledger: dict[str, object] | None = None,
     ) -> None:
         """Wire the sequencer to its plan, its ports and any prior state.
 
-        `history` and `season_enabled` are the ONLY state this constructor
-        accepts back, and neither is machine state: outcome records are not,
-        and a season flag is a runtime MODE, not an in-flight cycle. Seeding
-        them is therefore not resuming a cycle (AD-11's recovery path stays
-        Story 3.2's, and it restores `run`/`last_run`/`deferred`). Without the
+        `history`, `season_enabled` and `ledger` are the ONLY state this
+        constructor accepts back, and none is machine state: outcome records
+        are not, a season flag is a runtime MODE, and the water-debt ledger is
+        ACCOUNTING between cycles, not an in-flight cycle. Seeding them is
+        therefore not resuming a cycle (AD-11's recovery path stays Story
+        3.2's, and it restores `run`/`last_run`/`deferred`). Without the
         history seed the first `_save` of every reload would overwrite the
-        stored 7-day section with an empty list, and the reload regime runs on
-        every config change.
+        stored 7-day section with an empty list, and without the ledger seed a
+        deficit would not survive the reload regime that runs on every config
+        change — let alone an HA restart.
 
         `season_enabled` defaults to True — fail-wet (AD-4): doubt about the
         stored value resolves toward watering, so an absent or unreadable key
-        waters rather than silently ending the season.
+        waters rather than silently ending the season. `ledger` is the
+        section exactly as `Ledger.as_dict` wrote it, already validated by the
+        journal adapter; `None` (a journal written before Story 2.2) is an
+        empty ledger and the first cycle is quoted on base durations.
         """
         # Public and replaceable on purpose: a new plan applies to the NEXT
         # requested cycle; the running cycle only ever reads its own snapshot
@@ -106,6 +113,10 @@ class Sequencer:
         # update listener, and the reload it schedules would tear down a
         # running cycle mid-flight — which AC 1 forbids.
         self._season_enabled = season_enabled
+        # THE water-debt ledger (AD-5): every cycle is quoted through it in
+        # `_create_run` and settled through it in `_complete_cycle`, and those
+        # two are its only call sites. Journalled with the rest of the state.
+        self._ledger = Ledger.from_dict(ledger)
         # Each deferred entry keeps the reference instant of its ORIGINAL
         # request: that is what its configured start (and therefore its
         # irrigation day) is derived from, so a cycle deferred across midnight
@@ -138,6 +149,15 @@ class Sequencer:
     def season_enabled(self) -> bool:
         """Return whether scheduling is active at all, read-only (AD-6)."""
         return self._season_enabled
+
+    @property
+    def ledger(self) -> Ledger:
+        """Return the water-debt ledger for READING (AD-6).
+
+        The zone sensors project `deficit_s` from it. Writing goes through
+        `_complete_cycle` only — nothing outside the engine settles.
+        """
+        return self._ledger
 
     async def async_set_season(self, *, enabled: bool, now: datetime) -> bool:  # noqa: ARG002
         """Turn the season on or off; return True iff the value changed.
@@ -497,8 +517,15 @@ class Sequencer:
 
         `status` is the TERMINAL status to file the run under: COMPLETED for
         the normal path, CANCELLED for `async_cancel_cycle`. Both go through
-        here so the pump-off, the history append, the prune and the release
-        have exactly one implementation.
+        here so the pump-off, the settlement, the history append, the prune
+        and the release have exactly one implementation.
+
+        The ledger is settled right after the status turns terminal and
+        BEFORE the snapshot is saved (Story 2.2): the journal written for this
+        completion already carries the deficits it produced, and the deferred
+        cycle created further down is quoted against them. Both terminal
+        statuses settle — a cancelled run's un-reached zones owe their whole
+        slot — and this is the ONLY place `settle` is called.
 
         Called from inside the lock by `advance` and directly by
         `async_cancel_cycle`, which already holds it — this method must NOT
@@ -517,6 +544,7 @@ class Sequencer:
                     error,
                 )
         run.status = status
+        self._ledger.settle(run)
         # Appended BEFORE the save and before the deferral branch below: a
         # deferred cycle is created in this same call, and the snapshot taken
         # then must already carry this cycle's outcome.
@@ -553,13 +581,23 @@ class Sequencer:
         object — the id, the windows and the occurrence counter are derived
         identically either way, which is what keeps a run-now indistinguishable
         from a scheduled cycle everywhere except in the accounting.
+
+        Durations are QUOTED through the ledger (Story 2.2, AD-5), whichever
+        caller is creating the run: a scheduled start, a deferred pop and a
+        run-now all apply the carried deficit the same way — FR11's "current
+        durations" are the current EFFECTIVE durations. The windows accumulate
+        the quoted durations, so a carried deficit shifts every following
+        zone and `next_wakeup()` with it. Quoting is pure; the ledger is only
+        written when this run settles in `_complete_cycle`.
         """
         schedule = derive_schedule(self.plan, kind, reference)
         scheduled_start = schedule.start if dispatch_at is None else dispatch_at
-        windows = (
-            schedule.zones
-            if dispatch_at is None
-            else zone_windows(self.plan, kind, dispatch_at)
+        quotes = self._ledger.quote(self.plan.zones, kind)
+        windows = zone_windows(
+            self.plan,
+            kind,
+            scheduled_start,
+            [quote.quoted_s for quote in quotes],
         )
         self._run = CycleRun(
             cycle_id=cycle_id_for(
@@ -576,11 +614,18 @@ class Sequencer:
                     zone_id=spec.zone_id,
                     name=spec.name,
                     valve_entity_id=spec.valve_entity_id,
-                    duration_s=spec.duration_s(kind),
+                    duration_s=quote.quoted_s,
+                    base_s=quote.base_s,
+                    carried_s=quote.carried_s,
                     planned_start=window.start,
                     planned_end=window.end,
                 )
-                for spec, window in zip(self.plan.zones, windows, strict=True)
+                for spec, quote, window in zip(
+                    self.plan.zones,
+                    quotes,
+                    windows,
+                    strict=True,
+                )
             ),
             manual=manual,
         )
@@ -652,7 +697,9 @@ class Sequencer:
         zone looks identical whether it is the current slot or a finished
         one), `last_run` keeps the completed cycle that would otherwise be
         overwritten the moment a deferred cycle is created, and the deferred
-        queue keeps each entry's reference instant.
+        queue keeps each entry's reference instant. `ledger` is the water
+        debt between cycles (Story 2.2) — seeded back on setup, which is how a
+        deficit survives a restart.
         """
         last_run = self._last_run
         snapshot: dict[str, object] = {
@@ -666,6 +713,7 @@ class Sequencer:
             ],
             "history": list(self._history),
             "season_enabled": self._season_enabled,
+            "ledger": self._ledger.as_dict(),
         }
         try:
             await self._journal.async_save(snapshot)

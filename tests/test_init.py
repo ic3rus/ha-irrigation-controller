@@ -20,7 +20,10 @@ from custom_components.ha_irrigation_controller import (
     config_fingerprint,
 )
 from custom_components.ha_irrigation_controller.adapters.anomalies import AnomalyManager
-from custom_components.ha_irrigation_controller.adapters.journal import JournalAdapter
+from custom_components.ha_irrigation_controller.adapters.journal import (
+    STORAGE_KEY,
+    JournalAdapter,
+)
 from custom_components.ha_irrigation_controller.adapters.switches import (
     VerifiedSwitchAdapter,
 )
@@ -49,7 +52,10 @@ from custom_components.ha_irrigation_controller.engine.config import (
 from custom_components.ha_irrigation_controller.engine.plan import ControllerPlan
 from custom_components.ha_irrigation_controller.engine.ports import AnomalyKind
 from custom_components.ha_irrigation_controller.engine.runs import CycleStatus
-from custom_components.ha_irrigation_controller.engine.sequencer import Sequencer
+from custom_components.ha_irrigation_controller.engine.sequencer import (
+    JOURNAL_SCHEMA_VERSION,
+    Sequencer,
+)
 from tests.common import (
     CONTROLLER_OPTIONS,
     PUMP,
@@ -870,3 +876,134 @@ async def test_setup_succeeds_on_prerelease_of_min_ha_version(
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
     assert entry.state is ConfigEntryState.LOADED
+
+
+# --------------------------------------------------------------------------
+# The ledger seed reaches the engine (Story 2.2)
+# --------------------------------------------------------------------------
+
+
+async def test_a_journal_written_before_the_ledger_sets_up_and_quotes_on_base(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """AC 2: a pre-2.2 document loads, and the first cycle is quoted on base.
+
+    The stored document is one the pre-2.2 code wrote — history and the
+    season flag, no `ledger` key anywhere. Setup must not fail and must not
+    invent a debt: the engine starts with an empty ledger and the 10 min
+    zone waters 600 s.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {
+            "schema_version": JOURNAL_SCHEMA_VERSION,
+            "history": [
+                {
+                    "cycle_id": "2026-07-30-evening",
+                    "irrigation_day": "2026-07-30",
+                    "kind": "evening",
+                    "status": "completed",
+                    "manual": False,
+                    "configured_start": "2026-07-30T18:00:00+00:00",
+                    "scheduled_start": "2026-07-30T18:00:00+00:00",
+                    "ended_at": "2026-07-30T18:15:00+00:00",
+                    "zones": [
+                        {
+                            "zone_id": "zone-a",
+                            "status": "completed",
+                            "effective_s": 900,
+                        },
+                    ],
+                },
+            ],
+            "season_enabled": True,
+        },
+    }
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[
+            {**zone_subentry_data("Zone A", VALVE_1), "subentry_id": "zone-a"},
+        ],
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+    sequencer = entry.runtime_data.sequencer
+    assert sequencer.ledger.as_dict() == {"settled_cycle_id": None, "deficits": {}}
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+
+    run = sequencer.current_run
+    assert run is not None
+    zone = run.zone_runs[0]
+    assert (zone.duration_s, zone.base_s, zone.carried_s) == (600, 600, 0)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_a_seeded_ledger_reaches_the_engine_and_extends_the_first_cycle(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """AC 3: a deficit recorded before an HA restart is applied after setup.
+
+    `async_setup_entry` hands `seed.ledger` to the sequencer — the wiring
+    this test pins. The 300 s owed by `zone-a` extend its morning slot to
+    900 s, and the zone after it starts 5 min later than the plan says.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {
+            "schema_version": JOURNAL_SCHEMA_VERSION,
+            "history": [],
+            "ledger": {
+                "settled_cycle_id": "2026-07-30-evening",
+                "deficits": {"zone-a": 300},
+            },
+        },
+    }
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[
+            {**zone_subentry_data("Zone A", VALVE_1), "subentry_id": "zone-a"},
+            {**zone_subentry_data("Zone B", VALVE_2), "subentry_id": "zone-b"},
+        ],
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+    sequencer = entry.runtime_data.sequencer
+    assert sequencer.ledger.deficit_s("zone-a") == 300
+    assert sequencer.ledger.deficit_s("zone-b") == 0
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+
+    run = sequencer.current_run
+    assert run is not None
+    zone_a, zone_b = run.zone_runs
+    assert (zone_a.duration_s, zone_a.carried_s) == (900, 300)
+    assert (zone_b.duration_s, zone_b.carried_s) == (600, 0)
+    assert zone_b.planned_start.isoformat() == "2026-07-31T07:15:00+02:00"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()

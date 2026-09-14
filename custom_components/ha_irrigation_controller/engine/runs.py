@@ -67,14 +67,26 @@ def utc_iso(moment: datetime | None) -> str | None:
 
 @dataclass(slots=True)
 class ZoneRun:
-    """One zone's slot in a cycle run — parameters snapshotted from the plan."""
+    """One zone's slot in a cycle run — parameters snapshotted from the plan.
+
+    Three durations, all seconds, all frozen at quote time (Story 2.2):
+
+    - `base_s` is the plan's duration for this cycle kind — the snapshot the
+      ledger settles against, never the live plan (AD-8).
+    - `carried_s` is the deficit the ledger applied to this run (≤ `base_s`).
+    - `duration_s` is the QUOTED effective duration the slot actually runs:
+      `max(0, base_s - rain credit) + carried_s`. The planned window is
+      derived from it, so a carried deficit really does extend the run.
+    """
 
     zone_id: str
     name: str
     valve_entity_id: str
     duration_s: int
+    base_s: int
     planned_start: datetime
     planned_end: datetime
+    carried_s: int = 0
     status: ZoneRunStatus = ZoneRunStatus.PENDING
     actual_start: datetime | None = None
     actual_end: datetime | None = None
@@ -91,6 +103,8 @@ class ZoneRun:
             "name": self.name,
             "valve_entity_id": self.valve_entity_id,
             "duration_s": self.duration_s,
+            "base_s": self.base_s,
+            "carried_s": self.carried_s,
             "planned_start": utc_iso(self.planned_start),
             "planned_end": utc_iso(self.planned_end),
             "status": self.status.value,
@@ -112,6 +126,11 @@ def effective_seconds(zone_run: ZoneRun) -> int:
     Epic 2's deficit input and Story 1.5's per-zone sensor both read THIS
     function: AD-5's "no feature re-implements the math" starts here.
 
+    ROUNDED to the nearest second, not truncated: both instants are timer-fire
+    wall-clock reads, so a healthy 600 s slot whose open fired a few ms later
+    than its close spans 599.99 s — truncation would read 599 and the ledger
+    would book a spurious 1 s deficit on roughly every other zone.
+
     Clamped at zero: `now` comes from the wall clock, which is not monotonic —
     an NTP correction, a manual time change or a VM snapshot restore between a
     zone's open and its close would otherwise produce a negative DURATION on a
@@ -121,7 +140,7 @@ def effective_seconds(zone_run: ZoneRun) -> int:
         return 0
     if zone_run.actual_start is None or zone_run.actual_end is None:
         return 0
-    return max(0, int((zone_run.actual_end - zone_run.actual_start).total_seconds()))
+    return max(0, round((zone_run.actual_end - zone_run.actual_start).total_seconds()))
 
 
 @dataclass(slots=True)
