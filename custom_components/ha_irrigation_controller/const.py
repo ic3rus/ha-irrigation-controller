@@ -38,6 +38,21 @@ DEFAULT_ACTUATION_TIMEOUT_S = 10
 MIN_ACTUATION_TIMEOUT_S = 1
 MAX_ACTUATION_TIMEOUT_S = 120
 
+# Verb-named actions (FR5, AD-10). Registered in `async_setup` and NEVER
+# removed on unload (`action-setup`), so an automation referencing one stays
+# editable while the entry is down. `run_now` joins them in Story 2.1.
+SERVICE_CANCEL_CYCLE = "cancel_cycle"
+SERVICE_SET_ZONE_DURATION = "set_zone_duration"
+SERVICE_SET_SEASON = "set_season"
+
+# Service field names. `zone_id` is the subentry id — the zone key everywhere
+# (AD-8), so the services take the same identity the journal and the card do.
+# `duration` is MINUTES, matching every other duration UI surface.
+ATTR_ZONE_ID = "zone_id"
+ATTR_CYCLE = "cycle"
+ATTR_DURATION = "duration"
+ATTR_ENABLED = "enabled"
+
 # The SINGLE bus event type this integration ever fires (conventions table).
 # Payloads carry an "event_type" discriminator ("anomaly" today; more kinds
 # join in later stories) — never a second event type per feature.

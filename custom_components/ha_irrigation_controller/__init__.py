@@ -16,7 +16,7 @@ from homeassistant.const import (
     __version__ as HA_VERSION,  # noqa: N812
 )
 from homeassistant.exceptions import ConfigEntryError
-from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import config_validation as cv, device_registry as dr
 from homeassistant.helpers.device_registry import DeviceEntryType
 from homeassistant.helpers.storage import Store
 
@@ -33,17 +33,25 @@ from .const import (
 )
 from .engine.config import PlanValidationError, build_plan, parse_actuation_timeout
 from .engine.sequencer import JOURNAL_SCHEMA_VERSION, Sequencer
+from .services import async_setup_services
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
+    from homeassistant.helpers.typing import ConfigType
 
     from .engine.plan import ControllerPlan
 
 type HaIrrigationConfigEntry = ConfigEntry[HaIrrigationRuntimeData]
 
-# The only platform this integration forwards today; Story 1.6 adds SWITCH.
-PLATFORMS: Final = [Platform.SENSOR]
+# Required the moment `async_setup` exists on a config-entry-only integration:
+# it declares that nothing of ours may be configured from `configuration.yaml`.
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+# The platforms this integration forwards. One home for the list (here, not in
+# const.py): `async_unload_entry` unloads whatever it names, so adding a
+# platform is a one-line change.
+PLATFORMS: Final = [Platform.SENSOR, Platform.SWITCH]
 
 
 @dataclass
@@ -60,6 +68,22 @@ class HaIrrigationRuntimeData:
     runner: CycleRunner
     journal: JournalAdapter
     anomalies: AnomalyManager
+
+
+async def async_setup(
+    hass: HomeAssistant,
+    config: ConfigType,  # noqa: ARG001 — component setup signature
+) -> bool:
+    """Register the integration's actions at COMPONENT setup (`action-setup`).
+
+    Deliberately not in `async_setup_entry`: services registered per entry
+    disappear on unload, and an automation referencing one would then become
+    an action the operator cannot even open. Registered once here, they stay
+    for the process lifetime and each call resolves the entry itself — so a
+    call made while nothing is loaded explains that instead of vanishing.
+    """
+    async_setup_services(hass)
+    return True
 
 
 async def async_setup_entry(
@@ -157,17 +181,26 @@ async def async_setup_entry(
             sequencer.current_run.cycle_id if sequencer.current_run else None
         ),
     )
-    # The ONLY thing read back from storage here: the outcome history AC 4
-    # promises to retain for 7 days. Without it the first journal write of
-    # every reload overwrites the stored section with an empty list, and the
-    # reload regime runs on every config change. Machine state stays unread —
-    # resuming an in-flight cycle is AD-11's recovery path and Story 3.2's.
+    # The ONLY things read back from storage here: the outcome history AC 4
+    # promises to retain for 7 days, and the season mode flag (Story 1.6).
+    # Without the history seed the first journal write of every reload
+    # overwrites the stored section with an empty list, and without the season
+    # seed a reload would silently resume watering after the operator ended
+    # the season — the reload regime runs on every config change.
+    #
+    # Neither is machine state, which is why this is NOT AD-11's recovery
+    # path: a 7-day outcome list is history and the season is a runtime mode,
+    # so neither resumes an in-flight cycle. `run`, `last_run`, `zone_index`
+    # and `deferred` stay unread — restoring those is Story 3.2's, and it
+    # extends this ONE seed read rather than adding a second reader.
+    seed = await journal.async_load_seed()
     sequencer = Sequencer(
         plan,
         switches=switches,
         journal=journal,
         anomalies=anomalies,
-        history=await journal.async_load_history(),
+        history=seed.history,
+        season_enabled=seed.season_enabled,
     )
     runner = CycleRunner(hass, entry, sequencer=sequencer, clock=clock)
 

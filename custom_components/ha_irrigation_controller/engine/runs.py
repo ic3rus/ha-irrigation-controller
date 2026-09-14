@@ -22,14 +22,17 @@ if TYPE_CHECKING:
 class CycleStatus(StrEnum):
     """Lifecycle of a cycle run.
 
-    COMPLETED is the only terminal status today; a future CANCELLED
-    (Story 1.6) joins as a second terminal status without redesign — nothing
-    below assumes "terminal == completed".
+    Two TERMINAL statuses: COMPLETED (the cycle ran its course) and CANCELLED
+    (Story 1.6's explicit operator cancel, the only thing that stops a running
+    cycle). Nothing anywhere assumes "terminal == completed" — the completion
+    path is shared and takes the terminal status as a parameter, and every
+    reader keys off the value rather than off the absence of a run.
     """
 
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
+    CANCELLED = "cancelled"
 
 
 class ZoneRunStatus(StrEnum):

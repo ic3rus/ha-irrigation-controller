@@ -27,7 +27,8 @@
             }
         },
         "error": {
-            "start_times_conflict": "The morning and evening cycles cannot start at the same time. Change one of them, or turn the morning cycle off."
+            "start_times_conflict": "The morning and evening cycles cannot start at the same time. Change one of them, or turn the morning cycle off.",
+            "pump_is_own_entity": "This is the irrigation controller's own Season switch, not a physical pump. Pick the switch that powers your pump."
         },
         "abort": {
             "already_configured": "This controller is already configured.",
@@ -86,6 +87,7 @@
             },
             "error": {
                 "valve_is_pump": "This is the pump switch, not a zone valve. Pick the switch that opens this zone's own valve.",
+                "valve_is_own_entity": "This is the irrigation controller's own Season switch, not a physical valve. Pick the switch that opens this zone's valve.",
                 "valve_already_configured": "Another zone already uses this valve. Each zone needs its own valve switch.",
                 "valve_not_found": "That valve no longer exists. Pick a switch that is currently available.",
                 "name_required": "Give this zone a name. It is how the zone appears on its device, the dashboard card and in notifications.",
@@ -129,6 +131,7 @@
         "error": {
             "start_times_conflict": "The morning and evening cycles cannot start at the same time. Change one of them, or turn the morning cycle off.",
             "pump_is_zone_valve": "This switch is already used as a zone's valve. Pick the switch that powers the pump, not one that opens a valve.",
+            "pump_is_own_entity": "This is the irrigation controller's own Season switch, not a physical pump. Pick the switch that powers your pump.",
             "cycles_overlap": "With these start times the morning cycle would still be watering when the evening cycle starts. Move the start times apart or shorten the zones.",
             "evening_cycle_overlap": "With these start times the evening cycle would still be watering when the morning cycle starts. Move the start times apart or shorten the zones."
         }
@@ -141,11 +144,51 @@
                     "idle": "Idle",
                     "pending": "Pending",
                     "running": "Running",
-                    "completed": "Completed"
+                    "completed": "Completed",
+                    "cancelled": "Cancelled"
                 }
             },
             "last_watering_duration": {
                 "name": "Last watering duration"
+            }
+        },
+        "switch": {
+            "season": {
+                "name": "Season"
+            }
+        }
+    },
+    "services": {
+        "cancel_cycle": {
+            "name": "Cancel cycle",
+            "description": "Stops the cycle that is running right now. The open valve is closed, then the pump, and the cycle is recorded as cancelled. This is the only thing that stops a running cycle."
+        },
+        "set_season": {
+            "name": "Set season",
+            "description": "Turns watering on or off in one action. With the season off no new cycle is scheduled and no anomaly is raised; a cycle already running still finishes.",
+            "fields": {
+                "enabled": {
+                    "name": "Enabled",
+                    "description": "On resumes scheduling from this moment on. Off suspends it, including any cycle already queued behind a running one."
+                }
+            }
+        },
+        "set_zone_duration": {
+            "name": "Set zone duration",
+            "description": "Changes how long one zone waters during one cycle. The change applies without restarting Home Assistant. Note: it reloads the integration, so a cycle running at that moment is abandoned — avoid calling it mid-cycle until that is fixed.",
+            "fields": {
+                "zone_id": {
+                    "name": "Zone",
+                    "description": "The zone's identifier. This is the config subentry id shown in the error message if you get it wrong — not the zone's name."
+                },
+                "cycle": {
+                    "name": "Cycle",
+                    "description": "Which of the two daily cycles this duration applies to."
+                },
+                "duration": {
+                    "name": "Duration",
+                    "description": "Minutes this zone waters during that cycle, from 1 to 120. The two cycles must not end up overlapping."
+                }
             }
         }
     },
@@ -155,6 +198,18 @@
         },
         "invalid_stored_config": {
             "message": "The stored configuration is invalid and the schedule cannot be built from it: {detail}. Fix the reported field (or remove and re-add the zone) and reload the integration."
+        },
+        "no_cycle_running": {
+            "message": "There is no cycle running, so there is nothing to cancel."
+        },
+        "unknown_zone": {
+            "message": "No zone has the id {zone_id}. The configured zones are: {known}."
+        },
+        "invalid_duration": {
+            "message": "A zone duration must be between {min} and {max} minutes; {duration} is outside that range."
+        },
+        "cycles_overlap": {
+            "message": "With this duration the morning and evening cycles would overlap. Shorten a zone or move the start times apart."
         }
     }
 }

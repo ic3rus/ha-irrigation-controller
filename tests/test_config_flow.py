@@ -9,6 +9,7 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.data_entry_flow import FlowResultType, InvalidData
+from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ha_irrigation_controller.const import (
@@ -472,3 +473,47 @@ async def test_options_flow_rejects_identical_start_times(hass: HomeAssistant) -
     await hass.async_block_till_done()
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert entry.options[CONF_MORNING_START] == "06:15:00"
+
+
+async def test_options_flow_rejects_our_own_season_switch_as_the_pump(
+    hass: HomeAssistant,
+) -> None:
+    """The integration's own `switch.*` entity is not usable as hardware.
+
+    Story 1.6 made this integration publish a switch entity, so its own plain
+    `domain="switch"` pump picker offers it back. Commanding it through the
+    verified adapter would re-enter the sequencer while `advance()` holds its
+    lock — broken only by the actuation timeout, at the cost of a stall and a
+    spurious anomaly per command. Checked against the entity REGISTRY, so a
+    rename cannot defeat it, and enforced in validation rather than in the
+    selector because the WebSocket API bypasses pickers.
+    """
+    entry = controller_entry()
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    season = er.async_get(hass).async_get_entity_id(
+        "switch",
+        DOMAIN,
+        f"{entry.entry_id}_season",
+    )
+    assert season is not None
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={**CONTROLLER_OPTIONS, CONF_PUMP_SWITCH: season},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_PUMP_SWITCH: "pump_is_own_entity"}
+    assert entry.options[CONF_PUMP_SWITCH] == CONTROLLER_OPTIONS[CONF_PUMP_SWITCH]
+
+    # Recovery: a real switch still saves through the same open form.
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={**CONTROLLER_OPTIONS, CONF_PUMP_SWITCH: "switch.other_pump"},
+    )
+    await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_PUMP_SWITCH] == "switch.other_pump"

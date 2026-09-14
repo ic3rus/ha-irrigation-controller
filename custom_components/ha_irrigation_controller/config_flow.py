@@ -105,6 +105,11 @@ _DEVICE_CLASS_HUMIDITY = "humidity"
 ERROR_START_TIMES_CONFLICT = "start_times_conflict"
 ERROR_PUMP_IS_ZONE_VALVE = "pump_is_zone_valve"
 ERROR_VALVE_IS_PUMP = "valve_is_pump"
+# Since Story 1.6 this integration publishes a `switch.*` entity of its own,
+# so its own pump/valve pickers offer it back. One error id per field: the
+# operator must be told which picker to change.
+ERROR_PUMP_IS_OWN_ENTITY = "pump_is_own_entity"
+ERROR_VALVE_IS_OWN_ENTITY = "valve_is_own_entity"
 ERROR_VALVE_ALREADY_CONFIGURED = "valve_already_configured"
 ERROR_VALVE_NOT_FOUND = "valve_not_found"
 ERROR_NAME_REQUIRED = "name_required"
@@ -172,6 +177,26 @@ def _resolve_entity_id(hass: HomeAssistant, value: str) -> str:
         return value
     registry_entry = er.async_get(hass).async_get(value)
     return registry_entry.entity_id if registry_entry is not None else value
+
+
+def _is_own_entity(hass: HomeAssistant, entity_id: str) -> bool:
+    """Return True when `entity_id` is an entity this integration publishes.
+
+    Since Story 1.6 the integration owns a `switch.*` entity (the season
+    switch), and both pickers here are plain `domain="switch"` selectors, so
+    they offer it back. Driving it as the pump or a valve would make the
+    verified adapter command our own entity, which calls back into the
+    sequencer while `advance()` holds its lock — a re-entrancy the actuation
+    timeout is the only thing that breaks, at the cost of a stall and a
+    spurious unconfirmed-actuation anomaly per command, plus a season flip
+    landing out of band.
+
+    Checked against the entity registry rather than by name: the selectors are
+    UI affordances only (the WebSocket API bypasses them), and the operator can
+    rename the entity to anything.
+    """
+    registry_entry = er.async_get(hass).async_get(entity_id)
+    return registry_entry is not None and registry_entry.platform == DOMAIN
 
 
 def build_controller_schema() -> vol.Schema:
@@ -266,6 +291,7 @@ def _normalize_controller_input(
 
 
 def validate_controller_input(
+    hass: HomeAssistant,
     user_input: Mapping[str, Any],
     *,
     entry: ConfigEntry | None = None,
@@ -284,8 +310,15 @@ def validate_controller_input(
     its valve, which would then trip `valve_is_pump` with no way out.
     """
     errors: dict[str, str] = {}
-    if entry is not None:
-        pump = user_input.get(CONF_PUMP_SWITCH)
+    # Pinned as `str`, not `.get()`'s `Any | None`: the field is `vol.Required`
+    # in the schema, so it is present by the time validation runs — and mypy
+    # strict must see a real entity_id going into the registry lookup.
+    pump: str = user_input[CONF_PUMP_SWITCH]
+    if _is_own_entity(hass, pump):
+        # Unreachable during initial setup (no entry, so no entities of ours
+        # exist yet) — the options flow is where this fires.
+        errors[CONF_PUMP_SWITCH] = ERROR_PUMP_IS_OWN_ENTITY
+    elif entry is not None:
         for subentry in entry.get_subentries_of_type(SUBENTRY_TYPE_ZONE):
             if subentry.data.get(CONF_VALVE_SWITCH) == pump:
                 errors[CONF_PUMP_SWITCH] = ERROR_PUMP_IS_ZONE_VALVE
@@ -397,7 +430,8 @@ def _normalize_zone_input(
     }
 
 
-def validate_zone_input(
+def validate_zone_input(  # noqa: PLR0911 — a flat guard cascade, one return per rule: collapsing them into an accumulator would report several errors on one field, which the form cannot show
+    hass: HomeAssistant,
     entry: ConfigEntry,
     user_input: Mapping[str, Any],
     *,
@@ -428,6 +462,8 @@ def validate_zone_input(
         return {CONF_VALVE_SWITCH: ERROR_VALVE_NOT_FOUND}
     if valve == entry.options.get(CONF_PUMP_SWITCH):
         return {CONF_VALVE_SWITCH: ERROR_VALVE_IS_PUMP}
+    if _is_own_entity(hass, valve):
+        return {CONF_VALVE_SWITCH: ERROR_VALVE_IS_OWN_ENTITY}
     for subentry in entry.get_subentries_of_type(SUBENTRY_TYPE_ZONE):
         if subentry.subentry_id == exclude_subentry_id:
             # A zone keeping its own valve or name on reconfigure is not a
@@ -496,7 +532,7 @@ class HaIrrigationControllerConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             user_input = _normalize_controller_input(self.hass, user_input)
             # No entry yet, so no zones can exist to cross-check the pump against.
-            errors = validate_controller_input(user_input)
+            errors = validate_controller_input(self.hass, user_input)
             if not errors:
                 # data={} on purpose: nothing about this controller is immutable,
                 # so options is the one place the operator's choices live.
@@ -534,7 +570,7 @@ class ZoneSubentryFlow(ConfigSubentryFlow):
         errors: dict[str, str] = {}
         if user_input is not None:
             user_input = _normalize_zone_input(self.hass, user_input)
-            errors = validate_zone_input(self._get_entry(), user_input)
+            errors = validate_zone_input(self.hass, self._get_entry(), user_input)
             if not errors:
                 # No unique_id: zones have no natural one — duplicate-valve
                 # protection is the flow validation above.
@@ -569,6 +605,7 @@ class ZoneSubentryFlow(ConfigSubentryFlow):
         if user_input is not None:
             user_input = _normalize_zone_input(self.hass, user_input)
             errors = validate_zone_input(
+                self.hass,
                 self._get_entry(),
                 user_input,
                 exclude_subentry_id=subentry.subentry_id,
@@ -618,7 +655,11 @@ class HaIrrigationControllerOptionsFlow(OptionsFlow):
         errors: dict[str, str] = {}
         if user_input is not None:
             user_input = _normalize_controller_input(self.hass, user_input)
-            errors = validate_controller_input(user_input, entry=self.config_entry)
+            errors = validate_controller_input(
+                self.hass,
+                user_input,
+                entry=self.config_entry,
+            )
             if not errors:
                 return self.async_create_entry(title="", data=user_input)
 

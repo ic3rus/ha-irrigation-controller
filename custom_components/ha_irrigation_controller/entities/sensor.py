@@ -19,10 +19,8 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.const import UnitOfTime
-from homeassistant.core import callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
-from ..const import SUBENTRY_TYPE_ZONE, engine_state_signal  # noqa: TID252
+from ..const import SUBENTRY_TYPE_ZONE  # noqa: TID252
 from ..engine.runs import CycleStatus, effective_seconds  # noqa: TID252
 from .entity import HaIrrigationControllerEntity, HaIrrigationZoneEntity
 
@@ -61,37 +59,14 @@ async def async_setup_entry(
         )
 
 
-class _EngineStateProjection(SensorEntity):
-    """Mixin: subscribe to the engine-state signal, write state, nothing else.
+class CycleStatusSensor(HaIrrigationControllerEntity, SensorEntity):
+    """What the controller is doing right now: idle, or the run's status.
 
-    `entity-event-setup`: subscriptions are registered in
-    `async_added_to_hass` and released through `async_on_remove`.
+    The dispatcher subscription comes from the shared base (`entities/entity.py`),
+    which every platform inherits — our base is FIRST so its
+    `_attr_should_poll = False` and `__init__` win, while `SensorEntity`'s own
+    overrides still precede `Entity`'s.
     """
-
-    _entry: HaIrrigationConfigEntry
-
-    async def async_added_to_hass(self) -> None:
-        """Connect the entity to the runner's engine-state signal."""
-        await super().async_added_to_hass()
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass,
-                engine_state_signal(self._entry.entry_id),
-                self._async_engine_state_changed,
-            ),
-        )
-
-    @callback
-    def _async_engine_state_changed(self) -> None:
-        """Re-read the engine — the projection owns no state to update."""
-        self.async_write_ha_state()
-
-
-class CycleStatusSensor(
-    _EngineStateProjection,
-    HaIrrigationControllerEntity,
-):
-    """What the controller is doing right now: idle, or the run's status."""
 
     # No state_class and no unit: HA raises on either for an ENUM sensor.
     _attr_device_class = SensorDeviceClass.ENUM
@@ -133,10 +108,7 @@ class CycleStatusSensor(
         }
 
 
-class ZoneLastWateringSensor(
-    _EngineStateProjection,
-    HaIrrigationZoneEntity,
-):
+class ZoneLastWateringSensor(HaIrrigationZoneEntity, SensorEntity):
     """How long this zone last actually watered, in seconds."""
 
     _attr_device_class = SensorDeviceClass.DURATION
@@ -164,18 +136,27 @@ class ZoneLastWateringSensor(
 
         The value itself always comes from `effective_seconds` — the ONE
         helper Epic 2's deficit also reads (AD-5).
+
+        A CANCELLED run is the one case where a zone with no `actual_end` is
+        still an ANSWER rather than missing data: the cancel stopped the cycle
+        before that zone's slot, so it watered zero seconds — which is what the
+        README documents and what `effective_seconds` returns for it. Without
+        this branch a cancel would flap every un-reached zone's MEASUREMENT
+        sensor to `unknown` and pollute its long-term statistics.
         """
         for run in (self._sequencer.current_run, self._sequencer.last_run):
+            if run is None:
+                continue
             zone = _zone_run(run, self._zone_id)
-            if zone is not None and zone.actual_end is not None:
+            if zone is not None and (
+                zone.actual_end is not None or run.status is CycleStatus.CANCELLED
+            ):
                 return effective_seconds(zone)
         return None
 
 
-def _zone_run(run: CycleRun | None, zone_id: str) -> ZoneRun | None:
+def _zone_run(run: CycleRun, zone_id: str) -> ZoneRun | None:
     """Return `zone_id`'s slot in `run`, or None when it has none."""
-    if run is None:
-        return None
     return next((zone for zone in run.zone_runs if zone.zone_id == zone_id), None)
 
 
@@ -185,6 +166,11 @@ def _live_zone(run: CycleRun) -> ZoneRun | None:
     Identified by "started but not finished" rather than by status: a FAILED
     zone is indistinguishable by status from a finished one, and it is still
     the live slot until its planned end (fail-wet consumes the slot, AD-4).
+
+    The SAME rule is encoded in `engine/sequencer.py::_close_live_zone`, which
+    is what a cancel closes. The duplication is deliberate (the engine may not
+    import from `entities/`), so the two must be edited together — promoting it
+    to a shared `engine/runs.py` helper is the clean follow-up.
     """
     return next(
         (

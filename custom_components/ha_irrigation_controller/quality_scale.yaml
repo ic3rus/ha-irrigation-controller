@@ -1,8 +1,8 @@
 rules:
   # Bronze
   action-setup:
-    status: exempt
-    comment: No services yet; services arrive with Story 1.6.
+    status: done
+    comment: cancel_cycle, set_season and set_zone_duration are registered in async_setup (services.py), so they stay registered while the entry is unloaded. Each handler resolves the entry per call via homeassistant.helpers.service.async_get_config_entry, which raises the translated "not found"/"not loaded"/"multiple entries" errors itself.
   appropriate-polling:
     status: exempt
     comment: iot_class is calculated — the integration does not poll.
@@ -17,8 +17,8 @@ rules:
   dependency-transparency:
     status: done
   docs-actions:
-    status: exempt
-    comment: No services yet; services arrive with Story 1.6.
+    status: done
+    comment: README "Services" section documents all three actions, their fields and units, that season OFF does not stop a running cycle, and the mid-cycle reload caveat.
   docs-high-level-description:
     status: done
   docs-installation-instructions:
@@ -40,3 +40,8 @@ rules:
     comment: No device/service connection to test — local calculated helper.
   test-before-setup: done
   unique-config-entry: done
+
+  # Silver
+  action-exceptions:
+    status: done
+    comment: Every failure path of the three actions raises a translated ServiceValidationError (no_cycle_running, unknown_zone, invalid_duration, cycles_overlap); the "no entry"/"not loaded"/"multiple entries" cases come already translated from async_get_config_entry. Range and identity checks live in the handlers rather than the voluptuous schemas, so a bad value never surfaces as an untranslated vol.Invalid.

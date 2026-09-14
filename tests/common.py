@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING, Any
 
 from homeassistant import config_entries
@@ -63,17 +64,60 @@ def register_switch_domain(hass: HomeAssistant) -> list[ServiceCall]:
 
     A recorder alone would never confirm: the verified adapter watches for the
     state change, so the fake has to behave like a real switch.
+
+    ORDER CONTRACT — call this AFTER the entry is set up. Since Story 1.6 the
+    integration forwards `Platform.SWITCH`, so HA's switch component registers
+    the real `switch.turn_on`/`turn_off` during `async_forward_entry_setups`,
+    and `async_register` is last-wins: a fake registered first is silently
+    replaced, the fake hardware then never flips, and every cycle stalls
+    waiting for a confirmation that cannot arrive.
+
+    Entity ids the fake does NOT own are delegated back to the handler it
+    replaced, so the fake hardware and the integration's own season switch can
+    both be driven from one test. `Service.job.target` is the function HA
+    registered; calling it is exactly what `async_call` does.
     """
     calls: list[ServiceCall] = []
+    # A tuple, not a set: the seeding loop below sets initial states, and a set
+    # would order them by PYTHONHASHSEED.
+    fake_hardware = (PUMP, VALVE_1, VALVE_2)
+    replaced = {
+        name: service.job.target
+        for name, service in hass.services.async_services_for_domain("switch").items()
+    }
+    # The ORDER CONTRACT above, enforced rather than merely documented. An entry
+    # for this domain existing means `async_forward_entry_setups` has run (or is
+    # about to), and forwarding `Platform.SWITCH` is what loads HA's switch
+    # component — so an empty `replaced` at that point means this helper is
+    # about to be overwritten and every cycle will stall on a confirmation that
+    # cannot arrive. A hang is the hardest failure to trace back to here; this
+    # turns it into a named one. Runner-level tests build no entry at all and
+    # legitimately have nothing to delegate to.
+    assert replaced or not hass.config_entries.async_entries(DOMAIN), (
+        "register_switch_domain must be called AFTER the entry is set up — "
+        "see the ORDER CONTRACT in its docstring."
+    )
 
     async def _handle(call: ServiceCall) -> None:
+        # `.get`, not `[]`: a call targeting an area, a device or a label
+        # carries no `entity_id` at all, and the list form is equally legal.
+        # Neither is fake hardware, so both belong on the delegate path rather
+        # than raising KeyError inside a service handler.
+        entity_id = call.data.get(ATTR_ENTITY_ID)
+        if entity_id not in fake_hardware:
+            delegate = replaced.get(call.service)
+            if delegate is not None:
+                result = delegate(call)
+                if inspect.isawaitable(result):
+                    await result
+            return
         calls.append(call)
         state = STATE_ON if call.service == "turn_on" else STATE_OFF
-        hass.states.async_set(call.data[ATTR_ENTITY_ID], state, context=call.context)
+        hass.states.async_set(entity_id, state, context=call.context)
 
     hass.services.async_register("switch", "turn_on", _handle)
     hass.services.async_register("switch", "turn_off", _handle)
-    for entity_id in (PUMP, VALVE_1, VALVE_2):
+    for entity_id in fake_hardware:
         hass.states.async_set(entity_id, STATE_OFF)
     return calls
 
