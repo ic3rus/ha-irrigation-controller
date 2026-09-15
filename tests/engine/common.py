@@ -141,15 +141,20 @@ class FakeRainPort:
 
 
 class FakeAnomalyPort:
-    """Records every reported anomaly."""
+    """Records every reported anomaly and every clear (Story 3.1)."""
 
     def __init__(self) -> None:
-        """Start with an empty report log."""
+        """Start with empty report and clear logs."""
         self.reports: list[tuple[AnomalyKind, dict[str, object]]] = []
+        self.clears: list[tuple[AnomalyKind, dict[str, object]]] = []
 
     def report(self, kind: AnomalyKind, context: dict[str, object]) -> None:
         """Record the anomaly kind and its context payload."""
         self.reports.append((kind, dict(context)))
+
+    def clear(self, kind: AnomalyKind, context: dict[str, object]) -> None:
+        """Record the clear — the engine's "healthy again" for that subject."""
+        self.clears.append((kind, dict(context)))
 
 
 def make_zone(  # noqa: PLR0913 — one keyword per spec field is the readable shape

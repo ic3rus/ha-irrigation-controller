@@ -21,8 +21,9 @@ from homeassistant.helpers import config_validation as cv, device_registry as dr
 from homeassistant.helpers.device_registry import DeviceEntryType
 from homeassistant.helpers.storage import Store
 
-from .adapters.anomalies import AnomalyManager
+from .adapters.anomalies import AnomalyManager, async_delete_domain_issues
 from .adapters.journal import STORAGE_KEY, JournalAdapter
+from .adapters.notify import HaNotifyAdapter, parse_notify_target
 from .adapters.rain import RainSensorAdapter
 from .adapters.registry import ConfiguredEntityTracker
 from .adapters.switches import VerifiedSwitchAdapter
@@ -87,7 +88,7 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 # The platforms this integration forwards. One home for the list (here, not in
 # const.py): `async_unload_entry` unloads whatever it names, so adding a
 # platform is a one-line change.
-PLATFORMS: Final = [Platform.SENSOR, Platform.SWITCH]
+PLATFORMS: Final = [Platform.BINARY_SENSOR, Platform.SENSOR, Platform.SWITCH]
 
 
 @dataclass
@@ -212,13 +213,23 @@ async def async_setup_entry(
             name=subentry.title,
         )
 
-    # The engine and its five adapters. The switch adapter's cycle_id provider
+    # The engine and its adapters. The switch adapter's cycle_id provider
     # closes over the sequencer built on the next statement — late-bound on
     # purpose, since the two reference each other (AD-7 needs the running
     # cycle's id to mint its one Context).
     clock = HaClock()
     journal = JournalAdapter(hass)
-    anomalies = AnomalyManager(hass)
+    # The anomaly manager (Story 3.1) is the ONE fan-out: Repairs, the push,
+    # the bus event and health. The push target is a `notify.*` entity read
+    # from the options — absent or unreadable means no push, said once in the
+    # log, never a setup failure. Options edits reach it through the reload
+    # regime, so a new target applies without an HA restart.
+    notify_target = parse_notify_target(entry.options)
+    anomalies = AnomalyManager(
+        hass,
+        entry,
+        notify=None if notify_target is None else HaNotifyAdapter(hass, notify_target),
+    )
     # The rain gauge (Story 2.4): read by the engine at quote time only, so
     # nothing is subscribed here and no `after_dependencies` is declared. The
     # option is required by the flow, but a stored entry is unvalidated input
@@ -285,6 +296,12 @@ async def async_setup_entry(
         tracker=tracker,
         config_fingerprint=config_fingerprint(entry),
     )
+    # ALSO before forwarding: the manager re-seeds its open set from the
+    # Repairs issues that survived the previous load, and the health binary
+    # sensor reads that set the moment it is added. Its stop is registered
+    # right after its start, like the tracker's below.
+    anomalies.async_start()
+    entry.async_on_unload(anomalies.async_stop)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # All three must run on every unload path: a surviving timer fails PHCC's
@@ -404,10 +421,12 @@ async def async_remove_entry(
     hass: HomeAssistant,
     entry: HaIrrigationConfigEntry,  # noqa: ARG001
 ) -> None:
-    """Delete the journal store when the integration is removed.
+    """Delete the journal store and every Repairs issue when the integration goes.
 
     A throwaway Store with the same key: `runtime_data` is gone by the time
     HA calls this hook, and `async_remove` only needs the key to delete the
-    `.storage` file.
+    `.storage` file. The issues are keyed by domain, not by entry, so they
+    need no runtime either.
     """
+    async_delete_domain_issues(hass)
     await Store(hass, JOURNAL_SCHEMA_VERSION, STORAGE_KEY).async_remove()

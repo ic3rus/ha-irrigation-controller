@@ -12,7 +12,8 @@
                     "morning_enabled": "Run a morning cycle",
                     "morning_start": "Morning start time",
                     "evening_start": "Evening start time",
-                    "actuation_timeout": "Actuation timeout"
+                    "actuation_timeout": "Actuation timeout",
+                    "notify_target": "Notify target"
                 },
                 "data_description": {
                     "pump_switch": "The switch that powers the pump feeding your valves.",
@@ -22,13 +23,15 @@
                     "morning_enabled": "Off by default: in spring the evening cycle alone is usually enough. The evening cycle always runs.",
                     "morning_start": "Local time the morning cycle starts, when it is enabled.",
                     "evening_start": "Local time the evening cycle starts.",
-                    "actuation_timeout": "Seconds to wait for a pump or valve switch to confirm a command before raising an anomaly. The cycle continues either way."
+                    "actuation_timeout": "Seconds to wait for a pump or valve switch to confirm a command before raising an anomaly. The cycle continues either way.",
+                    "notify_target": "Optional. A notify entity (for example your phone's companion app) that receives one push notification when an anomaly opens. Leave empty for no push notifications; anomalies still appear under Settings → Repairs."
                 }
             }
         },
         "error": {
             "start_times_conflict": "The morning and evening cycles cannot start at the same time. Change one of them, or turn the morning cycle off.",
-            "pump_is_own_entity": "This is the irrigation controller's own Season switch, not a physical pump. Pick the switch that powers your pump."
+            "pump_is_own_entity": "This is the irrigation controller's own Season switch, not a physical pump. Pick the switch that powers your pump.",
+            "notify_target_is_own_entity": "This is one of the irrigation controller's own entities, not a notify target. Pick the notify entity of a phone or messaging service."
         },
         "abort": {
             "already_configured": "This controller is already configured.",
@@ -114,7 +117,8 @@
                     "morning_enabled": "Run a morning cycle",
                     "morning_start": "Morning start time",
                     "evening_start": "Evening start time",
-                    "actuation_timeout": "Actuation timeout"
+                    "actuation_timeout": "Actuation timeout",
+                    "notify_target": "Notify target"
                 },
                 "data_description": {
                     "pump_switch": "The switch that powers the pump feeding your valves.",
@@ -124,7 +128,8 @@
                     "morning_enabled": "Off by default: in spring the evening cycle alone is usually enough. The evening cycle always runs.",
                     "morning_start": "Local time the morning cycle starts, when it is enabled.",
                     "evening_start": "Local time the evening cycle starts.",
-                    "actuation_timeout": "Seconds to wait for a pump or valve switch to confirm a command before raising an anomaly. The cycle continues either way."
+                    "actuation_timeout": "Seconds to wait for a pump or valve switch to confirm a command before raising an anomaly. The cycle continues either way.",
+                    "notify_target": "Optional. A notify entity (for example your phone's companion app) that receives one push notification when an anomaly opens. Empty the field to remove it; anomalies still appear under Settings → Repairs."
                 }
             }
         },
@@ -133,7 +138,8 @@
             "pump_is_zone_valve": "This switch is already used as a zone's valve. Pick the switch that powers the pump, not one that opens a valve.",
             "pump_is_own_entity": "This is the irrigation controller's own Season switch, not a physical pump. Pick the switch that powers your pump.",
             "cycles_overlap": "With these start times the morning cycle would still be watering when the evening cycle starts. Move the start times apart or shorten the zones.",
-            "evening_cycle_overlap": "With these start times the evening cycle would still be watering when the morning cycle starts. Move the start times apart or shorten the zones."
+            "evening_cycle_overlap": "With these start times the evening cycle would still be watering when the morning cycle starts. Move the start times apart or shorten the zones.",
+            "notify_target_is_own_entity": "This is one of the irrigation controller's own entities, not a notify target. Pick the notify entity of a phone or messaging service."
         }
     },
     "entity": {
@@ -156,6 +162,11 @@
         "switch": {
             "season": {
                 "name": "Season"
+            }
+        },
+        "binary_sensor": {
+            "health": {
+                "name": "Health"
             }
         }
     },
@@ -227,6 +238,85 @@
         },
         "cycles_overlap": {
             "message": "With this duration the morning and evening cycles would overlap. Shorten a zone or move the start times apart."
+        }
+    },
+    "issues": {
+        "pump_on_unconfirmed": {
+            "title": "Pump did not confirm turning on",
+            "fix_flow": {
+                "step": {
+                    "confirm": {
+                        "title": "Pump did not confirm turning on",
+                        "description": "The pump switch `{entity_id}` did not report ON within the actuation timeout during cycle `{cycle_id}`. The cycle continued anyway (fail-wet): the zones ran their slots, possibly without pressure. Check the switch and the pump. Acknowledging clears this issue; it also clears itself when the pump next confirms turning on."
+                    }
+                }
+            }
+        },
+        "pump_off_unconfirmed": {
+            "title": "Pump did not confirm turning off",
+            "fix_flow": {
+                "step": {
+                    "confirm": {
+                        "title": "Pump did not confirm turning off",
+                        "description": "The pump switch `{entity_id}` did not report OFF within the actuation timeout at the end of cycle `{cycle_id}`. The pump may still be running against closed valves — check it now. Acknowledging clears this issue; it also clears itself when the pump next confirms turning off."
+                    }
+                }
+            }
+        },
+        "valve_open_unconfirmed": {
+            "title": "Valve did not confirm opening",
+            "fix_flow": {
+                "step": {
+                    "confirm": {
+                        "title": "Valve did not confirm opening",
+                        "description": "The valve `{entity_id}` of zone `{zone_id}` did not report ON within the actuation timeout during cycle `{cycle_id}`. The zone's slot elapsed anyway and the missed watering is carried forward as water debt. Check the valve and its switch. Acknowledging clears this issue; it also clears itself when the valve next confirms opening."
+                    }
+                }
+            }
+        },
+        "valve_close_unconfirmed": {
+            "title": "Valve did not confirm closing",
+            "fix_flow": {
+                "step": {
+                    "confirm": {
+                        "title": "Valve did not confirm closing",
+                        "description": "The valve `{entity_id}` of zone `{zone_id}` did not report OFF within the actuation timeout during cycle `{cycle_id}`. The valve may still be open — check it now; the cycle continued with the next zone. Acknowledging clears this issue; it also clears itself when the valve next confirms closing."
+                    }
+                }
+            }
+        },
+        "journal_save_failed": {
+            "title": "Cycle journal could not be saved",
+            "fix_flow": {
+                "step": {
+                    "confirm": {
+                        "title": "Cycle journal could not be saved",
+                        "description": "Home Assistant's storage refused a write of the irrigation journal. Watering continued; a restart during this window could lose the last transitions. Check the free space and the permissions of the `.storage` folder. Acknowledging clears this issue; it also clears itself when the next journal write succeeds."
+                    }
+                }
+            }
+        },
+        "configured_entity_missing": {
+            "title": "Configured entity is missing",
+            "fix_flow": {
+                "step": {
+                    "confirm": {
+                        "title": "Configured entity is missing",
+                        "description": "The entity `{entity_id}` (role: `{role}`, zone: `{zone_id}`) was removed from or disabled in the entity registry. Nothing is skipped: the next cycle still commands it and will report unconfirmed actuations. Restore or re-enable the entity, or reconfigure the controller or the zone. Acknowledging clears this issue; it also clears itself when the entity comes back enabled, or when the role is reconfigured to another entity or the zone deleted."
+                    }
+                }
+            }
+        },
+        "cycle_interrupted": {
+            "title": "A cycle was interrupted",
+            "fix_flow": {
+                "step": {
+                    "confirm": {
+                        "title": "A cycle was interrupted",
+                        "description": "Cycle `{cycle_id}` was interrupted while it was running (zone `{zone_id}`) because the integration was reloaded, disabled or removed. The open valve and the pump were closed; the cycle was not resumed and the missed watering is carried forward as water debt. Acknowledging clears this issue; it also clears itself when the next cycle completes or is cancelled."
+                    }
+                }
+            }
         }
     }
 }

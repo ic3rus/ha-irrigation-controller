@@ -20,12 +20,14 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from homeassistant.config_entries import ConfigEntryState, ConfigSubentry
 from homeassistant.const import ATTR_ENTITY_ID, STATE_OFF
-from homeassistant.helpers import entity_registry as er
+from homeassistant.core import callback
+from homeassistant.helpers import entity_registry as er, issue_registry as ir
 from homeassistant.helpers.entity_registry import EVENT_ENTITY_REGISTRY_UPDATED
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ha_irrigation_controller.const import (
     CONF_HUMIDITY_SENSOR,
+    CONF_NOTIFY_TARGET,
     CONF_PUMP_SWITCH,
     CONF_RAIN_SENSOR,
     CONF_TEMPERATURE_SENSOR,
@@ -103,9 +105,19 @@ def zone_of(entry: MockConfigEntry, title: str) -> ConfigSubentry:
 
 
 def record_anomalies(hass: HomeAssistant) -> list[Event]:
-    """Collect every anomaly event fired for the rest of the test."""
+    """Collect every anomaly event fired for the rest of the test.
+
+    The listener is a `@callback`: a bare `list.append` is a builtin, which
+    HA runs in the executor, so two events fired back to back could be
+    recorded out of order. Order matters to the tests below.
+    """
     events: list[Event] = []
-    hass.bus.async_listen(EVENT_HA_IRRIGATION_CONTROLLER, events.append)
+
+    @callback
+    def _record(event: Event) -> None:
+        events.append(event)
+
+    hass.bus.async_listen(EVENT_HA_IRRIGATION_CONTROLLER, _record)
     return events
 
 
@@ -286,7 +298,7 @@ async def test_a_live_valve_renamed_mid_cycle_is_closed_under_its_new_id(
     assert run.status is CycleStatus.COMPLETED
     assert entry.runtime_data is not runtime_data_before
     assert entry.runtime_data.plan.zones[0].valve_entity_id == NEW_VALVE
-    assert entry.runtime_data.anomalies.open_anomalies == frozenset()
+    assert entry.runtime_data.anomalies.open_anomalies == ()
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
@@ -398,7 +410,9 @@ async def test_removing_a_configured_valve_raises_an_anomaly_and_changes_nothing
     assert events[0].data["role"] == CONF_VALVE_SWITCH
     assert events[0].data["zone_id"] == zone_a.subentry_id
     anomalies = entry.runtime_data.anomalies
-    assert AnomalyKind.CONFIGURED_ENTITY_MISSING in anomalies.open_anomalies
+    assert AnomalyKind.CONFIGURED_ENTITY_MISSING in {
+        record.kind for record in anomalies.open_anomalies
+    }
     assert zone_of(entry, "Zone A").data[CONF_VALVE_SWITCH] == VALVE_1
     assert entry.runtime_data is runtime_data_before
     assert entry.state is ConfigEntryState.LOADED
@@ -551,11 +565,16 @@ async def test_an_entity_filling_two_roles_is_rewritten_in_one_write(
     await hass.async_block_till_done()
 
 
-async def test_disabling_a_configured_entity_raises_and_re_enabling_does_not(
+async def test_disabling_a_configured_entity_raises_and_re_enabling_clears(
     hass: HomeAssistant,
     entry: MockConfigEntry,
 ) -> None:
-    """`changes` carries the OLD value; the registry decides: disabled NOW → anomaly."""
+    """`changes` carries the OLD value; the registry decides: disabled NOW → anomaly.
+
+    Story 3.1 AC 3: re-enabling the pump deletes its
+    `configured_entity_missing:pump_switch` issue, fires `anomaly_cleared`
+    with the same role, and leaves health empty. The options never move.
+    """
     events = record_anomalies(hass)
     registry = er.async_get(hass)
 
@@ -565,12 +584,155 @@ async def test_disabling_a_configured_entity_raises_and_re_enabling_does_not(
     assert [event.data["anomaly"] for event in events] == ["configured_entity_missing"]
     assert events[0].data["entity_id"] == PUMP
     assert events[0].data["role"] == CONF_PUMP_SWITCH
+    issue_id = f"configured_entity_missing:{CONF_PUMP_SWITCH}"
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is not None
 
     registry.async_update_entity(PUMP, disabled_by=None)
     await hass.async_block_till_done()
 
-    assert len(events) == 1
+    assert [(event.data["event_type"], event.data["anomaly"]) for event in events] == [
+        ("anomaly", "configured_entity_missing"),
+        ("anomaly_cleared", "configured_entity_missing"),
+    ]
+    assert events[1].data["role"] == CONF_PUMP_SWITCH
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
+    assert entry.runtime_data.anomalies.open_anomalies == ()
     assert dict(entry.options) == CONTROLLER_OPTIONS
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_re_creating_a_removed_valve_clears_its_missing_issue(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+) -> None:
+    """Removed, then re-created under its stored id: `create` clears the zone's issue.
+
+    The valve's subject is its ZONE, so the issue is
+    `configured_entity_missing:<zone_id>` and the cleared payload names the
+    zone — the same keys the `anomaly` event carried.
+    """
+    events = record_anomalies(hass)
+    registry = er.async_get(hass)
+    zone_a = zone_of(entry, "Zone A")
+    issue_id = f"configured_entity_missing:{zone_a.subentry_id}"
+
+    registry.async_remove(VALVE_1)
+    await hass.async_block_till_done()
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is not None
+
+    recreated = registry.async_get_or_create(
+        "switch",
+        "test",
+        "valve_1_uid_again",
+        suggested_object_id=VALVE_1.split(".", 1)[1],
+    )
+    await hass.async_block_till_done()
+
+    assert recreated.entity_id == VALVE_1
+    assert [(event.data["event_type"], event.data["anomaly"]) for event in events] == [
+        ("anomaly", "configured_entity_missing"),
+        ("anomaly_cleared", "configured_entity_missing"),
+    ]
+    assert events[1].data["zone_id"] == zone_a.subentry_id
+    assert events[1].data["role"] == CONF_VALVE_SWITCH
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
+    assert entry.runtime_data.anomalies.open_anomalies == ()
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_re_creating_a_valve_disabled_does_not_clear_its_missing_issue(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+) -> None:
+    """An entity that comes back DISABLED is as unusable as a missing one.
+
+    The `create` clears nothing; the later re-enable (an `update`) does.
+    """
+    registry = er.async_get(hass)
+    zone_a = zone_of(entry, "Zone A")
+    issue_id = f"configured_entity_missing:{zone_a.subentry_id}"
+    registry.async_remove(VALVE_1)
+    await hass.async_block_till_done()
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is not None
+
+    recreated = registry.async_get_or_create(
+        "switch",
+        "test",
+        "valve_1_uid_disabled",
+        suggested_object_id=VALVE_1.split(".", 1)[1],
+        disabled_by=er.RegistryEntryDisabler.INTEGRATION,
+    )
+    await hass.async_block_till_done()
+
+    assert recreated.entity_id == VALVE_1
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is not None
+    assert len(entry.runtime_data.anomalies.open_anomalies) == 1
+
+    registry.async_update_entity(VALVE_1, disabled_by=None)
+    await hass.async_block_till_done()
+
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
+    assert entry.runtime_data.anomalies.open_anomalies == ()
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_reconfiguring_the_role_to_another_entity_clears_the_stale_missing_issue(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+) -> None:
+    """A missing entity that is no longer configured anywhere is superseded.
+
+    Removing the pump opens `configured_entity_missing:pump_switch`; no
+    registry event about `switch.other_pump` could ever clear it. The
+    options edit reloads the entry, and the rebuilt tracker's start clears
+    every open missing-entity anomaly whose id is not configured any more —
+    so it is neither re-seeded nor left on the health entity.
+    """
+    registry = er.async_get(hass)
+    issue_id = f"configured_entity_missing:{CONF_PUMP_SWITCH}"
+    registry.async_remove(PUMP)
+    await hass.async_block_till_done()
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is not None
+
+    hass.config_entries.async_update_entry(
+        entry,
+        options={**CONTROLLER_OPTIONS, CONF_PUMP_SWITCH: "switch.other_pump"},
+    )
+    await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
+    assert entry.runtime_data.anomalies.open_anomalies == ()
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_re_enabling_an_entity_that_was_never_reported_clears_nothing(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+) -> None:
+    """A clear for a subject with no open issue is a no-op: no event, no signal."""
+    events = record_anomalies(hass)
+    registry = er.async_get(hass)
+    # Disable while the tracker is stopped, so no report is made...
+    entry.runtime_data.tracker.async_stop()
+    registry.async_update_entity(PUMP, disabled_by=er.RegistryEntryDisabler.USER)
+    await hass.async_block_till_done()
+    entry.runtime_data.tracker.async_start()
+
+    # ...then re-enable with it running: nothing to clear.
+    registry.async_update_entity(PUMP, disabled_by=None)
+    await hass.async_block_till_done()
+
+    assert events == []
+    assert entry.runtime_data.anomalies.open_anomalies == ()
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
@@ -667,6 +829,7 @@ async def test_configured_entities_are_read_from_the_live_entry(
         CONTROLLER_OPTIONS[CONF_RAIN_SENSOR]: [(CONF_RAIN_SENSOR, None)],
         CONTROLLER_OPTIONS[CONF_TEMPERATURE_SENSOR]: [(CONF_TEMPERATURE_SENSOR, None)],
         CONTROLLER_OPTIONS[CONF_HUMIDITY_SENSOR]: [(CONF_HUMIDITY_SENSOR, None)],
+        CONTROLLER_OPTIONS[CONF_NOTIFY_TARGET]: [(CONF_NOTIFY_TARGET, None)],
         VALVE_1: [(CONF_VALVE_SWITCH, zone_of(entry, "Zone A").subentry_id)],
         VALVE_2: [(CONF_VALVE_SWITCH, zone_of(entry, "Zone B").subentry_id)],
     }
@@ -704,7 +867,7 @@ async def test_an_entity_without_a_registry_entry_is_not_tracked(
     await hass.async_block_till_done()
 
     assert events == []
-    assert entry.runtime_data.anomalies.open_anomalies == frozenset()
+    assert entry.runtime_data.anomalies.open_anomalies == ()
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

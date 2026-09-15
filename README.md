@@ -304,8 +304,111 @@ Two limits:
 - A configured entity that is **removed** from the registry, or **disabled**,
   raises a `configured_entity_missing` anomaly naming the entity and its role.
   Nothing is skipped or unscheduled: the next cycle still commands it and
-  raises the usual unconfirmed-actuation anomalies. Like every anomaly in this
-  version, it stays open until the integration reloads.
+  raises the usual unconfirmed-actuation anomalies. The anomaly clears itself
+  when the entity is re-created (enabled) under its stored id or re-enabled,
+  and also when you point the role at another entity or delete the zone —
+  the reconfiguration supersedes it (see [Anomalies](#anomalies)).
+
+## Anomalies
+
+Everything that goes wrong reaches you through **one pipeline**, and nominal
+operation never uses it: completed cycles, rain reductions, skipped or waived
+cycles, the season being off, a run-now and reloads produce no notification,
+no issue and no event. A nominal week is silent.
+
+When something does go wrong, each anomaly fans out to four places at once:
+
+- a **Repairs issue** (Settings → System → Repairs), one per open anomaly —
+  the same fault reported again refreshes that issue rather than adding one;
+- **one push notification** to the configured *Notify target*, sent only when
+  the anomaly *opens* — never again while it stays open;
+- a `ha_irrigation_controller_event` **bus event** with `event_type: anomaly`
+  on every report (see the payloads below);
+- the controller's **Health** binary sensor (`device_class: problem`), which is
+  `on` while at least one anomaly is open.
+
+### Kinds
+
+| Anomaly | Raised when | Clears itself when |
+| --- | --- | --- |
+| `pump_on_unconfirmed` | the pump switch did not report ON within the actuation timeout | the pump next confirms turning **on** |
+| `pump_off_unconfirmed` | the pump switch did not report OFF within the timeout | the pump next confirms turning **off** |
+| `valve_open_unconfirmed` | a zone's valve did not report ON within the timeout | that zone's valve next confirms **opening** |
+| `valve_close_unconfirmed` | a zone's valve did not report OFF within the timeout | that zone's valve next confirms **closing** |
+| `journal_save_failed` | Home Assistant's storage refused a write of the cycle journal | the next journal write succeeds |
+| `configured_entity_missing` | a configured pump, valve, sensor or notify target was removed from or disabled in the entity registry | the entity is re-created (enabled) under its stored id or re-enabled; or the role is pointed at another entity or the zone deleted |
+| `cycle_interrupted` | a forced reload, a disable or a removal of the integration stopped a running cycle | the next cycle completes or is cancelled |
+
+Issues are **per subject**: an unconfirmed valve is one issue per zone, an
+unconfirmed pump one per pump entity, a missing entity one per zone (for a
+valve) or per role (for the pump, the sensors and the notify target);
+`journal_save_failed` and `cycle_interrupted` are one issue for the whole
+controller.
+
+A confirmation clears only the kind it proves: a confirmed ON clears the
+`*_on` / `*_open` anomaly of that pump or zone, a confirmed OFF the `*_off` /
+`*_close` one. The trivially confirmed close of a valve that never opened
+therefore does **not** hide the failed open — that issue stays until the
+valve actually confirms opening (usually the next cycle) or you acknowledge
+it.
+
+### Acknowledging
+
+An anomaly stays open until it **clears itself** (the table above), or until
+you **acknowledge** it in Repairs — either the *Submit* button of its fix
+dialog or *Ignore*. Both remove the issue and turn the Health sensor off; if
+the same fault happens again later you get a fresh issue and a fresh push.
+Acknowledging never changes the schedule: the anomaly is a report, not a
+switch.
+
+Issues are not persisted across a Home Assistant restart. They do survive a
+reload of the integration, and the pipeline re-reads them on start, so an
+options edit does not re-notify you about an anomaly you already know of.
+Removing the integration deletes its issues.
+
+### Notify target
+
+The **Notify target** option on the controller is a `notify.*` *entity* — for
+the companion app that is `notify.mobile_app_<your phone>`. It is optional and
+can be cleared by emptying the picker: without one, anomalies still appear in
+Repairs, on the Health sensor and on the bus; they are just not pushed, and
+the log says so once at setup. Changing it applies through the normal
+cycle-aware reload — no Home Assistant restart. The push is best-effort: a
+target that is unavailable or fails is a warning in the log, never a further
+anomaly. Legacy `notify.<service>` service names are not supported; pick the
+entity.
+
+### Health sensor
+
+The **Health** binary sensor on the controller device is `on` while at least
+one anomaly is open and carries two attributes:
+
+- `open_anomalies` — a list of `{"anomaly": <kind>, ...}` entries with the
+  subject keys of each open anomaly (`zone_id`, `entity_id` or `role`);
+- `last_anomaly` — the most recent report, kind plus its full context; kept
+  after it clears, so you can see what went wrong last.
+
+### Bus events for automations
+
+One event type, discriminated by `event_type`:
+
+```yaml
+# Every report — the payload is the anomaly's context plus these two keys
+event_type: anomaly
+anomaly: valve_open_unconfirmed
+cycle_id: 2026-07-31-morning
+zone_id: 01J...            # the zone's subentry id
+entity_id: switch.zone_1_valve
+
+# Every automatic clear — the kind plus the subject keys only
+event_type: anomaly_cleared
+anomaly: valve_open_unconfirmed
+zone_id: 01J...
+```
+
+`anomaly` events fire on every occurrence (including a fault that is already
+open); `anomaly_cleared` fires when the engine confirms the subject healthy
+again, not when you acknowledge an issue by hand.
 
 ## Development
 

@@ -56,6 +56,7 @@ from .const import (
     CONF_MORNING_DURATION,
     CONF_MORNING_ENABLED,
     CONF_MORNING_START,
+    CONF_NOTIFY_TARGET,
     CONF_PUMP_SWITCH,
     CONF_RAIN_EXPOSED,
     CONF_RAIN_FACTOR,
@@ -111,6 +112,7 @@ ERROR_VALVE_IS_PUMP = "valve_is_pump"
 # operator must be told which picker to change.
 ERROR_PUMP_IS_OWN_ENTITY = "pump_is_own_entity"
 ERROR_VALVE_IS_OWN_ENTITY = "valve_is_own_entity"
+ERROR_NOTIFY_TARGET_IS_OWN_ENTITY = "notify_target_is_own_entity"
 ERROR_VALVE_ALREADY_CONFIGURED = "valve_already_configured"
 ERROR_VALVE_NOT_FOUND = "valve_not_found"
 ERROR_NAME_REQUIRED = "name_required"
@@ -259,6 +261,11 @@ def build_controller_schema() -> vol.Schema:
                     unit_of_measurement="s",
                 ),
             ),
+            # The anomaly push target (Story 3.1): a notify ENTITY, optional
+            # and clearable like the weather sensors, hence no `default=`.
+            vol.Optional(CONF_NOTIFY_TARGET): EntitySelector(
+                EntitySelectorConfig(domain="notify"),
+            ),
         },
     )
 
@@ -281,14 +288,21 @@ def _normalize_controller_input(
     The timeout is rounded to int seconds for the same reason zone durations
     are rounded to int minutes: `NumberSelector` coerces to float, and the
     stored contract (and the engine parser) wants whole seconds.
+
+    The notify target, when given, is resolved to an entity_id too: the
+    registry tracker follows it by entity id, and `parse_notify_target`
+    would otherwise read a registry id as garbage and push nothing.
     """
-    return {
+    normalized = {
         **user_input,
         CONF_PUMP_SWITCH: _resolve_entity_id(hass, user_input[CONF_PUMP_SWITCH]),
         CONF_MORNING_START: cv.time(user_input[CONF_MORNING_START]).isoformat(),
         CONF_EVENING_START: cv.time(user_input[CONF_EVENING_START]).isoformat(),
         CONF_ACTUATION_TIMEOUT: _round_whole(user_input[CONF_ACTUATION_TIMEOUT]),
     }
+    if (target := user_input.get(CONF_NOTIFY_TARGET)) is not None:
+        normalized[CONF_NOTIFY_TARGET] = _resolve_entity_id(hass, target)
+    return normalized
 
 
 def validate_controller_input(
@@ -324,6 +338,11 @@ def validate_controller_input(
             if subentry.data.get(CONF_VALVE_SWITCH) == pump:
                 errors[CONF_PUMP_SWITCH] = ERROR_PUMP_IS_ZONE_VALVE
                 break
+    # Same guard as the pump, same reason: an entity of ours as the push
+    # target would call back into the integration from its own anomaly path.
+    target = user_input.get(CONF_NOTIFY_TARGET)
+    if isinstance(target, str) and _is_own_entity(hass, target):
+        errors[CONF_NOTIFY_TARGET] = ERROR_NOTIFY_TARGET_IS_OWN_ENTITY
     if user_input.get(CONF_MORNING_ENABLED) and user_input.get(
         CONF_MORNING_START,
     ) == user_input.get(CONF_EVENING_START):

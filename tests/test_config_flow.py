@@ -18,6 +18,7 @@ from custom_components.ha_irrigation_controller.const import (
     CONF_HUMIDITY_SENSOR,
     CONF_MORNING_ENABLED,
     CONF_MORNING_START,
+    CONF_NOTIFY_TARGET,
     CONF_PUMP_SWITCH,
     CONF_RAIN_SENSOR,
     CONF_TEMPERATURE_SENSOR,
@@ -110,6 +111,8 @@ async def test_user_flow_creates_entry_without_optional_sensors(
     assert result["options"] == _MINIMAL_INPUT
     assert CONF_TEMPERATURE_SENSOR not in result["options"]
     assert CONF_HUMIDITY_SENSOR not in result["options"]
+    # The notify target (Story 3.1) is optional the same way.
+    assert CONF_NOTIFY_TARGET not in result["options"]
 
 
 async def test_user_flow_rejects_identical_start_times(hass: HomeAssistant) -> None:
@@ -574,3 +577,98 @@ async def test_options_flow_rejects_our_own_season_switch_as_the_pump(
     await hass.async_block_till_done()
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert entry.options[CONF_PUMP_SWITCH] == "switch.other_pump"
+
+
+# --------------------------------------------------------------------------
+# Story 3.1 — the notify target option
+# --------------------------------------------------------------------------
+
+
+async def test_options_flow_clears_the_notify_target(hass: HomeAssistant) -> None:
+    """The target, once set, can be cleared by emptying its picker (no `default`)."""
+    entry = controller_entry()
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            key: value
+            for key, value in CONTROLLER_OPTIONS.items()
+            if key != CONF_NOTIFY_TARGET
+        },
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert CONF_NOTIFY_TARGET not in entry.options
+    assert entry.state is ConfigEntryState.LOADED
+
+
+async def test_a_notify_target_given_as_a_registry_id_is_stored_as_an_entity_id(
+    hass: HomeAssistant,
+) -> None:
+    """Pin "entity ids everywhere": the tracker and the parser rely on it."""
+    phone = er.async_get(hass).async_get_or_create(
+        "notify",
+        "mobile_app",
+        "phone_uid",
+        suggested_object_id="mobile_app_phone",
+    )
+    entry = controller_entry()
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={**CONTROLLER_OPTIONS, CONF_NOTIFY_TARGET: phone.id},
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_NOTIFY_TARGET] == "notify.mobile_app_phone"
+
+
+async def test_options_flow_rejects_our_own_entity_as_the_notify_target(
+    hass: HomeAssistant,
+) -> None:
+    """Same guard as the pump: an entity of ours is never the push target.
+
+    The integration publishes no notify entity today, so the guard is
+    exercised through a registry entry filed under our platform.
+    """
+    own = er.async_get(hass).async_get_or_create(
+        "notify",
+        DOMAIN,
+        "own_notify_uid",
+        suggested_object_id="irrigation_own",
+    )
+    entry = controller_entry()
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={**CONTROLLER_OPTIONS, CONF_NOTIFY_TARGET: own.entity_id},
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_NOTIFY_TARGET: "notify_target_is_own_entity"}
+    assert entry.options[CONF_NOTIFY_TARGET] == CONTROLLER_OPTIONS[CONF_NOTIFY_TARGET]
+
+    # Recovery: a real target saves through the same open form.
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            **CONTROLLER_OPTIONS,
+            CONF_NOTIFY_TARGET: "notify.mobile_app_tablet",
+        },
+    )
+    await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_NOTIFY_TARGET] == "notify.mobile_app_tablet"

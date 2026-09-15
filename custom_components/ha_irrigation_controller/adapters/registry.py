@@ -14,7 +14,10 @@ zone files FAILED cycle after cycle. This adapter makes the convention hold:
   its role, and NOTHING else changes: the stored id and the schedule stay,
   and the next cycle's commands raise the usual `*_UNCONFIRMED` kinds
   (fail-wet, AD-4). Never a silent skip (NFR1), never a removal of the entry
-  (unlike `switch_as_x`).
+  (unlike `switch_as_x`);
+- **reappearance clears it** (Story 3.1) — the entity re-created under its
+  stored id or re-enabled clears the `CONFIGURED_ENTITY_MISSING` of every
+  role it fills, so health mirrors the registry rather than the reload.
 
 Why not core's `helpers.helper_integration.async_handle_source_entity_changes`:
 it tracks ONE source entity per call with hardcoded semantics (removing the
@@ -44,6 +47,7 @@ from homeassistant.helpers.event import async_track_entity_registry_updated_even
 
 from ..const import (  # noqa: TID252
     CONF_HUMIDITY_SENSOR,
+    CONF_NOTIFY_TARGET,
     CONF_PUMP_SWITCH,
     CONF_RAIN_SENSOR,
     CONF_TEMPERATURE_SENSOR,
@@ -62,13 +66,14 @@ if TYPE_CHECKING:
     from .switches import VerifiedSwitchAdapter
 
 # The controller-level roles, in `entry.options`. Every one is an entity id
-# when present; the two weather sensors are optional and simply absent when
-# the operator left them empty.
+# when present; the two weather sensors and the notify target are optional
+# and simply absent when the operator left them empty.
 _OPTION_ROLES: tuple[str, ...] = (
     CONF_PUMP_SWITCH,
     CONF_RAIN_SENSOR,
     CONF_TEMPERATURE_SENSOR,
     CONF_HUMIDITY_SENSOR,
+    CONF_NOTIFY_TARGET,
 )
 
 # One configured occurrence of an entity: which stored key holds it and, for a
@@ -117,11 +122,25 @@ class ConfiguredEntityTracker:
 
     @callback
     def async_start(self) -> None:
-        """Subscribe to registry updates for every configured entity id."""
+        """Subscribe to registry updates for every configured entity id.
+
+        Also clears every open `CONFIGURED_ENTITY_MISSING` whose entity is
+        no longer configured anywhere (Story 3.1): the operator pointed the
+        role at another entity or deleted the zone, which supersedes the
+        anomaly — no registry event will ever clear it, and the manager
+        would otherwise re-seed it on every reload.
+        """
         self.async_stop()
+        configured = self.configured_entities()
+        for record in self._anomalies.open_anomalies:
+            if (
+                record.kind is AnomalyKind.CONFIGURED_ENTITY_MISSING
+                and record.context.get("entity_id") not in configured
+            ):
+                self._anomalies.clear(record.kind, dict(record.context))
         self._unsubscribe = async_track_entity_registry_updated_event(
             self._hass,
-            list(self.configured_entities()),
+            list(configured),
             self._async_registry_updated,
         )
 
@@ -137,10 +156,18 @@ class ConfiguredEntityTracker:
         self,
         event: Event[EventEntityRegistryUpdatedData],
     ) -> None:
-        """Dispatch one registry event: rename → rewrite, gone → anomaly."""
+        """Dispatch one registry event: rename, disappearance or reappearance."""
         data = event.data
         if data["action"] == "remove":
             self._report_missing(data["entity_id"])
+        elif data["action"] == "create":
+            # A tracked id re-created (the integration providing it was set
+            # up again, or the operator re-added it): the anomaly its removal
+            # raised is superseded — unless it came back DISABLED (an entity
+            # disabled by default is as unusable as a missing one).
+            current = er.async_get(self._hass).async_get(data["entity_id"])
+            if current is not None and current.disabled_by is None:
+                self._clear_missing(data["entity_id"])
         elif data["action"] == "update":
             # Independent checks: one `async_update_entity` call can rename
             # AND disable in the same event, and the disabled check runs on
@@ -150,18 +177,39 @@ class ConfiguredEntityTracker:
             if "disabled_by" in data["changes"]:
                 # `changes` carries the OLD values, so the registry itself is
                 # what says whether the entity is disabled NOW. Re-enabling
-                # arrives through the same key and is deliberately ignored.
+                # arrives through the same key and clears (Story 3.1).
                 current = er.async_get(self._hass).async_get(data["entity_id"])
-                if current is not None and current.disabled_by is not None:
+                if current is None:
+                    return
+                if current.disabled_by is not None:
                     self._report_missing(data["entity_id"])
+                else:
+                    self._clear_missing(data["entity_id"])
 
     def _report_missing(self, entity_id: str) -> None:
         """Raise `CONFIGURED_ENTITY_MISSING` once per role the entity fills."""
+        for context in self._missing_contexts(entity_id):
+            self._anomalies.report(AnomalyKind.CONFIGURED_ENTITY_MISSING, context)
+
+    def _clear_missing(self, entity_id: str) -> None:
+        """Clear `CONFIGURED_ENTITY_MISSING` for every role the entity fills.
+
+        The same contexts as the report, so the manager finds the same
+        subjects (the zone for a valve, the option key otherwise). Clearing
+        a role that was never reported is a no-op on the manager's side.
+        """
+        for context in self._missing_contexts(entity_id):
+            self._anomalies.clear(AnomalyKind.CONFIGURED_ENTITY_MISSING, context)
+
+    def _missing_contexts(self, entity_id: str) -> list[dict[str, object]]:
+        """Return one anomaly context per role `entity_id` fills (live entry)."""
+        contexts: list[dict[str, object]] = []
         for role, zone_id in self.configured_entities().get(entity_id, []):
             context: dict[str, object] = {"entity_id": entity_id, "role": role}
             if zone_id is not None:
                 context["zone_id"] = zone_id
-            self._anomalies.report(AnomalyKind.CONFIGURED_ENTITY_MISSING, context)
+            contexts.append(context)
+        return contexts
 
     def _follow_rename(self, old_entity_id: str, new_entity_id: str) -> None:
         """Rewrite every stored occurrence of `old_entity_id`, then re-subscribe.
