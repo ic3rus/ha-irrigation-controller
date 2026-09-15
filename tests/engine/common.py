@@ -113,18 +113,21 @@ class FakeJournalPort:
 
 
 class FakeRainPort:
-    """A settable rain gauge (Story 2.4).
+    """A settable rain gauge (Stories 2.4, 2.5).
 
     `total` is what `total_mm()` answers — the cumulative mm, or None for a
     doubtful gauge. `raising` makes it leak a `PortError` instead: a real
     adapter is supposed to translate every doubtful reading into None, and
     the engine must survive one that does not. `reads` counts the calls so a
-    test can pin "read once per cycle, at quote time".
+    test can pin "read once per cycle, at quote time". `source_id` is the
+    gauge's identity (Story 2.5), settable so a test can swap or rename the
+    gauge under a running sequencer the way a reload would.
     """
 
-    def __init__(self, total: float | None = None) -> None:
-        """Start with `total` on the gauge and nothing raising."""
+    def __init__(self, total: float | None = None, source_id: str = "gauge") -> None:
+        """Start with `total` on the gauge, identity `source_id`, nothing raising."""
         self.total = total
+        self.source_id = source_id
         self.raising = False
         self.reads = 0
 

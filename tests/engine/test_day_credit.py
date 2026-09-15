@@ -202,6 +202,7 @@ async def test_the_waived_record_is_the_snapshot_a_real_run_would_have_had() -> 
         "configured_start": "2026-07-31T05:00:00+00:00",
         "scheduled_start": "2026-07-31T05:00:00+00:00",
         "ended_at": "2026-07-31T05:00:00+00:00",
+        "rain_total_mm": None,
         "zones": [
             {
                 "zone_id": "zone-1",
@@ -556,6 +557,7 @@ async def test_an_outstanding_deficit_survives_a_waived_cycle() -> None:
             "deficits": {"zone-1": 300},
             "day_credit": CREDIT_31,
             "rain_baselines": {},
+            "rain_source": None,
         },
     )
     clock = VirtualClock(aware(7))
@@ -578,6 +580,7 @@ async def test_an_outstanding_deficit_survives_a_waived_cycle() -> None:
         "deficits": {"zone-1": 300},
         "day_credit": None,
         "rain_baselines": {},
+        "rain_source": None,
     }
 
     clock.advance_to(aware(20))

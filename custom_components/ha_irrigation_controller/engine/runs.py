@@ -198,6 +198,15 @@ class CycleRun:
     settled zone's rain baseline to — so rain falling DURING the cycle is
     banked for the next one rather than lost. Settlement needs no second
     gauge read because of it.
+
+    `rain_source` (Story 2.5) is the identity of the gauge that produced
+    `rain_total_mm` — the rain port's `source_id`, frozen at quote time next
+    to the total and serialized with it, None when there is no gauge. The
+    ledger compares it to the source its baselines were banked under when
+    it quotes (a foreign gauge credits nothing) and stamps it as the new
+    source when the run settles with a readable total. Snapshotting it here
+    is what lets settlement re-bank under the right gauge without a second
+    port read, even after a restart or a mid-cycle sensor change.
     """
 
     cycle_id: str
@@ -211,6 +220,7 @@ class CycleRun:
     pump_off_confirmed: bool | None = None
     manual: bool = False
     rain_total_mm: float | None = None
+    rain_source: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         """Return a plain serializable snapshot of this cycle run."""
@@ -225,6 +235,7 @@ class CycleRun:
             "pump_off_confirmed": self.pump_off_confirmed,
             MANUAL_KEY: self.manual,
             "rain_total_mm": self.rain_total_mm,
+            "rain_source": self.rain_source,
             "zones": [zone.as_dict() for zone in self.zone_runs],
         }
 

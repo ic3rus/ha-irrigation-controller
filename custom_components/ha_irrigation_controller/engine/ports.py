@@ -41,7 +41,7 @@ class SwitchPort(Protocol):
 
 
 class RainPort(Protocol):
-    """Read seam for the rain gauge (Story 2.4, FR14) — the rain credit's ONE input.
+    """Read seam for the rain gauge (FR14, FR15) — the rain credit's ONE input.
 
     `total_mm()` returns the gauge's CUMULATIVE precipitation total in
     millimetres, or `None` when the reading is doubtful — missing entity,
@@ -51,12 +51,28 @@ class RainPort(Protocol):
     "no modulation for this quote", never an anomaly: fail-wet (AD-4) reads a
     doubtful gauge as "it did not rain".
 
+    `source_id` is the gauge's IDENTITY (Story 2.5) — an opaque string the
+    engine compares for equality and nothing else. The ledger banks its rain
+    baselines under the source that produced them, and a total from any
+    other source is not comparable to them: baselines banked under one
+    source never credit another. So swapping the gauge for one whose
+    cumulative total is higher credits nothing (instead of its whole
+    lifetime total) and simply re-banks under the new source — the fail-wet
+    direction. The adapter answers with the configured entity id, so a
+    rename costs one banking cycle too; accepted.
+
     Synchronous on purpose: a Home Assistant state read is synchronous, and
     the sequencer quotes inside `_build_run`, which is synchronous too. The
     engine reads the port exactly once per QUOTE (`_build_run` — a scheduled
     dispatch that ends waived and a deferred pop are quotes too) and
-    snapshots the value on the run (AD-8) — never during or after a cycle.
+    snapshots the value AND the source on the run (AD-8) — never during or
+    after a cycle.
     """
+
+    @property
+    def source_id(self) -> str:
+        """Return the opaque identity of the gauge this port reads."""
+        ...
 
     def total_mm(self) -> float | None:
         """Return the cumulative rain total in mm, or None when doubtful."""

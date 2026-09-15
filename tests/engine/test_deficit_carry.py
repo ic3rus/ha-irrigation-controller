@@ -142,6 +142,7 @@ async def test_a_failed_open_extends_the_next_run_of_that_kind() -> None:
         "deficits": {},
         "day_credit": None,
         "rain_baselines": {},
+        "rain_source": None,
     }
 
 
@@ -198,6 +199,7 @@ async def test_a_partial_cancel_books_each_zones_shortfall() -> None:
         "deficits": {"zone-2": 480, "zone-3": 600},
         "day_credit": None,
         "rain_baselines": {},
+        "rain_source": None,
     }
 
 
@@ -253,6 +255,7 @@ async def test_the_completion_snapshot_already_carries_the_settlement() -> None:
             "deficits": {},
             "day_credit": None,
             "rain_baselines": {},
+            "rain_source": None,
         }
         for snapshot in journal.snapshots
     )
@@ -271,6 +274,7 @@ async def test_the_completion_snapshot_already_carries_the_settlement() -> None:
         "deficits": {"zone-1": 600},
         "day_credit": None,
         "rain_baselines": {},
+        "rain_source": None,
     }
     assert journal.snapshots[-1]["ledger"] == completion["ledger"]
 
@@ -326,6 +330,7 @@ async def test_a_suspend_settles_nothing_and_the_deficit_is_re_applied() -> None
         "deficits": {"zone-1": 300},
         "day_credit": None,
         "rain_baselines": {},
+        "rain_source": None,
     }
     sequencer, _, journal, _ = make_sequencer(two_zone_plan(), ledger=seed)
     clock = VirtualClock(aware(7))
@@ -410,6 +415,7 @@ async def test_a_run_now_applies_and_settles_the_deficit() -> None:
             "cycle_id": "2026-07-31-morning-2",
         },
         "rain_baselines": {},
+        "rain_source": None,
     }
 
 
@@ -442,6 +448,7 @@ async def test_without_a_seed_the_first_run_is_quoted_on_base() -> None:
         "deficits": {},
         "day_credit": None,
         "rain_baselines": {},
+        "rain_source": None,
     }
 
 

@@ -1,4 +1,4 @@
-"""Rain sensor adapter — the ONE implementation of `RainPort` (Story 2.4).
+"""Rain sensor adapter — the ONE implementation of `RainPort` (Stories 2.4, 2.5).
 
 The engine reads the gauge through `engine.ports.RainPort` exactly once per
 cycle, at quote time (`Sequencer._build_run`); this adapter is what answers.
@@ -9,19 +9,31 @@ the two things the engine must never do (AD-1):
   non-numeric, non-finite or negative state and an unknown unit all read as
   `None`, which the engine takes as "no modulation for this cycle": full
   durations, no anomaly. Fail-wet (AD-4): a doubtful gauge never skips
-  water. This is the MINIMUM guard; Story 2.5 owns the full matrix
-  (gauge-reset policy, late-arriving data).
+  water. Everything downstream of the reading — a total that decreased
+  (gauge reset), a total from another gauge, a total that jumped after a
+  connectivity gap — is the ledger's arithmetic, not this adapter's: the
+  clamp is the whole reset policy and there is no plausibility cap here.
 - CONVERT units to millimetres — `mm` (or no unit attribute) as is, `cm`
   *10, `in` *25.4, per Home Assistant's `UnitOfPrecipitationDepth`. The
   engine speaks mm only.
 
 The entity is whatever the operator picked in the generic precipitation
 picker (`config_flow.py`, `_DEVICE_CLASS_PRECIPITATION`): any cumulative
-precipitation sensor, nothing vendor-specific. Renames are followed by the
-registry tracker rewriting the option, which reloads the entry — so this
-adapter is simply rebuilt with the new id and holds no subscription of its
-own. Every `None` is logged at DEBUG (never higher: a transient sensor gap is
-not an operator-facing fault, and 2.5 decides what is).
+precipitation sensor, nothing vendor-specific. Its entity id is also the
+port's `source_id` (Story 2.5): the identity the ledger banks its baselines
+under, so a total from a different entity never credits rain measured by the
+previous one. Renames are followed by the registry tracker rewriting the
+option, which reloads the entry — so this adapter is simply rebuilt with the
+new id and holds no subscription of its own. The new id is a new source,
+and the cost of a rename is therefore ONE banking cycle: the next cycle
+waters in full and re-banks, the one after modulates. Accepted rather than
+looked up in the registry: that would add a hass dependency for a case the
+operator cannot notice. Every `None` is logged at DEBUG, never higher: a
+transient sensor gap is not an operator-facing fault, and a gauge doubtful
+for weeks is deliberately just as silent — the operator reads
+`rain_total_mm: null` in history. The registry tracker's
+CONFIGURED_ENTITY_MISSING on a removed or disabled sensor is the one fault
+surfaced.
 """
 
 from __future__ import annotations
@@ -63,6 +75,11 @@ class RainSensorAdapter:
         """Bind the adapter to the configured precipitation entity."""
         self._hass = hass
         self._entity_id = entity_id
+
+    @property
+    def source_id(self) -> str:
+        """Return the configured entity id — the identity baselines are banked under."""
+        return self._entity_id
 
     def total_mm(self) -> float | None:
         """Return the gauge's cumulative total in mm, or None when doubtful."""

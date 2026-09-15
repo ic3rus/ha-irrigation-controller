@@ -61,6 +61,17 @@ def history_entry(
     no `rain_credit_s` key and are not backfilled — Epic 4's reader defaults
     it, as it does `planned_s`.
 
+    The cycle record carries the run's quote-time gauge reading,
+    `rain_total_mm` (Story 2.5): a number when the gauge was readable and
+    the cycle was modulated from it, `null` when there was no gauge or its
+    reading was DOUBTFUL (unavailable, non-numeric, raising, ...) and the
+    cycle watered in full. `null` is deliberately distinct from "no rain" —
+    no rain is a number equal to the previous cycle's with `rain_credit_s:
+    0` on every zone. It is the one signal that says "modulation was off for
+    this cycle" without an anomaly, since a doubtful gauge raises none
+    however long it stays doubtful; Epic 4's history view reads it, and
+    records written before 2.5 have no such key and are not backfilled.
+
     `waived_by` (Story 2.3) is the id of the completed run-now whose day
     credit excused this cycle, on a record filed with `status: "waived"`; it
     is written on EVERY record — `None` for a cycle that ran — so Epic 4's
@@ -82,6 +93,7 @@ def history_entry(
         "configured_start": utc_iso(run.configured_start),
         "scheduled_start": utc_iso(run.scheduled_start),
         "ended_at": utc_iso(ended_at),
+        "rain_total_mm": run.rain_total_mm,
         "zones": [
             {
                 "zone_id": zone.zone_id,
