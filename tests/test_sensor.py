@@ -721,6 +721,7 @@ async def test_a_rain_skipped_zone_reports_zero_seconds_and_its_credit(
                 "deficits": {},
                 "day_credit": None,
                 "rain_baselines": {"zone-a": 0.0, "zone-b": 0.0},
+                "rain_source": "sensor.rain_gauge",
             },
         },
     }

@@ -945,6 +945,7 @@ async def test_a_journal_written_before_the_ledger_sets_up_and_quotes_on_base(
         "deficits": {},
         "day_credit": None,
         "rain_baselines": {},
+        "rain_source": None,
     }
 
     await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
@@ -1069,6 +1070,7 @@ async def test_a_seeded_day_credit_waives_the_same_days_first_scheduled_cycle(
                     "cycle_id": "2026-07-31-morning",
                 },
                 "rain_baselines": {},
+                "rain_source": None,
             },
         },
     }
@@ -1144,6 +1146,7 @@ async def test_seeded_rain_baselines_reach_the_engine_and_reduce_the_first_cycle
                 "deficits": {},
                 "day_credit": None,
                 "rain_baselines": {"zone-a": 12.0},
+                "rain_source": "sensor.rain_gauge",
             },
         },
     }
@@ -1236,6 +1239,158 @@ async def test_a_journal_written_before_rain_baselines_quotes_full_durations(
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
+
+
+async def test_a_journal_written_by_2_4_waters_in_full_once_then_modulates(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 2.5 AC 3: a pre-2.5 section (baselines, no `rain_source`) loads.
+
+    Zone A banked 12.0 under no known gauge, so the 15.5 reading is not
+    comparable: the morning cycle waters its full 600 s (no anomaly) and
+    settlement stamps the configured gauge as the source next to 15.5. The
+    evening cycle, with the gauge at 17.5, is modulated: 900 - 120 = 780 s.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    set_gauge(hass, "15.5")
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {
+            "schema_version": JOURNAL_SCHEMA_VERSION,
+            "history": [],
+            "ledger": {
+                "settled_cycle_id": "2026-07-30-evening",
+                "deficits": {},
+                "day_credit": None,
+                "rain_baselines": {"zone-a": 12.0},
+            },
+        },
+    }
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[
+            {**zone_subentry_data("Zone A", VALVE_1), "subentry_id": "zone-a"},
+        ],
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+    sequencer = entry.runtime_data.sequencer
+    assert sequencer.ledger.rain_baseline_mm("zone-a") == 12.0
+    assert sequencer.ledger.rain_source is None
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    run = sequencer.current_run
+    assert run is not None
+    assert (run.rain_total_mm, run.rain_source) == (15.5, "sensor.rain_gauge")
+    assert (run.zone_runs[0].duration_s, run.zone_runs[0].rain_credit_s) == (600, 0)
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    assert sequencer.ledger.as_dict()["rain_baselines"] == {"zone-a": 15.5}
+    assert sequencer.ledger.rain_source == "sensor.rain_gauge"
+
+    set_gauge(hass, "17.5")
+    await fire_at(hass, freezer, "2026-07-31 20:00:00+02:00")
+
+    run = sequencer.current_run
+    assert run is not None
+    assert (run.zone_runs[0].duration_s, run.zone_runs[0].rain_credit_s) == (780, 120)
+    assert entry.runtime_data.anomalies.open_anomalies == frozenset()
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_changing_the_rain_sensor_re_banks_on_the_next_cycle(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 2.5 AC 1 through the options: a new sensor is a new source.
+
+    The morning cycle banks 12.0 under `sensor.rain_gauge`. The operator
+    then picks `sensor.rain_gauge_2`, whose lifetime total is 1200 mm; the
+    entry reloads at once (nothing running) with an adapter bound to the
+    new id. The evening cycle credits NOTHING — without the source stamp it
+    would have skipped the zone on 1188 mm of rain that never fell here —
+    and settles 1200 under the new source; the next morning, at 1203, is
+    modulated by the 3 mm since (180 s).
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    set_gauge(hass, "12.0")
+    hass.states.async_set(
+        "sensor.rain_gauge_2", "1200.0", {"unit_of_measurement": "mm"}
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[
+            {**zone_subentry_data("Zone A", VALVE_1), "subentry_id": "zone-a"},
+        ],
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+    runtime_before = entry.runtime_data
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    assert runtime_before.sequencer.ledger.as_dict()["rain_baselines"] == {
+        "zone-a": 12.0
+    }
+    assert runtime_before.sequencer.ledger.rain_source == "sensor.rain_gauge"
+
+    hass.config_entries.async_update_entry(
+        entry,
+        options={**CONTROLLER_OPTIONS, CONF_RAIN_SENSOR: "sensor.rain_gauge_2"},
+    )
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+    assert entry.runtime_data is not runtime_before
+    register_switch_domain(hass)
+    sequencer = entry.runtime_data.sequencer
+    # The reload re-seeded the section written under the OLD gauge.
+    assert sequencer.ledger.rain_baseline_mm("zone-a") == 12.0
+    assert sequencer.ledger.rain_source == "sensor.rain_gauge"
+
+    await fire_at(hass, freezer, "2026-07-31 20:00:00+02:00")
+    run = sequencer.current_run
+    assert run is not None
+    assert (run.rain_total_mm, run.rain_source) == (1200.0, "sensor.rain_gauge_2")
+    assert (run.zone_runs[0].duration_s, run.zone_runs[0].rain_credit_s) == (900, 0)
+    await fire_at(hass, freezer, "2026-07-31 20:15:00+02:00")
+    assert sequencer.current_run is None
+    assert sequencer.ledger.as_dict()["rain_baselines"] == {"zone-a": 1200.0}
+    assert sequencer.ledger.rain_source == "sensor.rain_gauge_2"
+    assert entry.runtime_data.anomalies.open_anomalies == frozenset()
+
+    hass.states.async_set(
+        "sensor.rain_gauge_2", "1203.0", {"unit_of_measurement": "mm"}
+    )
+    await fire_at(hass, freezer, "2026-08-01 07:00:00+02:00")
+
+    run = sequencer.current_run
+    assert run is not None
+    assert (run.zone_runs[0].duration_s, run.zone_runs[0].rain_credit_s) == (420, 180)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    # The unload flushes the debounced journal: the new source is on disk.
+    assert hass_storage[STORAGE_KEY]["data"]["ledger"]["rain_source"] == (
+        "sensor.rain_gauge_2"
+    )
 
 
 async def test_an_entry_without_a_rain_sensor_quotes_unmodulated(

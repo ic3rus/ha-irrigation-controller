@@ -219,9 +219,41 @@ it.
 If the rain sensor is missing, `unknown`, `unavailable`, reports something that
 is not a finite non-negative number, or reports a unit the controller does not
 understand, rain modulation is simply disabled for that cycle: every zone
-waters its full duration and no anomaly is raised. A sensor total that
-*decreases* (a gauge reset) credits nothing. Sensors reporting in `mm`, `cm`
-and `in` are all read correctly.
+waters its full duration and no anomaly is raised — however long the sensor
+stays that way. Each cycle's history record carries the gauge reading it was
+quoted from (`rain_total_mm`); `null` there means no rain sensor is
+configured, or the gauge was doubtful for that cycle — as opposed to a reading
+that simply showed no rain. Sensors
+reporting in `mm`, `cm` and `in` are all read correctly.
+
+The controller expects a **cumulative total that never resets** — the
+lifetime or season total of the gauge. A *daily* (since-midnight) total works
+but over-waters: the morning cycle compares the overnight total against
+yesterday's whole-day baseline, so everything that fell between the evening
+cycle and the next morning's cycle is usually lost — and under-credited
+otherwise, whenever the overnight rain does not exceed the previous day's
+total. Lost rain only ever means more watering, never less. A sensor total that
+*decreases* (a gauge reset) credits nothing for that cycle and becomes the new
+baseline, so rain falling after the reset is credited from the next cycle on.
+
+**Changing the rain sensor** (picking another entity in the options, or a
+rename of the current one) re-banks: baselines are remembered together with
+the sensor they were read from, and a reading from a different sensor is never
+compared with them — even if the new sensor's total is much higher. The first
+cycle after the change waters in full and banks the new sensor's reading; the
+cycle after that is reduced as usual. Turning the **season** on does the same:
+the rain accumulated while the season was off is forgotten, the first cycle of
+the season waters in full, and modulation resumes from the second. Turning
+the season off and on again *during* the season also forgets the rain banked
+since the last cycle, so the next cycle waters in full (fail-wet). Turning the
+season off keeps the baselines.
+
+**Late-arriving readings**: some gauges upload their measurements in batches
+after a connectivity gap. Whatever the sensor's total is when a cycle is
+quoted is what counts, so rain that reaches the sensor late — including rain
+that fell before a cycle quoted during the gap — is credited to the *next*
+cycle in full. A watering that already happened is never undone or re-filed:
+its history record and the baselines it banked stand.
 
 `run_now` is rain-reduced like any other cycle: it runs the *current* effective
 durations. A run-now fired after rain that covers every zone completes at once

@@ -1,9 +1,12 @@
 """Rain sensor adapter: the ONE implementation of `RainPort` (Story 2.4).
 
-The adapter's whole job is the minimum fail-wet guard and the unit conversion
-the engine must never do (AD-1): every doubtful reading is `None` with a
-debug log, every known precipitation unit becomes millimetres. Story 2.5
-owns the rest of the input matrix.
+The adapter's whole job is the fail-wet guard on the reading and the unit
+conversion the engine must never do (AD-1): every doubtful reading is `None`
+with a debug log, every known precipitation unit becomes millimetres — and
+(Story 2.5) the configured entity id is the port's `source_id`, the identity
+the ledger banks its baselines under. What happens to a total once it is a
+number (resets, swaps, late data) is the ledger's arithmetic, pinned in
+`tests/engine`.
 """
 
 from __future__ import annotations
@@ -143,3 +146,22 @@ async def test_the_adapter_reads_the_live_state_on_every_call(
 
     set_gauge(hass, "16.0")
     assert adapter.total_mm() == 16.0
+
+
+async def test_source_id_is_the_configured_entity_id(hass: HomeAssistant) -> None:
+    """Story 2.5: the identity baselines are banked under is the entity id, verbatim.
+
+    It does not depend on the entity having a state (a missing gauge still
+    has an identity, so a doubtful quote still snapshots WHICH gauge was
+    doubtful), and a different id is a different source — which is what
+    makes a swap or a rename cost one banking cycle instead of crediting the
+    new gauge's lifetime total.
+    """
+    adapter = RainSensorAdapter(hass, GAUGE)
+    assert adapter.source_id == GAUGE
+
+    set_gauge(hass, "12.0")
+    assert adapter.source_id == GAUGE
+    assert (
+        RainSensorAdapter(hass, "sensor.other_gauge").source_id == "sensor.other_gauge"
+    )

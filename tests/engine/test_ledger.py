@@ -27,6 +27,8 @@ from custom_components.ha_irrigation_controller.engine.runs import (
 from tests.engine.common import aware, make_zone
 
 VALVE = "switch.zone_valve"
+# The gauge identity every baseline in this suite is banked under (Story 2.5).
+GAUGE = "gauge"
 
 
 def zone_run(  # noqa: PLR0913 — one keyword per field the ledger reads is the readable shape
@@ -80,11 +82,15 @@ def cycle_run(
     status: CycleStatus = CycleStatus.COMPLETED,
     manual: bool = False,
     rain_total_mm: float | None = None,
+    rain_source: str | None = GAUGE,
 ) -> CycleRun:
     """Build one terminal cycle run carrying `zones`; `manual` marks a run-now.
 
     `rain_total_mm` is the quote-time gauge reading the run snapshotted
-    (Story 2.4) — what settlement advances every zone's baseline to.
+    (Story 2.4) — what settlement advances every zone's baseline to — and
+    `rain_source` the gauge it came from (Story 2.5), which settlement
+    stamps next to them. The sequencer snapshots the source whenever a port
+    exists, readable or not, so the default is a source even with no total.
     """
     return CycleRun(
         cycle_id=cycle_id,
@@ -96,6 +102,7 @@ def cycle_run(
         status=status,
         manual=manual,
         rain_total_mm=rain_total_mm,
+        rain_source=rain_source,
     )
 
 
@@ -174,6 +181,7 @@ def test_quote_is_pure() -> None:
         "deficits": {"zone-1": 300},
         "day_credit": None,
         "rain_baselines": {},
+        "rain_source": None,
     }
 
 
@@ -195,12 +203,12 @@ def test_the_rain_credit_comes_off_the_base_before_the_deficit_is_added() -> Non
     clamps at 0 and the debt still runs — 100, never negative. The credit
     field records the UNCLAMPED worth of the rain.
     """
-    ledger = Ledger({"zone-1": 100}, rain_baselines={"zone-1": 10.0})
+    ledger = Ledger({"zone-1": 100}, rain_baselines={"zone-1": 10.0}, rain_source=GAUGE)
     zones = (make_zone("zone-1", morning_s=600),)
 
     (plain,) = ledger.quote(zones, CycleKind.MORNING)
-    (credited,) = ledger.quote(zones, CycleKind.MORNING, 10.0 + 200 / 60)
-    (soaked,) = ledger.quote(zones, CycleKind.MORNING, 100.0)
+    (credited,) = ledger.quote(zones, CycleKind.MORNING, 10.0 + 200 / 60, GAUGE)
+    (soaked,) = ledger.quote(zones, CycleKind.MORNING, 100.0, GAUGE)
 
     assert (plain.rain_credit_s, plain.quoted_s) == (0, 700)
     assert (credited.rain_credit_s, credited.quoted_s) == (200, 500)
@@ -217,10 +225,10 @@ def test_rain_since_the_baseline_is_credited_at_factor_times_sixty() -> None:
 
     3.5 mm * 1 min/mm * 60 = 210 s off a 600 s base: quoted 390.
     """
-    ledger = Ledger(rain_baselines={"zone-1": 12.0})
+    ledger = Ledger(rain_baselines={"zone-1": 12.0}, rain_source=GAUGE)
     zone = make_zone("zone-1", morning_s=600, rain_exposed=True, rain_factor=1.0)
 
-    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 15.5)
+    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 15.5, GAUGE)
 
     assert quote == ZoneQuote(
         "zone-1",
@@ -233,13 +241,13 @@ def test_rain_since_the_baseline_is_credited_at_factor_times_sixty() -> None:
 
 def test_the_rain_factor_scales_the_credit() -> None:
     """2.5 min/mm on 2 mm is 300 s; 0.5 min/mm on the same rain is 60 s."""
-    ledger = Ledger(rain_baselines={"zone-1": 0.0, "zone-2": 0.0})
+    ledger = Ledger(rain_baselines={"zone-1": 0.0, "zone-2": 0.0}, rain_source=GAUGE)
     zones = (
         make_zone("zone-1", morning_s=600, rain_factor=2.5),
         make_zone("zone-2", morning_s=600, rain_factor=0.5),
     )
 
-    heavy, light = ledger.quote(zones, CycleKind.MORNING, 2.0)
+    heavy, light = ledger.quote(zones, CycleKind.MORNING, 2.0, GAUGE)
 
     assert (heavy.rain_credit_s, heavy.quoted_s) == (300, 300)
     assert (light.rain_credit_s, light.quoted_s) == (60, 540)
@@ -251,10 +259,10 @@ def test_a_credit_covering_the_whole_base_quotes_zero() -> None:
     Zero is the skip signal for the sequencer; the credit itself is not
     clamped, so history can show the rain was worth more than the zone.
     """
-    ledger = Ledger(rain_baselines={"zone-1": 0.0})
+    ledger = Ledger(rain_baselines={"zone-1": 0.0}, rain_source=GAUGE)
     zone = make_zone("zone-1", morning_s=600)
 
-    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 12.0)
+    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 12.0, GAUGE)
 
     assert (quote.rain_credit_s, quote.quoted_s) == (720, 0)
 
@@ -264,10 +272,10 @@ def test_a_covered_zone_in_debt_still_runs_its_carried_seconds() -> None:
 
     The debt floor holds (FR13): rain excuses the base, never the debt.
     """
-    ledger = Ledger({"zone-1": 300}, rain_baselines={"zone-1": 0.0})
+    ledger = Ledger({"zone-1": 300}, rain_baselines={"zone-1": 0.0}, rain_source=GAUGE)
     zone = make_zone("zone-1", morning_s=600)
 
-    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 12.0)
+    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 12.0, GAUGE)
 
     assert quote == ZoneQuote(
         "zone-1",
@@ -280,20 +288,20 @@ def test_a_covered_zone_in_debt_still_runs_its_carried_seconds() -> None:
 
 def test_a_sheltered_zone_is_never_credited() -> None:
     """Matrix "sheltered zone": `rain_exposed=False` waters its full duration."""
-    ledger = Ledger(rain_baselines={"zone-1": 0.0})
+    ledger = Ledger(rain_baselines={"zone-1": 0.0}, rain_source=GAUGE)
     zone = make_zone("zone-1", morning_s=600, rain_exposed=False)
 
-    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 50.0)
+    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 50.0, GAUGE)
 
     assert (quote.rain_credit_s, quote.quoted_s) == (0, 600)
 
 
 def test_a_factor_of_zero_disables_the_credit() -> None:
     """Matrix "factor 0": exposed, but 0 min/mm credits nothing."""
-    ledger = Ledger(rain_baselines={"zone-1": 0.0})
+    ledger = Ledger(rain_baselines={"zone-1": 0.0}, rain_source=GAUGE)
     zone = make_zone("zone-1", morning_s=600, rain_factor=0.0)
 
-    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 50.0)
+    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 50.0, GAUGE)
 
     assert (quote.rain_credit_s, quote.quoted_s) == (0, 600)
 
@@ -307,7 +315,7 @@ def test_a_zone_with_no_baseline_is_not_credited() -> None:
     ledger = Ledger()
     zone = make_zone("zone-1", morning_s=600)
 
-    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 12.0)
+    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 12.0, GAUGE)
 
     assert (quote.rain_credit_s, quote.quoted_s) == (0, 600)
     assert ledger.rain_baseline_mm("zone-1") is None
@@ -315,10 +323,10 @@ def test_a_zone_with_no_baseline_is_not_credited() -> None:
 
 def test_a_none_reading_credits_nothing_to_any_zone() -> None:
     """Matrix "gauge unavailable at quote": None → every zone on full duration."""
-    ledger = Ledger(rain_baselines={"zone-1": 0.0, "zone-2": 0.0})
+    ledger = Ledger(rain_baselines={"zone-1": 0.0, "zone-2": 0.0}, rain_source=GAUGE)
     zones = (make_zone("zone-1", morning_s=600), make_zone("zone-2", morning_s=300))
 
-    quotes = ledger.quote(zones, CycleKind.MORNING, None)
+    quotes = ledger.quote(zones, CycleKind.MORNING, None, GAUGE)
 
     assert [(q.rain_credit_s, q.quoted_s) for q in quotes] == [(0, 600), (0, 300)]
     quotes = ledger.quote(zones, CycleKind.MORNING)
@@ -327,20 +335,20 @@ def test_a_none_reading_credits_nothing_to_any_zone() -> None:
 
 def test_a_total_below_the_baseline_clamps_to_no_credit() -> None:
     """Matrix "decreasing total": baseline 40.0, total 0.5 → credit 0, not negative."""
-    ledger = Ledger(rain_baselines={"zone-1": 40.0})
+    ledger = Ledger(rain_baselines={"zone-1": 40.0}, rain_source=GAUGE)
     zone = make_zone("zone-1", morning_s=600)
 
-    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 0.5)
+    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 0.5, GAUGE)
 
     assert (quote.rain_credit_s, quote.quoted_s) == (0, 600)
 
 
 def test_the_credit_is_floored_to_whole_seconds() -> None:
     """1.234 mm * 1 min/mm * 60 = 74.04 s → 74: less credit waters more (AD-4)."""
-    ledger = Ledger(rain_baselines={"zone-1": 0.0})
+    ledger = Ledger(rain_baselines={"zone-1": 0.0}, rain_source=GAUGE)
     zone = make_zone("zone-1", morning_s=600)
 
-    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 1.234)
+    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 1.234, GAUGE)
 
     assert quote.rain_credit_s == 74
     assert isinstance(quote.rain_credit_s, int)
@@ -348,11 +356,11 @@ def test_the_credit_is_floored_to_whole_seconds() -> None:
 
 def test_a_binary_float_artefact_does_not_shave_a_second_off_the_credit() -> None:
     """`(10.0 - 9.9) * 60` is `5.999…` in binary floats — the credit is 6 s, not 5."""
-    ledger = Ledger(rain_baselines={"zone-1": 9.9, "zone-2": 0.1})
+    ledger = Ledger(rain_baselines={"zone-1": 9.9, "zone-2": 0.1}, rain_source=GAUGE)
     zones = (make_zone("zone-1", morning_s=600), make_zone("zone-2", morning_s=600))
 
-    (fine,) = ledger.quote((zones[0],), CycleKind.MORNING, 10.0)
-    (coarse,) = ledger.quote((zones[1],), CycleKind.MORNING, 0.3)
+    (fine,) = ledger.quote((zones[0],), CycleKind.MORNING, 10.0, GAUGE)
+    (coarse,) = ledger.quote((zones[1],), CycleKind.MORNING, 0.3, GAUGE)
 
     assert (fine.rain_credit_s, fine.quoted_s) == (6, 594)
     assert (coarse.rain_credit_s, coarse.quoted_s) == (12, 588)
@@ -360,20 +368,20 @@ def test_a_binary_float_artefact_does_not_shave_a_second_off_the_credit() -> Non
 
 def test_an_absurd_total_overflowing_the_credit_reads_as_no_credit() -> None:
     """1e307 mm at 10 min/mm overflows to `inf`: fail-wet, full base, no exception."""
-    ledger = Ledger(rain_baselines={"zone-1": 0.0})
+    ledger = Ledger(rain_baselines={"zone-1": 0.0}, rain_source=GAUGE)
     zone = make_zone("zone-1", morning_s=600, rain_factor=10.0)
 
-    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 1e307)
+    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 1e307, GAUGE)
 
     assert (quote.rain_credit_s, quote.quoted_s) == (0, 600)
 
 
 def test_quoting_with_rain_writes_no_baseline() -> None:
     """Quote stays pure: the gauge reading is banked only when a run SETTLES."""
-    ledger = Ledger(rain_baselines={"zone-1": 12.0})
+    ledger = Ledger(rain_baselines={"zone-1": 12.0}, rain_source=GAUGE)
     zones = (make_zone("zone-1"), make_zone("zone-2"))
 
-    ledger.quote(zones, CycleKind.MORNING, 15.5)
+    ledger.quote(zones, CycleKind.MORNING, 15.5, GAUGE)
 
     assert ledger.as_dict()["rain_baselines"] == {"zone-1": 12.0}
     assert ledger.rain_baseline_mm("zone-2") is None
@@ -399,7 +407,7 @@ def test_settle_sets_every_zones_baseline_to_the_runs_quote_time_reading() -> No
     assert ledger.as_dict()["rain_baselines"] == {"zone-1": 10.0, "zone-2": 10.0}
     assert ledger.rain_baseline_mm("zone-1") == 10.0
     (quote,) = ledger.quote(
-        (make_zone("zone-1", morning_s=600),), CycleKind.MORNING, 14.0
+        (make_zone("zone-1", morning_s=600),), CycleKind.MORNING, 14.0, GAUGE
     )
     assert quote.rain_credit_s == 240
 
@@ -411,7 +419,9 @@ def test_settle_advances_the_baseline_of_a_failed_and_a_cancelled_zone_too() -> 
     and never-reached zones advance like the rest — their shortfall carries
     as a deficit instead.
     """
-    ledger = Ledger(rain_baselines={"zone-1": 0.0, "zone-2": 0.0, "zone-3": 0.0})
+    ledger = Ledger(
+        rain_baselines={"zone-1": 0.0, "zone-2": 0.0, "zone-3": 0.0}, rain_source=GAUGE
+    )
     run = cycle_run(
         zone_run("zone-1", quoted_s=420, rain_credit_s=180, watered_s=420),
         zone_run("zone-2", quoted_s=420, rain_credit_s=180, watered_s=120),
@@ -432,7 +442,7 @@ def test_settle_advances_the_baseline_of_a_failed_and_a_cancelled_zone_too() -> 
 
 def test_a_none_reading_at_settle_keeps_each_zones_baseline() -> None:
     """Matrix "gauge unavailable at quote": nothing was credited, nothing is spent."""
-    ledger = Ledger(rain_baselines={"zone-1": 5.0})
+    ledger = Ledger(rain_baselines={"zone-1": 5.0}, rain_source=GAUGE)
     run = cycle_run(zone_run("zone-1"), zone_run("zone-2"), rain_total_mm=None)
 
     ledger.settle(run)
@@ -442,7 +452,7 @@ def test_a_none_reading_at_settle_keeps_each_zones_baseline() -> None:
 
 def test_a_decreasing_total_still_becomes_the_new_baseline() -> None:
     """Matrix "decreasing total": settle banks 0.5 — a reset gauge resets the window."""
-    ledger = Ledger(rain_baselines={"zone-1": 40.0})
+    ledger = Ledger(rain_baselines={"zone-1": 40.0}, rain_source=GAUGE)
 
     ledger.settle(cycle_run(zone_run("zone-1"), rain_total_mm=0.5))
 
@@ -451,7 +461,7 @@ def test_a_decreasing_total_still_becomes_the_new_baseline() -> None:
 
 def test_a_baseline_for_a_zone_absent_from_the_settled_run_is_dropped() -> None:
     """Matrix "zone removed": baselines are REPLACED by the run's zones, as deficits."""
-    ledger = Ledger(rain_baselines={"zone-gone": 3.0, "zone-1": 1.0})
+    ledger = Ledger(rain_baselines={"zone-gone": 3.0, "zone-1": 1.0}, rain_source=GAUGE)
 
     ledger.settle(cycle_run(zone_run("zone-1"), rain_total_mm=7.0))
 
@@ -461,7 +471,7 @@ def test_a_baseline_for_a_zone_absent_from_the_settled_run_is_dropped() -> None:
 
 def test_a_none_reading_also_drops_a_removed_zones_baseline() -> None:
     """The replacement rule holds whatever the reading: absent from the run → gone."""
-    ledger = Ledger(rain_baselines={"zone-gone": 3.0, "zone-1": 1.0})
+    ledger = Ledger(rain_baselines={"zone-gone": 3.0, "zone-1": 1.0}, rain_source=GAUGE)
 
     ledger.settle(cycle_run(zone_run("zone-1"), rain_total_mm=None))
 
@@ -480,7 +490,7 @@ def test_a_replayed_settlement_leaves_the_baselines_alone() -> None:
 
 def test_a_skipped_zone_settles_to_no_deficit() -> None:
     """Matrix "fully covered": quoted 0, watered 0 → nothing owed, baseline advanced."""
-    ledger = Ledger(rain_baselines={"zone-1": 0.0})
+    ledger = Ledger(rain_baselines={"zone-1": 0.0}, rain_source=GAUGE)
     run = cycle_run(
         zone_run(
             "zone-1",
@@ -500,7 +510,7 @@ def test_a_skipped_zone_settles_to_no_deficit() -> None:
 
 def test_an_all_skipped_run_now_credits_the_day() -> None:
     """Matrix "run-now after rain": manual, COMPLETED, no shortfall → day credit."""
-    ledger = Ledger(rain_baselines={"zone-1": 0.0})
+    ledger = Ledger(rain_baselines={"zone-1": 0.0}, rain_source=GAUGE)
     run = cycle_run(
         zone_run(
             "zone-1",
@@ -533,7 +543,7 @@ def test_as_dict_from_dict_round_trip_with_baselines() -> None:
     assert rebuilt.as_dict() == ledger.as_dict()
     assert rebuilt.as_dict()["rain_baselines"] == {"zone-1": 12.0, "zone-2": 12.0}
     (quote,) = rebuilt.quote(
-        (make_zone("zone-1", morning_s=600),), CycleKind.MORNING, 15.5
+        (make_zone("zone-1", morning_s=600),), CycleKind.MORNING, 15.5, GAUGE
     )
     assert quote.rain_credit_s == 210
 
@@ -554,7 +564,7 @@ def test_from_dict_narrows_baselines_of_the_wrong_type_to_none() -> None:
 
 def test_seeded_baselines_are_read_back_as_floats() -> None:
     """An `int` in the seed is a legal baseline and comes back as `3.0`."""
-    ledger = Ledger(rain_baselines={"zone-1": 3})
+    ledger = Ledger(rain_baselines={"zone-1": 3}, rain_source=GAUGE)
 
     assert ledger.as_dict()["rain_baselines"] == {"zone-1": 3.0}
     assert isinstance(ledger.rain_baseline_mm("zone-1"), float)
@@ -562,13 +572,298 @@ def test_seeded_baselines_are_read_back_as_floats() -> None:
 
 def test_as_dict_returns_a_copy_of_the_baselines() -> None:
     """Mutating the section must not write through to the ledger (AD-6)."""
-    ledger = Ledger(rain_baselines={"zone-1": 3.0})
+    ledger = Ledger(rain_baselines={"zone-1": 3.0}, rain_source=GAUGE)
     section = ledger.as_dict()
     baselines = section["rain_baselines"]
     assert isinstance(baselines, dict)
     baselines["zone-1"] = 99.0
 
     assert ledger.rain_baseline_mm("zone-1") == 3.0
+
+
+# --------------------------------------------------------------------------
+# Rain source (Story 2.5): baselines banked under one gauge never credit another
+# --------------------------------------------------------------------------
+
+
+def test_a_total_from_another_source_credits_nothing_whatever_its_value() -> None:
+    """Matrix "gauge swapped upward": stored `sensor.a`/40, quote `sensor.b` 1200 → 0.
+
+    Without the source check the new gauge's whole lifetime total would be
+    credited and every exposed zone skipped — the fail-dry outcome FR15
+    forbids. The quote is unmodulated instead: 600 s.
+    """
+    ledger = Ledger(rain_baselines={"zone-1": 40.0}, rain_source="sensor.a")
+    zone = make_zone("zone-1", morning_s=600)
+
+    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 1200.0, "sensor.b")
+
+    assert (quote.rain_credit_s, quote.quoted_s) == (0, 600)
+    assert ledger.rain_source == "sensor.a"
+
+
+def test_a_foreign_source_still_runs_the_carried_deficit_in_full() -> None:
+    """Matrix "foreign source, zone in debt": no credit, full base + 300 → 900."""
+    ledger = Ledger(
+        {"zone-1": 300}, rain_baselines={"zone-1": 40.0}, rain_source="sensor.a"
+    )
+    zone = make_zone("zone-1", morning_s=600)
+
+    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 1200.0, "sensor.b")
+
+    assert quote == ZoneQuote(
+        "zone-1",
+        base_s=600,
+        rain_credit_s=0,
+        carried_s=300,
+        quoted_s=900,
+    )
+
+
+def test_a_quote_with_no_source_credits_nothing_even_from_a_matching_total() -> None:
+    """Strict equality, no wildcard: `None` on either side is "not comparable"."""
+    ledger = Ledger(rain_baselines={"zone-1": 10.0}, rain_source=GAUGE)
+    zone = make_zone("zone-1", morning_s=600)
+
+    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 15.0, None)
+    (default,) = ledger.quote((zone,), CycleKind.MORNING, 15.0)
+
+    assert (quote.rain_credit_s, quote.quoted_s) == (0, 600)
+    assert (default.rain_credit_s, default.quoted_s) == (0, 600)
+
+
+def test_none_on_both_sides_is_not_the_same_gauge() -> None:
+    """Strict equality never reads `None == None` as a match: no source anywhere → 0.
+
+    The `rain_source is None` clause is what keeps a pre-2.5 section and a
+    gauge-less quote apart from "the same instrument produced both".
+    """
+    ledger = Ledger(rain_baselines={"zone-1": 10.0}, rain_source=None)
+    zone = make_zone("zone-1", morning_s=600)
+
+    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 15.0, None)
+
+    assert (quote.rain_credit_s, quote.quoted_s) == (0, 600)
+
+
+def test_baselines_banked_with_no_source_credit_nothing() -> None:
+    """Matrix "pre-2.5 journal": baselines, no source → the gauge's total is foreign.
+
+    One unmodulated banking cycle after the upgrade, then settlement stamps
+    the source and the cycle after modulates.
+    """
+    ledger = Ledger(rain_baselines={"zone-1": 10.0}, rain_source=None)
+    zone = make_zone("zone-1", morning_s=600)
+
+    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 15.0, GAUGE)
+
+    assert (quote.rain_credit_s, quote.quoted_s) == (0, 600)
+    assert ledger.rain_source is None
+
+
+def test_the_same_source_on_both_sides_credits_the_rain_since_the_baseline() -> None:
+    """Matrix "same gauge, rain since": `sensor.a` on both sides, 10 → 15 → 300 s."""
+    ledger = Ledger(rain_baselines={"zone-1": 10.0}, rain_source="sensor.a")
+    zone = make_zone("zone-1", morning_s=600)
+
+    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 15.0, "sensor.a")
+
+    assert (quote.rain_credit_s, quote.quoted_s) == (300, 300)
+
+
+def test_settle_stamps_the_runs_source_next_to_the_baselines_it_banks() -> None:
+    """Matrix "gauge swapped upward", settlement half: 1200 under `sensor.b`.
+
+    The next quote from `sensor.b` is comparable again and modulates.
+    """
+    ledger = Ledger(rain_baselines={"zone-1": 40.0}, rain_source="sensor.a")
+    run = cycle_run(zone_run("zone-1"), rain_total_mm=1200.0, rain_source="sensor.b")
+
+    assert ledger.settle(run) is True
+
+    assert ledger.as_dict()["rain_baselines"] == {"zone-1": 1200.0}
+    assert ledger.rain_source == "sensor.b"
+    (quote,) = ledger.quote(
+        (make_zone("zone-1", morning_s=600),), CycleKind.MORNING, 1203.0, "sensor.b"
+    )
+    assert quote.rain_credit_s == 180
+
+
+def test_settle_with_a_none_reading_keeps_the_source_as_well_as_the_baselines() -> None:
+    """A doubtful reading spends nothing — not the baselines, not the source.
+
+    The run still carries the port's identity (`sensor.b`, a swap that
+    happened to be unreadable at quote time); the ledger keeps `sensor.a`
+    next to the `sensor.a` baselines it still holds.
+    """
+    ledger = Ledger(rain_baselines={"zone-1": 40.0}, rain_source="sensor.a")
+
+    ledger.settle(
+        cycle_run(zone_run("zone-1"), rain_total_mm=None, rain_source="sensor.b")
+    )
+
+    assert ledger.as_dict()["rain_baselines"] == {"zone-1": 40.0}
+    assert ledger.rain_source == "sensor.a"
+
+
+def test_settle_with_a_readable_total_but_no_source_banks_unusable_baselines() -> None:
+    """Fail-wet: a sourceless run banks the total and clears the source.
+
+    The baselines advance to 12.0 but are comparable to nothing, so a quote
+    from a real gauge credits 0 — until a sourced settlement re-stamps.
+    """
+    ledger = Ledger(rain_baselines={"zone-1": 5.0}, rain_source=GAUGE)
+    zone = make_zone("zone-1", morning_s=600)
+
+    ledger.settle(cycle_run(zone_run("zone-1"), rain_total_mm=12.0, rain_source=None))
+
+    assert ledger.as_dict()["rain_baselines"] == {"zone-1": 12.0}
+    assert ledger.rain_source is None
+    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 15.0, GAUGE)
+    assert (quote.rain_credit_s, quote.quoted_s) == (0, 600)
+
+    ledger.settle(
+        cycle_run(
+            zone_run("zone-1"),
+            cycle_id="2026-07-31-evening",
+            rain_total_mm=15.0,
+            rain_source=GAUGE,
+        )
+    )
+    (quote,) = ledger.quote((zone,), CycleKind.MORNING, 17.0, GAUGE)
+    assert (quote.rain_credit_s, quote.quoted_s) == (120, 480)
+
+
+def test_the_first_settlement_ever_stamps_the_source() -> None:
+    """Matrix "first cycle ever": nothing banked → the reading AND its source are."""
+    ledger = Ledger()
+    assert ledger.rain_source is None
+
+    ledger.settle(cycle_run(zone_run("zone-1"), rain_total_mm=12.0, rain_source=GAUGE))
+
+    assert ledger.rain_source == GAUGE
+
+
+def test_a_replayed_settlement_leaves_the_source_alone() -> None:
+    """Matrix "replay": the same cycle id from another gauge changes nothing."""
+    ledger = Ledger()
+    assert ledger.settle(cycle_run(zone_run("zone-1"), rain_total_mm=10.0)) is True
+
+    replay = cycle_run(zone_run("zone-1"), rain_total_mm=99.0, rain_source="other")
+    assert ledger.settle(replay) is False
+
+    assert ledger.as_dict()["rain_baselines"] == {"zone-1": 10.0}
+    assert ledger.rain_source == GAUGE
+
+
+def test_as_dict_from_dict_round_trip_carries_the_source() -> None:
+    """Matrix "restart": the source survives the journal next to its baselines."""
+    ledger = Ledger()
+    ledger.settle(
+        cycle_run(zone_run("zone-1"), rain_total_mm=12.0, rain_source="sensor.a")
+    )
+
+    rebuilt = Ledger.from_dict(ledger.as_dict())
+
+    assert rebuilt.as_dict() == ledger.as_dict()
+    assert rebuilt.as_dict()["rain_source"] == "sensor.a"
+    assert rebuilt.rain_source == "sensor.a"
+    (quote,) = rebuilt.quote(
+        (make_zone("zone-1", morning_s=600),), CycleKind.MORNING, 15.5, "sensor.a"
+    )
+    assert quote.rain_credit_s == 210
+
+
+def test_from_dict_of_a_pre_2_5_section_has_baselines_and_no_source() -> None:
+    """A 2.4 section has `rain_baselines` and no `rain_source` — and loads."""
+    ledger = Ledger.from_dict(
+        {
+            "settled_cycle_id": None,
+            "deficits": {"zone-1": 300},
+            "rain_baselines": {"zone-1": 10.0},
+        },
+    )
+
+    assert ledger.rain_source is None
+    assert ledger.as_dict()["rain_source"] is None
+    assert ledger.rain_baseline_mm("zone-1") == 10.0
+    assert ledger.deficit_s("zone-1") == 300
+
+
+def test_from_dict_narrows_a_source_of_the_wrong_type_to_none() -> None:
+    """Type narrowing of the serialized `object` value — validation is the adapter's."""
+    assert Ledger.from_dict({"rain_source": 42}).rain_source is None
+    assert Ledger.from_dict({"rain_source": ["a"]}).rain_source is None
+    assert Ledger.from_dict({"rain_source": "sensor.a"}).rain_source == "sensor.a"
+
+
+def test_an_empty_ledger_section_carries_a_none_source() -> None:
+    """The section shape has five keys now; `rain_source` is None until a settlement."""
+    assert Ledger().as_dict() == {
+        "settled_cycle_id": None,
+        "deficits": {},
+        "day_credit": None,
+        "rain_baselines": {},
+        "rain_source": None,
+    }
+
+
+# --------------------------------------------------------------------------
+# forget_rain (Story 2.5): the season switch starts a new accumulation period
+# --------------------------------------------------------------------------
+
+
+def test_forget_rain_clears_the_baselines_and_the_source_and_nothing_else() -> None:
+    """Matrix "season ON after winter", ledger half: rain gone, debt and credit kept."""
+    ledger = Ledger(
+        {"zone-1": 300},
+        settled_cycle_id="2026-07-30-evening",
+        day_credit=CREDIT,
+        rain_baselines={"zone-1": 40.0, "zone-2": 40.0},
+        rain_source="sensor.a",
+    )
+
+    ledger.forget_rain()
+
+    assert ledger.as_dict() == {
+        "settled_cycle_id": "2026-07-30-evening",
+        "deficits": {"zone-1": 300},
+        "day_credit": CREDIT,
+        "rain_baselines": {},
+        "rain_source": None,
+    }
+    assert ledger.rain_baseline_mm("zone-1") is None
+    assert ledger.rain_source is None
+    assert ledger.deficit_s("zone-1") == 300
+    assert ledger.day_credit == "2026-07-31"
+
+
+def test_after_forget_rain_the_next_quote_banks_and_the_one_after_spends() -> None:
+    """Matrix "season ON after winter": credit 0, settle banks 300, next modulates."""
+    ledger = Ledger(rain_baselines={"zone-1": 40.0}, rain_source="sensor.a")
+    zone = make_zone("zone-1", morning_s=600)
+    ledger.forget_rain()
+
+    (first,) = ledger.quote((zone,), CycleKind.MORNING, 300.0, "sensor.a")
+    assert (first.rain_credit_s, first.quoted_s) == (0, 600)
+    ledger.settle(
+        cycle_run(zone_run("zone-1"), rain_total_mm=300.0, rain_source="sensor.a")
+    )
+    (second,) = ledger.quote((zone,), CycleKind.MORNING, 302.0, "sensor.a")
+
+    assert ledger.as_dict()["rain_baselines"] == {"zone-1": 300.0}
+    assert ledger.rain_source == "sensor.a"
+    assert (second.rain_credit_s, second.quoted_s) == (120, 480)
+
+
+def test_forget_rain_on_an_empty_ledger_is_a_no_op() -> None:
+    """Nothing banked, nothing to forget: the empty section before and after."""
+    ledger = Ledger()
+    before = ledger.as_dict()
+
+    ledger.forget_rain()
+
+    assert ledger.as_dict() == before
 
 
 # --------------------------------------------------------------------------
@@ -651,6 +946,7 @@ def test_full_watering_removes_the_deficit_entry() -> None:
         "deficits": {},
         "day_credit": None,
         "rain_baselines": {},
+        "rain_source": None,
     }
 
 
@@ -714,6 +1010,7 @@ def test_settling_the_same_cycle_id_twice_is_a_no_op() -> None:
             "deficits": {"zone-1": 600},
             "day_credit": None,
             "rain_baselines": {},
+            "rain_source": None,
         }
     )
 
@@ -781,6 +1078,7 @@ def test_from_dict_of_none_is_an_empty_ledger() -> None:
         "deficits": {},
         "day_credit": None,
         "rain_baselines": {},
+        "rain_source": None,
     }
     assert ledger.deficit_s("zone-1") == 0
 
@@ -824,6 +1122,7 @@ def test_a_completed_run_now_with_no_shortfall_credits_its_day() -> None:
         "deficits": {},
         "day_credit": CREDIT,
         "rain_baselines": {},
+        "rain_source": None,
     }
 
 
@@ -957,6 +1256,7 @@ def test_a_replayed_settlement_changes_neither_debt_nor_credit() -> None:
         "deficits": {},
         "day_credit": CREDIT,
         "rain_baselines": {},
+        "rain_source": None,
     }
 
 
@@ -1047,6 +1347,7 @@ def test_waive_touches_neither_the_deficits_nor_the_settled_id() -> None:
         "deficits": {"zone-1": 300},
         "day_credit": None,
         "rain_baselines": {},
+        "rain_source": None,
     }
 
 

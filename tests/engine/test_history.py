@@ -131,6 +131,10 @@ def test_history_entry_is_a_compact_serializable_outcome() -> None:
         "configured_start": "2026-07-31T05:00:00+00:00",
         "scheduled_start": "2026-07-31T05:00:00+00:00",
         "ended_at": "2026-07-31T05:26:00+00:00",
+        # Story 2.5: the quote-time gauge reading — None here (no gauge), a
+        # number for a modulated cycle; how Epic 4 tells "doubtful" from
+        # "no rain" without an anomaly.
+        "rain_total_mm": None,
         # Story 2.2: the quoted duration and the carried deficit sit next to
         # what the zone actually watered, so Epic 4 can show all three.
         "zones": [
@@ -230,6 +234,37 @@ def test_a_rain_skipped_zone_records_why_nothing_flowed() -> None:
             "effective_s": 600,
         },
     ]
+
+
+def test_the_record_carries_the_quote_time_reading_of_a_modulated_cycle() -> None:
+    """Story 2.5: `rain_total_mm` is the run's snapshot, verbatim — 15.0 here."""
+    run = cycle_run(zone_run())
+    run.rain_total_mm = 15.0
+    run.rain_source = "sensor.rain_gauge"
+
+    entry = history_entry(run, aware(7, 10))
+
+    assert entry["rain_total_mm"] == 15.0
+    # The source is ledger material, not history: the record says what the
+    # gauge read, the zone records say what it was worth.
+    assert "rain_source" not in entry
+
+
+def test_the_record_of_a_doubtful_quote_says_null_not_zero() -> None:
+    """Story 2.5: a doubtful gauge is `rain_total_mm: None` with 0 s credit per zone.
+
+    Distinct from "no rain" (a number, with 0 s credit) — the one signal that
+    tells Epic 4 modulation was OFF for this cycle, since no anomaly says so.
+    """
+    run = cycle_run(zone_run(), zone_run(zone_id="zone-2"))
+    assert run.rain_total_mm is None
+
+    entry = history_entry(run, aware(7, 10))
+
+    assert entry["rain_total_mm"] is None
+    zones = entry["zones"]
+    assert isinstance(zones, list)
+    assert [zone["rain_credit_s"] for zone in zones] == [0, 0]
 
 
 def test_ended_at_is_the_completion_instant_not_the_last_zone_close() -> None:

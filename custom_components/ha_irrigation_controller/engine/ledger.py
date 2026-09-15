@@ -6,7 +6,7 @@ per-zone effective duration and nothing else writes ledger state: Story 2.3's
 day credit, Story 2.4's rain credit and Epic 3's recovery deficits all route
 through this module rather than adding parallel arithmetic.
 
-Three operations, deliberately asymmetric:
+Four operations, deliberately asymmetric:
 
 - ``quote()`` is PURE. It reads the ledger and mutates nothing, so a quoted
   cycle that never settles (crash, suspend, waiver) leaves its deficit AND
@@ -14,15 +14,26 @@ Three operations, deliberately asymmetric:
   and the rain stays banked for it — doubt waters (AD-4). It is also the ONE
   place that turns millimetres into seconds (Story 2.4): the rain credit is
   ``floor(max(0, total - baseline) * rain_factor * 60)`` for an exposed zone
-  with a baseline, given the gauge total the sequencer read at quote time.
+  with a baseline, given the gauge total the sequencer read at quote time —
+  and only when that total comes from the SAME gauge the baselines were
+  banked under (Story 2.5's `rain_source`); a total from another source is
+  not comparable to them and credits nothing.
 - ``settle(run)`` is the ONLY writer of debt, of the day credit AND of the
   per-zone rain baselines (the gauge total at the zone's previous settled
-  cycle), keyed by the run's cycle id so a replay of the same completion is
-  a no-op.
+  cycle) with the source they came from, keyed by the run's cycle id so a
+  replay of the same completion is a no-op.
 - ``waive(day)`` is the ONLY CONSUMER of the day credit (Story 2.3, FR12):
-  one credit, one decision. The `day_credit` property and `as_dict` read it
-  too, for the sensor and the journal, and reading consumes nothing. The
-  sequencer never inspects the credit itself.
+  one credit, one decision — it clears the credit it consumes, which makes
+  it the second writer of ledger state. The `day_credit` property and
+  `as_dict` read it too, for the sensor and the journal, and reading
+  consumes nothing. The sequencer never inspects the credit itself.
+- ``forget_rain()`` (Story 2.5) clears the baselines and their source — the
+  third writer, called by the sequencer for an actual season OFF→ON only:
+  the operator's statement that a new accumulation period begins. Deficits
+  and the day credit are untouched by it.
+
+Three writers of ledger state, then — `settle`, `waive` and `forget_rain` —
+and nothing else mutates it.
 
 Hass-free like the rest of the engine: stdlib plus the engine's own types.
 """
@@ -67,12 +78,14 @@ class ZoneQuote:
 class Ledger:
     """Per-zone water debt with idempotent settlement, day credit, rain baselines.
 
-    State is four things: the outstanding deficit per zone (seconds, strictly
+    State is five things: the outstanding deficit per zone (seconds, strictly
     positive — a zero deficit is simply absent), the id of the last settled
     cycle, at most ONE day credit (Story 2.3) — the irrigation day a
-    completed run-now has already watered, with the id of that run-now — and
-    the rain BASELINE per zone (Story 2.4): the gauge's cumulative total, in
-    mm, as it was quoted for the zone's previous settled cycle. The
+    completed run-now has already watered, with the id of that run-now — the
+    rain BASELINE per zone (Story 2.4): the gauge's cumulative total, in mm,
+    as it was quoted for the zone's previous settled cycle — and the rain
+    SOURCE (Story 2.5): the identity of the gauge every baseline was banked
+    from, one for the whole mapping since one quote reads one gauge. The
     sequencer settles only the run it just completed, once, inside
     `_complete_cycle`, so a replay can only ever be of that same run — one id
     is the whole replay defence, and it cannot grow without a pruning rule the
@@ -88,6 +101,7 @@ class Ledger:
         settled_cycle_id: str | None = None,
         day_credit: Mapping[str, object] | None = None,
         rain_baselines: Mapping[str, float] | None = None,
+        rain_source: str | None = None,
     ) -> None:
         """Start from `deficits` (zeros dropped), the settled id, credit and baselines.
 
@@ -96,7 +110,11 @@ class Ledger:
         at the trust boundary; the `isinstance` checks are type narrowing for
         the serialized `object` values, not validation. `rain_baselines` is
         `{zone_id: mm}` the same way — the adapter has already dropped every
-        entry that is not a finite, non-negative number.
+        entry that is not a finite, non-negative number — and `rain_source`
+        (Story 2.5) is the gauge identity they were banked under, or None
+        for a section written before that story (or one whose source was
+        malformed): baselines with no source credit nothing until they are
+        re-banked, which waters.
         """
         self._deficits: dict[str, int] = {
             zone_id: seconds
@@ -109,6 +127,9 @@ class Ledger:
         self._rain_baselines: dict[str, float] = {
             zone_id: float(total) for zone_id, total in (rain_baselines or {}).items()
         }
+        # The gauge every baseline above came from; None = unknown, so no
+        # total is comparable to them and the next settlement re-banks.
+        self._rain_source = rain_source
         # (credited irrigation day, id of the run-now that credited it).
         self._day_credit: tuple[date, str] | None = None
         if day_credit is not None:
@@ -133,22 +154,26 @@ class Ledger:
         settled = data.get("settled_cycle_id")
         credit = data.get("day_credit")
         baselines = data.get("rain_baselines")
+        source = data.get("rain_source")
         return cls(
             deficits=deficits if isinstance(deficits, dict) else None,
             settled_cycle_id=settled if isinstance(settled, str) else None,
             day_credit=credit if isinstance(credit, dict) else None,
             rain_baselines=baselines if isinstance(baselines, dict) else None,
+            rain_source=source if isinstance(source, str) else None,
         )
 
     def as_dict(self) -> dict[str, object]:
         """Return the serializable ledger section of the journal snapshot.
 
         `day_credit` is `None` or `{"irrigation_day": "YYYY-MM-DD",
-        "cycle_id": str}` and `rain_baselines` is `{zone_id: float}` — the
-        shapes `_seed_ledger` validates on the way back in
-        (`JOURNAL_SCHEMA_VERSION` stays 1: both keys are optional on read, so
-        a pre-2.3 section loads with no credit and a pre-2.4 one with no
-        baselines).
+        "cycle_id": str}`, `rain_baselines` is `{zone_id: float}` and
+        `rain_source` is `str` or `None` — the shapes `_seed_ledger`
+        validates on the way back in (`JOURNAL_SCHEMA_VERSION` stays 1: all
+        three keys are optional on read, so a pre-2.3 section loads with no
+        credit, a pre-2.4 one with no baselines and a pre-2.5 one with
+        baselines but no source — which quotes one unmodulated cycle and
+        then modulates).
         """
         credit = self._day_credit
         return {
@@ -160,6 +185,7 @@ class Ledger:
                 else {"irrigation_day": credit[0].isoformat(), "cycle_id": credit[1]}
             ),
             "rain_baselines": dict(self._rain_baselines),
+            "rain_source": self._rain_source,
         }
 
     @property
@@ -211,11 +237,37 @@ class Ledger:
         """
         return self._rain_baselines.get(zone_id)
 
+    @property
+    def rain_source(self) -> str | None:
+        """Return the identity of the gauge the baselines were banked from, or None.
+
+        READ-ONLY (AD-6). None means no reading has been banked yet (or the
+        section predates Story 2.5), so no total is comparable to the
+        baselines and the next quote credits nothing.
+        """
+        return self._rain_source
+
+    def forget_rain(self) -> None:
+        """Clear every rain baseline and the stored source (Story 2.5).
+
+        The third of the three writers of ledger state (`settle`, `waive` —
+        which clears the credit it consumes — and this), called by the
+        sequencer for an actual season OFF→ON only: the switch is the
+        operator's own statement that a new accumulation period begins, so
+        the rain banked before it (a winter's worth) must not skip the first
+        cycle of the season. The next cycle quotes no credit, waters in full
+        and re-banks at settlement — fail-wet. Deficits, the settled id and
+        the day credit are untouched: they are about water owed, not rain.
+        """
+        self._rain_baselines = {}
+        self._rain_source = None
+
     def quote(
         self,
         plan_zones: Sequence[ZoneSpec],
         kind: CycleKind,
         rain_total_mm: float | None = None,
+        rain_source: str | None = None,
     ) -> tuple[ZoneQuote, ...]:
         """Return the quoted duration of every zone for a `kind` cycle.
 
@@ -224,7 +276,8 @@ class Ledger:
             rain_credit_s = floor(round(max(0, total - baseline) * rain_factor
                                         * 60, 6))
                             iff exposed and factor > 0 and total and baseline
-                            are both known and the product is finite, else 0
+                            are both known and source == the banked source
+                            and the product is finite, else 0
             carried_s     = min(deficit, base_s)
             quoted_s      = max(0, base_s - rain_credit_s) + carried_s
 
@@ -241,22 +294,34 @@ class Ledger:
         seconds (AD-5). The rain since the zone's previous settled cycle
         (`total - baseline`) is what is credited; a sheltered zone, a factor
         of 0 and a zone with no baseline yet credit nothing; a total BELOW
-        the baseline (a gauge reset — Story 2.5's concern) credits nothing
-        rather than a negative amount; and `floor` rounds toward LESS credit,
-        which waters more (AD-4). The product is rounded to 6 decimals BEFORE
-        the floor so a binary-float artefact (`(10.0 - 9.9) * 60 = 5.999…`)
-        does not shave a whole second off an ordinary delta; a product that
-        is not finite (an absurd total overflowing to `inf`) is a doubtful
-        reading and credits 0 rather than raising. The credit comes off the
-        base BEFORE the deficit is added and never drives the base part below
-        zero: a zone in debt still waters its `carried_s` however much it
-        rained — the
-        debt floor holds (FR13).
+        the baseline (a gauge reset) credits nothing rather than a negative
+        amount — the clamp is the whole reset policy, there is no "reset
+        means rain since zero" inference; and `floor` rounds toward LESS
+        credit, which waters more (AD-4). The product is rounded to 6
+        decimals BEFORE the floor so a binary-float artefact (`(10.0 - 9.9)
+        * 60 = 5.999…`) does not shave a whole second off an ordinary delta;
+        a product that is not finite (an absurd total overflowing to `inf`)
+        is a doubtful reading and credits 0 rather than raising. The credit
+        comes off the base BEFORE the deficit is added and never drives the
+        base part below zero: a zone in debt still waters its `carried_s`
+        however much it rained — the debt floor holds (FR13).
+
+        `rain_source` (Story 2.5) is the identity of the gauge that produced
+        `rain_total_mm`, as the sequencer snapshots it on the run. A total is
+        comparable to the baselines only if the SAME gauge produced both, so
+        the credit also requires `rain_source` to equal the ledger's stored
+        source, both non-None — strict equality, no wildcard. A foreign
+        source (the sensor was swapped or renamed), a pre-2.5 section with
+        baselines but no source and a ledger with nothing banked all credit
+        nothing; settlement then re-banks under the new source and the cycle
+        after modulates. This is what stops a replacement gauge with a
+        higher lifetime total from crediting that total and skipping every
+        exposed zone — the fail-dry outcome FR15 forbids.
         """
         quotes: list[ZoneQuote] = []
         for zone in plan_zones:
             base_s = zone.duration_s(kind)
-            credit_s = self._rain_credit_s(zone, rain_total_mm)
+            credit_s = self._rain_credit_s(zone, rain_total_mm, rain_source)
             carried_s = min(self.deficit_s(zone.zone_id), base_s)
             quotes.append(
                 ZoneQuote(
@@ -269,7 +334,12 @@ class Ledger:
             )
         return tuple(quotes)
 
-    def _rain_credit_s(self, zone: ZoneSpec, rain_total_mm: float | None) -> int:
+    def _rain_credit_s(
+        self,
+        zone: ZoneSpec,
+        rain_total_mm: float | None,
+        rain_source: str | None,
+    ) -> int:
         """Return the seconds `rain_total_mm` is worth to `zone` — see `quote`."""
         baseline = self._rain_baselines.get(zone.zone_id)
         if (
@@ -277,6 +347,8 @@ class Ledger:
             or zone.rain_factor <= 0
             or rain_total_mm is None
             or baseline is None
+            or rain_source is None
+            or rain_source != self._rain_source
         ):
             return 0
         credit = max(0.0, rain_total_mm - baseline) * zone.rain_factor * 60
@@ -325,6 +397,14 @@ class Ledger:
         baseline it had. Like deficits, the mapping is REPLACED by the run's
         zones, so a removed zone's baseline is dropped. A waived cycle never
         reaches here, so its rain stays banked for the next real cycle.
+
+        The RAIN SOURCE (Story 2.5) follows the same rule: a non-None reading
+        stamps the stored source with the run's snapshotted `rain_source` —
+        the gauge that produced the total the baselines are being set to —
+        and a None reading leaves it as it was, next to the baselines it
+        describes. A foreign source therefore re-banks in one settlement:
+        every zone's baseline becomes the new gauge's total and the source
+        becomes the new gauge, so the next quote modulates.
         """
         if run.cycle_id == self._settled_cycle_id:
             return False
@@ -347,4 +427,6 @@ class Ledger:
             if baseline is not None:
                 baselines[zone.zone_id] = baseline
         self._rain_baselines = baselines
+        if total is not None:
+            self._rain_source = run.rain_source
         return True

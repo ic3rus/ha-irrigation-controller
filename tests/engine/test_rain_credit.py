@@ -43,8 +43,16 @@ PUMP = "switch.pool_pump"
 VALVE_1 = "switch.zone_1_valve"
 VALVE_2 = "switch.zone_2_valve"
 
+# The identity `FakeRainPort` answers by default (Story 2.5): every baseline
+# this suite seeds is banked under it, so the fake gauge's readings compare.
+GAUGE = "gauge"
+
 # The ledger section with nothing owed and no credit — the baselines vary.
-NO_DEBT: dict[str, object] = {"settled_cycle_id": None, "deficits": {}}
+NO_DEBT: dict[str, object] = {
+    "settled_cycle_id": None,
+    "deficits": {},
+    "rain_source": GAUGE,
+}
 
 
 def two_zone_plan() -> ControllerPlan:
@@ -180,6 +188,7 @@ async def test_rain_since_the_previous_cycle_reduces_the_next_one() -> None:
     snapshot_run = journal.snapshots[-1]["run"]
     assert isinstance(snapshot_run, dict)
     assert snapshot_run["rain_total_mm"] == 15.5
+    assert snapshot_run["rain_source"] == GAUGE
     assert snapshot_run["zones"][0]["rain_credit_s"] == 210
 
     await sequencer.advance(clock.now())
@@ -379,6 +388,7 @@ async def test_a_cancel_after_a_skipped_zone_closes_the_live_zone_only() -> None
         "deficits": {"zone-2": 360},
         "day_credit": None,
         "rain_baselines": {"zone-1": 12.0, "zone-2": 12.0},
+        "rain_source": GAUGE,
     }
 
 
@@ -423,6 +433,7 @@ async def test_a_covered_zone_in_debt_still_waters_its_carried_seconds() -> None
             "settled_cycle_id": "2026-07-30-evening",
             "deficits": {"zone-1": 300},
             "rain_baselines": {"zone-1": 0.0},
+            "rain_source": GAUGE,
         },
     )
     clock = VirtualClock(aware(7))
@@ -668,6 +679,7 @@ async def test_a_cancelled_run_advances_the_baselines_and_carries_the_shortfall(
         "deficits": {"zone-1": 300, "zone-2": 420},
         "day_credit": None,
         "rain_baselines": {"zone-1": 3.0, "zone-2": 3.0},
+        "rain_source": GAUGE,
     }
     clock.advance_to(aware(20))
     await sequencer.request_cycle(CycleKind.EVENING, clock.now())
@@ -822,6 +834,7 @@ async def test_a_run_now_after_rain_covering_every_zone_credits_the_day() -> Non
             "cycle_id": "2026-07-31-morning",
         },
         "rain_baselines": {"zone-1": 12.0, "zone-2": 12.0},
+        "rain_source": GAUGE,
     }
     history = journal.snapshots[-1]["history"]
     assert isinstance(history, list)

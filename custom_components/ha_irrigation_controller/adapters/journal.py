@@ -55,14 +55,20 @@ class JournalSeed:
     `ledger` is the section in the shape `Ledger.as_dict` writes —
     `{"settled_cycle_id": str | None, "deficits": {zone_id: int},
     "day_credit": {"irrigation_day": "YYYY-MM-DD", "cycle_id": str} | None,
-    "rain_baselines": {zone_id: float}}` — already validated, so the engine
-    can trust it. `day_credit` (Story 2.3) is the irrigation day a completed
-    run-now has already watered, with that run-now's id; it is optional on
-    read, and a malformed one reads as no credit without touching the rest
-    of the section. `rain_baselines` (Story 2.4) is the gauge total, in mm,
-    at each zone's previous settled cycle — what the next rain credit is
-    measured from; optional on read too, and each malformed entry reads as
-    "no baseline" (no credit until the zone settles a cycle) on its own.
+    "rain_baselines": {zone_id: float}, "rain_source": str | None}` —
+    already validated, so the engine can trust it. `day_credit` (Story 2.3)
+    is the irrigation day a completed run-now has already watered, with that
+    run-now's id; it is optional on read, and a malformed one reads as no
+    credit without touching the rest of the section. `rain_baselines`
+    (Story 2.4) is the gauge total, in mm, at each zone's previous settled
+    cycle — what the next rain credit is measured from; optional on read
+    too, and each malformed entry reads as "no baseline" (no credit until
+    the zone settles a cycle) on its own. `rain_source` (Story 2.5) is the
+    identity of the gauge those baselines came from; optional on read (a
+    pre-2.5 section has baselines and no source) and anything but a `str`
+    reads as `None` — baselines with no source credit nothing until the next
+    settlement re-banks them under the current gauge, so an upgrade costs
+    one unmodulated cycle and never a skipped one.
     """
 
     history: list[dict[str, object]]
@@ -235,6 +241,7 @@ def _empty_ledger() -> dict[str, object]:
         "deficits": {},
         "day_credit": None,
         "rain_baselines": {},
+        "rain_source": None,
     }
 
 
@@ -262,6 +269,12 @@ def _seed_ledger(section: object) -> dict[str, object]:
       `bool`). A bad entry reads as NO baseline for that zone, which credits
       it nothing until it settles a cycle — the fail-wet direction — and
       never rejects the section or the other zones' baselines.
+    - `rain_source` (Story 2.5) is optional — absent in every document
+      written before it — and kept only as a `str`; anything else reads as
+      `None`, on its own, without rejecting the section or the baselines.
+      No source means no total is comparable to the baselines: the next
+      cycle waters in full and re-banks under the current gauge — fail-wet
+      — and nothing is logged.
 
     Anything else about the section's shape — absent (every document written
     before this story), not a mapping, a `deficits` that is not a mapping, a
@@ -274,6 +287,7 @@ def _seed_ledger(section: object) -> dict[str, object]:
     settled = section.get("settled_cycle_id")
     if not isinstance(deficits, dict) or not isinstance(settled, str | None):
         return _empty_ledger()
+    source = section.get("rain_source")
     return {
         "settled_cycle_id": settled,
         "deficits": {
@@ -286,6 +300,7 @@ def _seed_ledger(section: object) -> dict[str, object]:
         },
         "day_credit": _seed_day_credit(section.get("day_credit")),
         "rain_baselines": _seed_rain_baselines(section.get("rain_baselines")),
+        "rain_source": source if isinstance(source, str) else None,
     }
 
 

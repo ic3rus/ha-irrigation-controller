@@ -181,6 +181,19 @@ class Sequencer:
         deliberately NOT touched whatever its status: a cycle in progress
         completes, and only `async_cancel_cycle` stops one.
 
+        Turning the season ON forgets the rain (Story 2.5): an actual OFF→ON
+        change calls `Ledger.forget_rain()`, clearing every banked baseline
+        and the gauge source they came from, and journals. The switch is the
+        operator's statement that a new accumulation period begins, and the
+        rain banked before it — a winter's worth, on a gauge that never
+        resets — must not skip the first cycle of the season. That first
+        cycle quotes no credit, waters in full and re-banks at settlement;
+        the one after modulates. A mid-season OFF/ON loses the credit for
+        that gap's rain, which is the fail-wet direction. Season OFF, a
+        no-op toggle and a run-now leave the baselines alone; deficits and
+        the day credit are never touched here. This is the ONLY caller of
+        `forget_rain`.
+
         `now` is accepted for symmetry with every other engine entry point and
         is deliberately unused: the engine never reads a clock of its own
         (AD-1), and a later season-transition record would take its instant
@@ -190,7 +203,9 @@ class Sequencer:
             if self._season_enabled == enabled:
                 return False
             self._season_enabled = enabled
-            if not enabled:
+            if enabled:
+                self._ledger.forget_rain()
+            else:
                 self._deferred.clear()
             await self._save()
             return True
@@ -733,11 +748,27 @@ class Sequencer:
         port that raises is treated like a doubtful reading — `None`, full
         durations, no anomaly — the same defence `_command` gives the switch
         port, because a broken gauge must never be what stops the water.
+        Doubt stays SILENT however long it lasts: no counter, no anomaly
+        kind — a gauge unavailable for weeks waters in full with the
+        adapter's DEBUG logs only, and the operator reads `rain_total_mm:
+        null` in history. The registry tracker's CONFIGURED_ENTITY_MISSING
+        on a removed or disabled sensor is the one fault surfaced.
+
+        The gauge's IDENTITY (`RainPort.source_id`, Story 2.5) is snapshotted
+        next to the reading and handed to the quote with it: the ledger
+        credits nothing from a source other than the one its baselines were
+        banked under, and settlement stamps the run's source as the new one.
+        A late-arriving total (FR16) needs nothing special here: whatever
+        the gauge says at THIS quote is compared to the baselines banked by
+        the previous settlement, so a backfilled jump credits the next
+        unquoted cycle in full — a completed run's snapshot, record and
+        settlement are never revisited.
         """
         schedule = derive_schedule(self.plan, kind, reference)
         scheduled_start = schedule.start if dispatch_at is None else dispatch_at
         rain_total_mm = self._rain_total_mm()
-        quotes = self._ledger.quote(self.plan.zones, kind, rain_total_mm)
+        rain_source = None if self._rain is None else self._rain.source_id
+        quotes = self._ledger.quote(self.plan.zones, kind, rain_total_mm, rain_source)
         windows = zone_windows(
             self.plan,
             kind,
@@ -775,6 +806,7 @@ class Sequencer:
             ),
             manual=manual,
             rain_total_mm=rain_total_mm,
+            rain_source=rain_source,
         )
 
     def _rain_total_mm(self) -> float | None:

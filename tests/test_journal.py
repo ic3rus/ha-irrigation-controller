@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -49,6 +50,7 @@ EMPTY_LEDGER: dict[str, object] = {
     "deficits": {},
     "day_credit": None,
     "rain_baselines": {},
+    "rain_source": None,
 }
 
 # The gauge as the representative controller entry (`CONTROLLER_OPTIONS`) sees it.
@@ -782,6 +784,7 @@ async def test_load_seed_keeps_only_the_deficits_the_engine_can_consume(
         "deficits": {"zone-1": 300, "zone-2": 0},
         "day_credit": None,
         "rain_baselines": {},
+        "rain_source": None,
     }
 
 
@@ -805,6 +808,7 @@ async def test_load_seed_accepts_a_ledger_with_deficits_but_no_settled_id(
         "deficits": {"zone-1": 300},
         "day_credit": None,
         "rain_baselines": {},
+        "rain_source": None,
     }
 
 
@@ -845,6 +849,7 @@ async def test_a_stored_ledger_round_trips_through_a_reload(
         "deficits": {zone_id: 300},
         "day_credit": None,
         "rain_baselines": {},
+        "rain_source": None,
     }
 
     assert await hass.config_entries.async_setup(entry.entry_id)
@@ -925,6 +930,7 @@ async def test_load_seed_reads_a_missing_or_malformed_day_credit_as_none(
         "deficits": {"zone-1": 300},
         "day_credit": None,
         "rain_baselines": {},
+        "rain_source": None,
     }
 
 
@@ -957,6 +963,7 @@ async def test_load_seed_accepts_a_valid_day_credit_and_keeps_only_its_two_keys(
             "cycle_id": "2026-07-31-morning",
         },
         "rain_baselines": {},
+        "rain_source": None,
     }
 
 
@@ -1003,6 +1010,7 @@ async def test_a_day_credit_round_trips_through_a_reload_and_waives_the_cycle(
             "cycle_id": "2026-07-31-morning",
         },
         "rain_baselines": {},
+        "rain_source": None,
     }
 
     assert await hass.config_entries.async_setup(entry.entry_id)
@@ -1074,6 +1082,7 @@ async def test_load_seed_reads_a_missing_or_malformed_baselines_key_as_empty(
         "deficits": {"zone-1": 300},
         "day_credit": None,
         "rain_baselines": {},
+        "rain_source": None,
     }
 
 
@@ -1125,10 +1134,85 @@ async def test_load_seed_keeps_only_the_baselines_the_engine_can_consume(
             "cycle_id": "2026-07-31-morning",
         },
         "rain_baselines": {"w": 3.0, "v": 2.5, "s": 0.0},
+        "rain_source": None,
     }
     baselines = seed.ledger["rain_baselines"]
     assert isinstance(baselines, dict)
     assert all(isinstance(total, float) for total in baselines.values())
+
+
+# A section written before Story 2.5 (baselines, no source) and every malformed
+# source a hand edit can produce: each reads as `None` — no gauge is comparable
+# to the baselines, so the next cycle waters in full and re-banks — with the
+# baselines and the debt next to it kept, and nothing logged.
+@pytest.mark.parametrize(
+    "source",
+    [
+        {},  # a document written before Story 2.5: no key at all
+        {"rain_source": None},
+        {"rain_source": 42},
+        {"rain_source": ["a"]},
+        {"rain_source": {"entity_id": "sensor.a"}},
+        {"rain_source": True},
+    ],
+    ids=["absent", "none", "int", "list", "mapping", "bool"],
+)
+async def test_load_seed_reads_a_missing_or_malformed_rain_source_as_none(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+    source: dict[str, object],
+) -> None:
+    """Matrix "pre-2.5 / malformed source": seed None, keep the rest, log nothing."""
+    caplog.set_level(logging.DEBUG, logger=f"custom_components.{DOMAIN}")
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {
+            "ledger": {
+                "settled_cycle_id": "2026-07-30-evening",
+                "deficits": {"zone-1": 300},
+                "rain_baselines": {"zone-1": 12.0},
+                **source,
+            },
+        },
+    }
+
+    assert (await JournalAdapter(hass).async_load_seed()).ledger == {
+        "settled_cycle_id": "2026-07-30-evening",
+        "deficits": {"zone-1": 300},
+        "day_credit": None,
+        "rain_baselines": {"zone-1": 12.0},
+        "rain_source": None,
+    }
+    assert [record for record in caplog.records if DOMAIN in record.name] == []
+
+
+async def test_load_seed_keeps_a_string_rain_source(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+) -> None:
+    """A source as the engine wrote it seeds back next to its baselines."""
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {
+            "ledger": {
+                "settled_cycle_id": "2026-07-30-evening",
+                "deficits": {},
+                "rain_baselines": {"zone-1": 12.0},
+                "rain_source": GAUGE,
+            },
+        },
+    }
+
+    assert (await JournalAdapter(hass).async_load_seed()).ledger == {
+        "settled_cycle_id": "2026-07-30-evening",
+        "deficits": {},
+        "day_credit": None,
+        "rain_baselines": {"zone-1": 12.0},
+        "rain_source": GAUGE,
+    }
 
 
 async def test_rain_baselines_round_trip_through_a_reload_and_reduce_the_next_cycle(
@@ -1139,10 +1223,11 @@ async def test_rain_baselines_round_trip_through_a_reload_and_reduce_the_next_cy
 ) -> None:
     """AC 4, end to end: baselines written by the one writer, read by the one reader.
 
-    The morning cycle is quoted with the gauge at 12.0 and banks it. After
-    the unload the stored section carries the baseline; after the reload
-    the gauge reads 15.5 and the evening cycle (15 min base) is quoted
-    900 - 210 = 690 s with `rain_credit_s` 210.
+    The morning cycle is quoted with the gauge at 12.0 and banks it — under
+    the gauge's entity id (Story 2.5). After the unload the stored section
+    carries the baseline and the source; after the reload the same gauge
+    reads 15.5, so the baselines are comparable and the evening cycle (15
+    min base) is quoted 900 - 210 = 690 s with `rain_credit_s` 210.
     """
     freezer.move_to("2026-07-31 06:59:00+02:00")
     set_gauge(hass, "12.0")
@@ -1169,11 +1254,13 @@ async def test_rain_baselines_round_trip_through_a_reload_and_reduce_the_next_cy
         "deficits": {},
         "day_credit": None,
         "rain_baselines": {zone_id: 12.0},
+        "rain_source": GAUGE,
     }
-    assert (stored["run"]["status"], stored["run"]["rain_total_mm"]) == (
-        "completed",
-        12.0,
-    )
+    assert (
+        stored["run"]["status"],
+        stored["run"]["rain_total_mm"],
+        stored["run"]["rain_source"],
+    ) == ("completed", 12.0, GAUGE)
 
     set_gauge(hass, "15.5")
     assert await hass.config_entries.async_setup(entry.entry_id)
@@ -1181,11 +1268,12 @@ async def test_rain_baselines_round_trip_through_a_reload_and_reduce_the_next_cy
     register_switch_domain(hass)
     sequencer = entry.runtime_data.sequencer
     assert sequencer.ledger.rain_baseline_mm(zone_id) == 12.0
+    assert sequencer.ledger.rain_source == GAUGE
 
     await fire_at(hass, freezer, "2026-07-31 20:00:00+02:00")
     run = sequencer.current_run
     assert run is not None
-    assert run.rain_total_mm == 15.5
+    assert (run.rain_total_mm, run.rain_source) == (15.5, GAUGE)
     zone = run.zone_runs[0]
     assert (zone.duration_s, zone.base_s, zone.rain_credit_s) == (690, 900, 210)
 
