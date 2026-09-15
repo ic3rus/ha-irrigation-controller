@@ -127,7 +127,7 @@ def make_runner(
             ),
         ),
         journal=JournalAdapter(hass),
-        anomalies=AnomalyManager(hass),
+        anomalies=AnomalyManager(hass, entry),
         rain=rain,
     )
     return CycleRunner(hass, entry, sequencer=sequencer, clock=clock), sequencer
@@ -384,7 +384,7 @@ async def test_each_engine_step_pushes_the_dispatcher_signal(
             cycle_id_provider=lambda: None,
         ),
         journal=JournalAdapter(hass),
-        anomalies=AnomalyManager(hass),
+        anomalies=AnomalyManager(hass, entry),
     )
     runner = CycleRunner(hass, entry, sequencer=sequencer, clock=clock)
     pushes = 0
@@ -679,7 +679,9 @@ async def test_an_unconfirmed_actuation_raises_an_anomaly_and_the_cycle_continue
     unsubscribe()
 
     anomalies = entry.runtime_data.anomalies
-    assert AnomalyKind.VALVE_OPEN_UNCONFIRMED in anomalies.open_anomalies
+    assert AnomalyKind.VALVE_OPEN_UNCONFIRMED in {
+        record.kind for record in anomalies.open_anomalies
+    }
     last = anomalies.last_anomaly
     assert last is not None
     assert last.context["entity_id"] == VALVE_1
@@ -1010,7 +1012,7 @@ async def test_a_command_wrapper_pushes_the_dispatcher_signal(
             cycle_id_provider=lambda: None,
         ),
         journal=JournalAdapter(hass),
-        anomalies=AnomalyManager(hass),
+        anomalies=AnomalyManager(hass, entry),
     )
     runner = CycleRunner(hass, entry, sequencer=sequencer, clock=HaClock())
     pushes = 0
@@ -1083,7 +1085,7 @@ def make_entry_runner(
             ),
         ),
         journal=JournalAdapter(hass),
-        anomalies=AnomalyManager(hass),
+        anomalies=AnomalyManager(hass, entry),
     )
     runner = CycleRunner(hass, entry, sequencer=sequencer, clock=HaClock())
     return runner, sequencer, entry

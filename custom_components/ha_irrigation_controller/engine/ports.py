@@ -132,10 +132,23 @@ class AnomalyKind(StrEnum):
 class AnomalyPort(Protocol):
     """Reporting seam for anomalies — no feature ever notifies directly (AD-9).
 
-    In 1.4 tests this is a recording fake; Story 1.5 connects it to the
-    anomaly-manager seed (notify once, persist until seen).
+    In the engine suites this is a recording fake; the adapter behind it is
+    the anomaly manager (notify once, persist until seen — Story 3.1).
+
+    `clear` is the OTHER half of the seam: the engine says "healthy again"
+    about a subject it just confirmed, and the manager closes whatever it has
+    open for that kind and subject. The engine calls it on every confirmed
+    actuation, every successful save and every terminal cycle status — it
+    never knows whether anything was open, so clearing nothing must be a
+    no-op on the adapter side. Contexts carry the same keys as the matching
+    `report` (`entity_id`, `zone_id`, `cycle_id`), which is how the adapter
+    finds the subject.
     """
 
     def report(self, kind: AnomalyKind, context: dict[str, object]) -> None:
         """Report one anomaly with its context payload."""
+        ...
+
+    def clear(self, kind: AnomalyKind, context: dict[str, object]) -> None:
+        """Declare `kind` healthy again for the subject `context` names."""
         ...

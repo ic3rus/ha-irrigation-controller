@@ -830,3 +830,239 @@ async def test_journal_snapshot_carries_what_a_restore_needs() -> None:
     active = final["run"]
     assert isinstance(active, dict)
     assert active["cycle_id"] == "2026-07-31-evening"
+
+
+# --------------------------------------------------------------------------
+# The clear half of the anomaly seam (Story 3.1): "healthy again" comes from
+# the engine — a confirmed actuation, a landed save, a terminal status.
+# --------------------------------------------------------------------------
+
+
+def actuation_clears(
+    anomalies: FakeAnomalyPort,
+) -> list[tuple[AnomalyKind, str | None]]:
+    """Return the (kind, subject) of every clear that is not a journal clear.
+
+    A successful save clears `JOURNAL_SAVE_FAILED` on EVERY transition, so
+    the actuation story is easier to read with those filtered out; they are
+    pinned separately.
+    """
+    return [
+        (kind, str(context.get("zone_id", context.get("entity_id"))))
+        for kind, context in anomalies.clears
+        if kind is not AnomalyKind.JOURNAL_SAVE_FAILED
+    ]
+
+
+async def test_a_nominal_cycle_reports_nothing_and_clears_each_confirmed_command() -> (
+    None
+):
+    """Nominal silence AND the exact clears: one kind per confirmed command.
+
+    A confirmed ON clears only the `*_on/open` kind of its subject, a
+    confirmed OFF only the `*_off/close` kind — a confirmation proves exactly
+    the command it confirmed. The terminal status clears
+    `CYCLE_INTERRUPTED`. Nothing is ever REPORTED.
+    """
+    sequencer, _, journal, anomalies = make_sequencer(
+        make_plan(
+            make_zone("zone-1", valve=VALVE_1, morning_s=600),
+            make_zone("zone-2", valve=VALVE_2, morning_s=900),
+        ),
+    )
+    clock = VirtualClock(aware(7))
+
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await run_to_idle(sequencer, clock)
+
+    assert anomalies.reports == []
+    assert actuation_clears(anomalies) == [
+        (AnomalyKind.PUMP_ON_UNCONFIRMED, PUMP),
+        (AnomalyKind.VALVE_OPEN_UNCONFIRMED, "zone-1"),
+        (AnomalyKind.VALVE_CLOSE_UNCONFIRMED, "zone-1"),
+        (AnomalyKind.VALVE_OPEN_UNCONFIRMED, "zone-2"),
+        (AnomalyKind.VALVE_CLOSE_UNCONFIRMED, "zone-2"),
+        (AnomalyKind.PUMP_OFF_UNCONFIRMED, PUMP),
+        (AnomalyKind.CYCLE_INTERRUPTED, "None"),
+    ]
+    interrupted = [
+        context
+        for kind, context in anomalies.clears
+        if kind is AnomalyKind.CYCLE_INTERRUPTED
+    ]
+    assert interrupted == [{"cycle_id": "2026-07-31-morning"}]
+    # One journal clear per landed save, each with the empty controller-level
+    # context — the adapter needs no subject to find the one issue.
+    journal_clears = [
+        context
+        for kind, context in anomalies.clears
+        if kind is AnomalyKind.JOURNAL_SAVE_FAILED
+    ]
+    assert journal_clears == [{}] * len(journal.snapshots)
+
+
+async def test_a_failed_open_is_not_cleared_by_the_confirmed_close_of_that_slot() -> (
+    None
+):
+    """Unconfirmed open, confirmed close: the close proves nothing about the open.
+
+    The switch adapter reads "already in the target state" as confirmed, so
+    the OFF of a valve that never opened confirms trivially — clearing
+    `VALVE_OPEN_UNCONFIRMED` on it would delete the issue within the slot,
+    before the operator ever saw it. Only `VALVE_CLOSE_UNCONFIRMED` of the
+    zone is cleared, with the same subject keys the report carried.
+    """
+    sequencer, switches, _, anomalies = make_sequencer(three_zone_plan())
+    switches.failing.add(("on", VALVE_1))
+    clock = VirtualClock(aware(7))
+
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await run_to_idle(sequencer, clock)
+
+    assert [kind for kind, _ in anomalies.reports] == [
+        AnomalyKind.VALVE_OPEN_UNCONFIRMED,
+    ]
+    zone_1_clears = [
+        (kind, context)
+        for kind, context in anomalies.clears
+        if context.get("zone_id") == "zone-1"
+    ]
+    assert zone_1_clears == [
+        (
+            AnomalyKind.VALVE_CLOSE_UNCONFIRMED,
+            {
+                "cycle_id": "2026-07-31-morning",
+                "zone_id": "zone-1",
+                "entity_id": VALVE_1,
+            },
+        ),
+    ]
+
+
+async def test_a_valve_that_recovers_is_cleared_by_its_next_confirmed_open() -> None:
+    """The open that fails today is cleared by the open that confirms tomorrow."""
+    sequencer, switches, _, anomalies = make_sequencer(three_zone_plan())
+    switches.failing.add(("on", VALVE_1))
+    clock = VirtualClock(aware(7))
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await run_to_idle(sequencer, clock)
+    assert (AnomalyKind.VALVE_OPEN_UNCONFIRMED, "zone-1") not in actuation_clears(
+        anomalies,
+    )
+
+    switches.failing.clear()
+    clock.advance_to(aware(7, day=1, month=8))
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await run_to_idle(sequencer, clock)
+
+    open_clears = [
+        context
+        for kind, context in anomalies.clears
+        if kind is AnomalyKind.VALVE_OPEN_UNCONFIRMED
+        and context.get("zone_id") == "zone-1"
+    ]
+    assert open_clears == [
+        {
+            "cycle_id": "2026-08-01-morning",
+            "zone_id": "zone-1",
+            "entity_id": VALVE_1,
+        },
+    ]
+    assert len(anomalies.reports) == 1
+
+
+async def test_an_unconfirmed_actuation_clears_nothing_for_its_subject() -> None:
+    """A pump that confirms neither ON nor OFF is never declared healthy."""
+    sequencer, switches, _, anomalies = make_sequencer(three_zone_plan())
+    switches.failing.add(("on", PUMP))
+    switches.failing.add(("off", PUMP))
+    clock = VirtualClock(aware(7))
+
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await run_to_idle(sequencer, clock)
+
+    assert [kind for kind, _ in anomalies.reports] == [
+        AnomalyKind.PUMP_ON_UNCONFIRMED,
+        AnomalyKind.PUMP_OFF_UNCONFIRMED,
+    ]
+    assert [
+        kind for kind, context in anomalies.clears if context.get("entity_id") == PUMP
+    ] == []
+
+
+async def test_a_recovered_journal_clears_journal_save_failed() -> None:
+    """Storage back → the first landed save clears, with the empty context."""
+    sequencer, _, journal, anomalies = make_sequencer(three_zone_plan())
+    journal.raising = True
+    clock = VirtualClock(aware(7))
+
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    assert [kind for kind, _ in anomalies.reports] == [
+        AnomalyKind.JOURNAL_SAVE_FAILED,
+    ]
+    assert anomalies.clears == []
+
+    journal.raising = False
+    await run_to_idle(sequencer, clock)
+
+    journal_clears = [
+        context
+        for kind, context in anomalies.clears
+        if kind is AnomalyKind.JOURNAL_SAVE_FAILED
+    ]
+    assert journal_clears
+    assert journal_clears[0] == {}
+    # Failed once, never again: exactly one report for the whole cycle.
+    assert len(anomalies.reports) == 1
+
+
+async def test_a_cancelled_cycle_clears_cycle_interrupted_too() -> None:
+    """CANCELLED is a terminal status: it supersedes an interrupted cycle."""
+    sequencer, _, _, anomalies = make_sequencer(three_zone_plan())
+    clock = VirtualClock(aware(7))
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await sequencer.advance(clock.now())
+    assert (AnomalyKind.CYCLE_INTERRUPTED, "None") not in actuation_clears(anomalies)
+
+    clock.advance_to(aware(7, 3))
+    assert await sequencer.async_cancel_cycle(clock.now())
+
+    interrupted = [
+        context
+        for kind, context in anomalies.clears
+        if kind is AnomalyKind.CYCLE_INTERRUPTED
+    ]
+    assert interrupted == [{"cycle_id": "2026-07-31-morning"}]
+    assert anomalies.reports == []
+
+
+async def test_an_anomaly_port_whose_clear_raises_never_stops_the_water() -> None:
+    """`_clear` has `_report`'s defence: a broken seam is not a stopped cycle."""
+
+    class RaisingClearPort(FakeAnomalyPort):
+        def clear(
+            self,
+            kind: AnomalyKind,  # noqa: ARG002 — the port signature
+            context: dict[str, object],  # noqa: ARG002
+        ) -> None:
+            msg = "the manager blew up clearing"
+            raise RuntimeError(msg)
+
+    switches = FakeSwitchPort()
+    anomalies = RaisingClearPort()
+    sequencer = Sequencer(
+        three_zone_plan(),
+        switches=switches,
+        journal=FakeJournalPort(),
+        anomalies=anomalies,
+    )
+    clock = VirtualClock(aware(7))
+
+    await sequencer.request_cycle(CycleKind.MORNING, clock.now())
+    await run_to_idle(sequencer, clock)
+
+    run = sequencer.last_run
+    assert run is not None
+    assert run.status is CycleStatus.COMPLETED
+    assert switches.commands[-1] == ("off", PUMP)
+    assert anomalies.reports == []

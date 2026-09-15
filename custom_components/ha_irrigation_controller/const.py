@@ -31,6 +31,12 @@ CONF_MORNING_ENABLED = "morning_enabled"
 CONF_MORNING_START = "morning_start"
 CONF_EVENING_START = "evening_start"
 CONF_ACTUATION_TIMEOUT = "actuation_timeout"
+# The notify ENTITY (`notify.*`) anomalies are pushed to (Story 3.1). Optional
+# and clearable like the weather sensors: absent means no push, everything
+# else in the anomaly pipeline still happens. Legacy `notify.<service>` names
+# are not supported — the option holds an entity id, so the registry tracker
+# follows a rename and reports a removal like any other configured entity.
+CONF_NOTIFY_TARGET = "notify_target"
 
 # Actuation confirmation timeout — SECONDS at every surface (UI, storage,
 # engine), unlike zone durations (minutes at UI): this bounds how long a switch
@@ -60,9 +66,12 @@ ATTR_DURATION = "duration"
 ATTR_ENABLED = "enabled"
 
 # The SINGLE bus event type this integration ever fires (conventions table).
-# Payloads carry an "event_type" discriminator ("anomaly" today; more kinds
-# join in later stories) — never a second event type per feature.
+# Payloads carry an "event_type" discriminator — never a second event type
+# per feature. Two values exist today, both fired by the anomaly manager
+# alone (Story 3.1): every report and every clear.
 EVENT_HA_IRRIGATION_CONTROLLER = "ha_irrigation_controller_event"
+EVENT_TYPE_ANOMALY = "anomaly"
+EVENT_TYPE_ANOMALY_CLEARED = "anomaly_cleared"
 
 
 def engine_state_signal(entry_id: str) -> str:

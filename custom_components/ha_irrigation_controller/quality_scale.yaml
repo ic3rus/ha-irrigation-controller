@@ -45,3 +45,8 @@ rules:
   action-exceptions:
     status: done
     comment: Every failure path of the four actions raises a translated ServiceValidationError (no_cycle_running, cycle_already_running, no_zones, unknown_zone, invalid_duration, cycles_overlap); the "no entry"/"not loaded"/"multiple entries" cases come already translated from async_get_config_entry. Range and identity checks live in the handlers rather than the voluptuous schemas, so a bad value never surfaces as an untranslated vol.Invalid.
+
+  # Gold
+  repair-issues:
+    status: done
+    comment: Every anomaly (unconfirmed pump/valve actuation, failed journal write, missing configured entity, interrupted cycle) is one deduplicated Repairs issue raised by the anomaly manager (adapters/anomalies.py), fixable through an acknowledge flow (repairs.py), and deleted automatically when the engine confirms the subject healthy again or the operator acknowledges or ignores it. Nothing else in the integration creates issues.

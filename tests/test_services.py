@@ -192,7 +192,7 @@ async def test_cancel_cycle_stops_the_running_cycle(
     assert run.status is CycleStatus.CANCELLED
     # A permitted non-watering cause: an operator cancel is an intent, not a
     # fault, so nothing is raised (AD-4).
-    assert entry.runtime_data.anomalies.open_anomalies == frozenset()
+    assert entry.runtime_data.anomalies.open_anomalies == ()
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
@@ -292,7 +292,7 @@ async def test_run_now_starts_a_full_cycle_immediately(
     assert finished.status is CycleStatus.COMPLETED
     assert finished.manual is True
     assert idle_entry.runtime_data.sequencer.current_run is None
-    assert idle_entry.runtime_data.anomalies.open_anomalies == frozenset()
+    assert idle_entry.runtime_data.anomalies.open_anomalies == ()
 
     assert await hass.config_entries.async_unload(idle_entry.entry_id)
     await hass.async_block_till_done()
@@ -474,7 +474,7 @@ async def test_set_season_false_then_a_daily_start_waters_nothing(
 
     assert entry.runtime_data.sequencer.current_run is None
     assert calls == []
-    assert entry.runtime_data.anomalies.open_anomalies == frozenset()
+    assert entry.runtime_data.anomalies.open_anomalies == ()
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

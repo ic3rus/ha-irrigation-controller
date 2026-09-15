@@ -149,7 +149,7 @@ async def test_season_off_suspends_the_daily_start_without_an_anomaly(
     assert sequencer.current_run is None
     assert not sequencer.deferred_kinds
     assert calls == []
-    assert entry.runtime_data.anomalies.open_anomalies == frozenset()
+    assert entry.runtime_data.anomalies.open_anomalies == ()
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

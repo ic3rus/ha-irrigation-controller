@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import time
 from typing import TYPE_CHECKING, Any
 
 import pytest
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.const import STATE_UNAVAILABLE
-from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.const import ATTR_ENTITY_ID, STATE_UNAVAILABLE
+from homeassistant.helpers import (
+    device_registry as dr,
+    entity_registry as er,
+    issue_registry as ir,
+)
 from homeassistant.helpers.device_registry import DeviceEntryType
 from homeassistant.helpers.entity_registry import EVENT_ENTITY_REGISTRY_UPDATED
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -32,9 +37,11 @@ from custom_components.ha_irrigation_controller.const import (
     CONF_ACTUATION_TIMEOUT,
     CONF_EVENING_START,
     CONF_MORNING_DURATION,
+    CONF_NOTIFY_TARGET,
     CONF_RAIN_SENSOR,
     DEFAULT_ACTUATION_TIMEOUT_S,
     DOMAIN,
+    EVENT_HA_IRRIGATION_CONTROLLER,
     MAX_ACTUATION_TIMEOUT_S,
     MAX_RAIN_FACTOR,
     MAX_ZONE_DURATION_MINUTES,
@@ -50,7 +57,10 @@ from custom_components.ha_irrigation_controller.engine.config import (
     build_plan,
     parse_actuation_timeout,
 )
-from custom_components.ha_irrigation_controller.engine.plan import ControllerPlan
+from custom_components.ha_irrigation_controller.engine.plan import (
+    ControllerPlan,
+    CycleKind,
+)
 from custom_components.ha_irrigation_controller.engine.ports import AnomalyKind
 from custom_components.ha_irrigation_controller.engine.runs import CycleStatus
 from custom_components.ha_irrigation_controller.engine.sequencer import (
@@ -64,6 +74,7 @@ from tests.common import (
     VALVE_2,
     controller_entry,
     fire_at,
+    register_notify_domain,
     register_switch_domain,
     zone_subentry_data,
 )
@@ -72,7 +83,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from freezegun.api import FrozenDateTimeFactory
-    from homeassistant.core import HomeAssistant
+    from homeassistant.core import HomeAssistant, ServiceCall
 
 _MODULE = "custom_components.ha_irrigation_controller"
 
@@ -678,7 +689,9 @@ async def test_a_forced_reload_mid_cycle_closes_the_valve_and_the_pump(
 
     assert hass.states.is_state(VALVE_1, "off")
     assert hass.states.is_state(PUMP, "off")
-    assert AnomalyKind.CYCLE_INTERRUPTED in anomalies_before.open_anomalies
+    assert AnomalyKind.CYCLE_INTERRUPTED in {
+        record.kind for record in anomalies_before.open_anomalies
+    }
     last = anomalies_before.last_anomaly
     assert last is not None
     assert last.context["zone_id"] == next(
@@ -689,6 +702,49 @@ async def test_a_forced_reload_mid_cycle_closes_the_valve_and_the_pump(
     assert entry.state is ConfigEntryState.LOADED
     assert entry.runtime_data.anomalies is not anomalies_before
     assert entry.runtime_data.sequencer.current_run is None
+    # The rebuilt manager re-seeded the interruption from its Repairs issue
+    # (Story 3.1): health survives the reload, and the issue is still there.
+    assert [
+        record.issue_id for record in entry.runtime_data.anomalies.open_anomalies
+    ] == [
+        "cycle_interrupted",
+    ]
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "cycle_interrupted") is not None
+
+
+async def test_the_cycle_interrupted_push_survives_the_unload_that_raised_it(
+    hass: HomeAssistant,
+    running_entry: MockConfigEntry,
+) -> None:
+    """The push task is hass-owned: the entry unload must not cancel it.
+
+    `runner.async_suspend()` raises `cycle_interrupted` from inside the
+    unload; an entry-owned background task would be cancelled right after
+    the on-unload hooks, before a real notify target (which awaits network)
+    ever delivered. The handler here parks on an event until the reload has
+    fully completed, then records — a cancelled task never reaches the
+    record.
+    """
+    entry = running_entry
+    delivered: list[dict[str, Any]] = []
+    release = asyncio.Event()
+
+    async def _slow_notify(call: ServiceCall) -> None:
+        await release.wait()
+        delivered.append(dict(call.data))
+
+    hass.services.async_register("notify", "send_message", _slow_notify)
+
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+    assert delivered == []
+
+    release.set()
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert [call[ATTR_ENTITY_ID] for call in delivered] == ["notify.mobile_app_phone"]
+    assert "cycle interrupted" in delivered[0]["title"]
 
 
 async def test_the_listener_reloads_at_once_when_the_entry_has_no_runtime(
@@ -828,7 +884,9 @@ async def test_a_forced_unload_mid_cycle_closes_the_valve_and_the_pump(
 
     assert hass.states.is_state(VALVE_1, "off")
     assert hass.states.is_state(PUMP, "off")
-    assert AnomalyKind.CYCLE_INTERRUPTED in anomalies_before.open_anomalies
+    assert AnomalyKind.CYCLE_INTERRUPTED in {
+        record.kind for record in anomalies_before.open_anomalies
+    }
     assert entry.state is ConfigEntryState.NOT_LOADED
     assert not hasattr(entry, "runtime_data")
 
@@ -1303,7 +1361,7 @@ async def test_a_journal_written_by_2_4_waters_in_full_once_then_modulates(
     run = sequencer.current_run
     assert run is not None
     assert (run.zone_runs[0].duration_s, run.zone_runs[0].rain_credit_s) == (780, 120)
-    assert entry.runtime_data.anomalies.open_anomalies == frozenset()
+    assert entry.runtime_data.anomalies.open_anomalies == ()
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
@@ -1374,7 +1432,7 @@ async def test_changing_the_rain_sensor_re_banks_on_the_next_cycle(
     assert sequencer.current_run is None
     assert sequencer.ledger.as_dict()["rain_baselines"] == {"zone-a": 1200.0}
     assert sequencer.ledger.rain_source == "sensor.rain_gauge_2"
-    assert entry.runtime_data.anomalies.open_anomalies == frozenset()
+    assert entry.runtime_data.anomalies.open_anomalies == ()
 
     hass.states.async_set(
         "sensor.rain_gauge_2", "1203.0", {"unit_of_measurement": "mm"}
@@ -1429,6 +1487,246 @@ async def test_an_entry_without_a_rain_sensor_quotes_unmodulated(
     assert run is not None
     assert run.rain_total_mm is None
     assert (run.zone_runs[0].duration_s, run.zone_runs[0].rain_credit_s) == (600, 0)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+# --------------------------------------------------------------------------
+# Story 3.1 — the anomaly pipeline wired through setup, reload and removal
+# --------------------------------------------------------------------------
+
+
+def domain_issue_ids(hass: HomeAssistant) -> set[str]:
+    """Return the ids of every Repairs issue of this domain."""
+    return {
+        issue_id for domain, issue_id in ir.async_get(hass).issues if domain == DOMAIN
+    }
+
+
+async def test_a_new_notify_target_is_used_after_the_options_edit(
+    hass: HomeAssistant,
+) -> None:
+    """AC 1: the next newly opened anomaly is pushed to the NEW target, no restart.
+
+    The options edit reloads the entry (idle), which rebuilds the manager
+    with an adapter bound to the new entity id.
+    """
+    calls = register_notify_domain(hass)
+    entry = controller_entry()
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    hass.config_entries.async_update_entry(
+        entry,
+        options={**CONTROLLER_OPTIONS, CONF_NOTIFY_TARGET: "notify.mobile_app_tablet"},
+    )
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+
+    entry.runtime_data.anomalies.report(
+        AnomalyKind.PUMP_ON_UNCONFIRMED,
+        {"cycle_id": "2026-07-31-morning", "entity_id": PUMP},
+    )
+    await hass.async_block_till_done()
+
+    assert [call.data[ATTR_ENTITY_ID] for call in calls] == ["notify.mobile_app_tablet"]
+    assert "pump on unconfirmed" in calls[0].data["title"]
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_an_entry_without_a_notify_target_sets_up_and_pushes_nothing(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Matrix "No/invalid target": one WARNING at setup, never a setup failure."""
+    calls = register_notify_domain(hass)
+    entry = controller_entry(
+        {
+            key: value
+            for key, value in CONTROLLER_OPTIONS.items()
+            if key != CONF_NOTIFY_TARGET
+        },
+    )
+    entry.add_to_hass(hass)
+    caplog.set_level(logging.WARNING)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    entry.runtime_data.anomalies.report(
+        AnomalyKind.PUMP_ON_UNCONFIRMED,
+        {"cycle_id": "2026-07-31-morning", "entity_id": PUMP},
+    )
+    await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert calls == []
+    assert domain_issue_ids(hass) == {f"pump_on_unconfirmed:{PUMP}"}
+    assert (
+        len(
+            [
+                r
+                for r in caplog.records
+                if "No notify target is configured" in r.getMessage()
+            ]
+        )
+        == 1
+    )
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_a_reload_re_seeds_the_open_anomaly_without_a_second_push(
+    hass: HomeAssistant,
+) -> None:
+    """Matrix "Reload with open issue": health survives, the operator is not re-told."""
+    calls = register_notify_domain(hass)
+    entry = controller_entry()
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    entry.runtime_data.anomalies.report(
+        AnomalyKind.PUMP_ON_UNCONFIRMED,
+        {"cycle_id": "2026-07-31-morning", "entity_id": PUMP},
+    )
+    await hass.async_block_till_done()
+    manager_before = entry.runtime_data.anomalies
+
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    manager = entry.runtime_data.anomalies
+    assert manager is not manager_before
+    assert [record.issue_id for record in manager.open_anomalies] == [
+        f"pump_on_unconfirmed:{PUMP}",
+    ]
+    assert len(calls) == 1
+    # Re-reported after the reload: still not new, still no push.
+    manager.report(
+        AnomalyKind.PUMP_ON_UNCONFIRMED,
+        {"cycle_id": "2026-07-31-evening", "entity_id": PUMP},
+    )
+    await hass.async_block_till_done()
+    assert len(calls) == 1
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_removing_the_entry_deletes_every_repairs_issue(
+    hass: HomeAssistant,
+) -> None:
+    """`async_remove_entry` leaves no issue of the domain behind."""
+    entry = controller_entry()
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    entry.runtime_data.anomalies.report(
+        AnomalyKind.PUMP_ON_UNCONFIRMED,
+        {"cycle_id": "2026-07-31-morning", "entity_id": PUMP},
+    )
+    entry.runtime_data.anomalies.report(AnomalyKind.JOURNAL_SAVE_FAILED, {})
+    await hass.async_block_till_done()
+    assert len(domain_issue_ids(hass)) == 2
+
+    await hass.config_entries.async_remove(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert domain_issue_ids(hass) == set()
+
+
+async def test_a_nominal_day_pushes_nothing_opens_nothing_and_fires_no_anomaly(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """AC 4: rain-reduced morning, run-now at noon, waived evening — silence.
+
+    Zone A banked 10.0 mm under the configured gauge; at 13.0 the morning
+    cycle is credited 180 s (420 s instead of 600). The run-now at noon
+    credits the day, so the 20:00 evening cycle is waived. Not one notify
+    call, not one Repairs issue, not one `anomaly` event across the day —
+    and the health entity stays `off`.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    set_gauge(hass, "13.0")
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {
+            "schema_version": JOURNAL_SCHEMA_VERSION,
+            "history": [],
+            "ledger": {
+                "settled_cycle_id": "2026-07-30-evening",
+                "deficits": {},
+                "day_credit": None,
+                "rain_baselines": {"zone-a": 10.0},
+                "rain_source": "sensor.rain_gauge",
+            },
+        },
+    }
+    notify_calls = register_notify_domain(hass)
+    anomaly_events: list[Any] = []
+    hass.bus.async_listen(
+        EVENT_HA_IRRIGATION_CONTROLLER,
+        lambda event: (
+            anomaly_events.append(event)
+            if event.data.get("event_type") == "anomaly"
+            else None
+        ),
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[
+            {**zone_subentry_data("Zone A", VALVE_1), "subentry_id": "zone-a"},
+        ],
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switch_domain(hass)
+    sequencer = entry.runtime_data.sequencer
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    run = sequencer.current_run
+    assert run is not None
+    assert (run.zone_runs[0].duration_s, run.zone_runs[0].rain_credit_s) == (420, 180)
+    await fire_at(hass, freezer, "2026-07-31 07:07:00+02:00")
+    assert sequencer.current_run is None
+    assert run.status is CycleStatus.COMPLETED
+
+    freezer.move_to("2026-07-31 12:00:00+02:00")
+    assert await entry.runtime_data.runner.async_run_now(CycleKind.EVENING)
+    await hass.async_block_till_done()
+    await fire_at(hass, freezer, "2026-07-31 12:15:00+02:00")
+    assert sequencer.current_run is None
+    assert sequencer.ledger.day_credit == "2026-07-31"
+
+    # 20:00: the scheduled evening cycle is waived by the run-now's credit —
+    # nothing is created (no `current_run`) and the credit is consumed.
+    await fire_at(hass, freezer, "2026-07-31 20:00:00+02:00")
+    assert sequencer.current_run is None
+    assert sequencer.ledger.day_credit is None
+
+    assert notify_calls == []
+    assert anomaly_events == []
+    assert domain_issue_ids(hass) == set()
+    assert entry.runtime_data.anomalies.open_anomalies == ()
+    health = er.async_get(hass).async_get_entity_id(
+        "binary_sensor",
+        DOMAIN,
+        f"{entry.entry_id}_health",
+    )
+    assert health is not None
+    assert hass.states.is_state(health, "off")
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

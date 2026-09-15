@@ -280,3 +280,31 @@ async def test_a_deferred_cycle_popped_after_the_swap_uses_the_new_plan() -> Non
     assert [zone.duration_s for zone in evening.zone_runs] == [300, 120]
     assert evening.zone_runs[0].planned_end == aware(7, 25)
     assert sequencer.next_wakeup() == aware(7, 25)
+
+
+async def test_suspend_clears_what_it_confirms_before_reporting_the_interruption() -> (
+    None
+):
+    """The confirmed close and pump-off are "healthy again" even on a suspend.
+
+    A suspend commands two actuations through the same port as a cycle; when
+    they confirm, the kinds they prove are cleared (the close, the pump-off),
+    and ONLY then is `CYCLE_INTERRUPTED` reported — a suspend never clears
+    that one.
+    """
+    sequencer, _, _, anomalies = make_sequencer(two_zone_plan())
+    clock = VirtualClock(aware(7))
+    await start_morning_cycle(sequencer, clock)
+
+    assert await sequencer.async_suspend(clock.now())
+
+    assert [kind for kind, _ in anomalies.reports] == [AnomalyKind.CYCLE_INTERRUPTED]
+    assert [
+        (kind, context.get("zone_id", context.get("entity_id")))
+        for kind, context in anomalies.clears
+        if kind is not AnomalyKind.JOURNAL_SAVE_FAILED
+    ][-2:] == [
+        (AnomalyKind.VALVE_CLOSE_UNCONFIRMED, "zone-1"),
+        (AnomalyKind.PUMP_OFF_UNCONFIRMED, PUMP),
+    ]
+    assert AnomalyKind.CYCLE_INTERRUPTED not in {kind for kind, _ in anomalies.clears}

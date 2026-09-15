@@ -374,26 +374,23 @@ class Sequencer:
                         on=False,
                         entity_id=zone.valve_entity_id,
                     )
-                    if not confirmed:
-                        self._report(
-                            AnomalyKind.VALVE_CLOSE_UNCONFIRMED,
-                            {
-                                "cycle_id": run.cycle_id,
-                                "zone_id": zone.zone_id,
-                                "entity_id": zone.valve_entity_id,
-                            },
-                            error,
-                        )
+                    self._valve_outcome(
+                        run,
+                        zone,
+                        confirmed=confirmed,
+                        error=error,
+                        kind=AnomalyKind.VALVE_CLOSE_UNCONFIRMED,
+                    )
                 confirmed, error = await self._command(
                     on=False,
                     entity_id=run.pump_entity_id,
                 )
-                if not confirmed:
-                    self._report(
-                        AnomalyKind.PUMP_OFF_UNCONFIRMED,
-                        {"cycle_id": run.cycle_id, "entity_id": run.pump_entity_id},
-                        error,
-                    )
+                self._pump_outcome(
+                    run,
+                    confirmed=confirmed,
+                    error=error,
+                    kind=AnomalyKind.PUMP_OFF_UNCONFIRMED,
+                )
             self._report(
                 AnomalyKind.CYCLE_INTERRUPTED,
                 {
@@ -422,18 +419,15 @@ class Sequencer:
         confirmed, error = await self._command(on=False, entity_id=zone.valve_entity_id)
         zone.close_confirmed = confirmed
         zone.actual_end = now
-        if not confirmed:
-            # Exactly what `_finish_zone` does: a failing valve reports and the
-            # sequence proceeds — it must never be what wedges a cancel.
-            self._report(
-                AnomalyKind.VALVE_CLOSE_UNCONFIRMED,
-                {
-                    "cycle_id": run.cycle_id,
-                    "zone_id": zone.zone_id,
-                    "entity_id": zone.valve_entity_id,
-                },
-                error,
-            )
+        # Exactly what `_finish_zone` does: a failing valve reports and the
+        # sequence proceeds — it must never be what wedges a cancel.
+        self._valve_outcome(
+            run,
+            zone,
+            confirmed=confirmed,
+            error=error,
+            kind=AnomalyKind.VALVE_CLOSE_UNCONFIRMED,
+        )
         if zone.status is not ZoneRunStatus.FAILED:
             zone.status = ZoneRunStatus.COMPLETED
 
@@ -480,14 +474,14 @@ class Sequencer:
             return
         confirmed, error = await self._command(on=True, entity_id=run.pump_entity_id)
         run.pump_on_confirmed = confirmed
-        if not confirmed:
-            # Fail-wet (AD-4/FR4): pressure is doubtful, zones still run
-            # their slots; aborting would be the one unforgivable branch.
-            self._report(
-                AnomalyKind.PUMP_ON_UNCONFIRMED,
-                {"cycle_id": run.cycle_id, "entity_id": run.pump_entity_id},
-                error,
-            )
+        # Fail-wet (AD-4/FR4): pressure is doubtful, zones still run their
+        # slots; aborting would be the one unforgivable branch.
+        self._pump_outcome(
+            run,
+            confirmed=confirmed,
+            error=error,
+            kind=AnomalyKind.PUMP_ON_UNCONFIRMED,
+        )
         run.status = CycleStatus.RUNNING
         await self._save()
         await self._open_zone(run, run.zone_runs[0], now)
@@ -510,21 +504,16 @@ class Sequencer:
         zone.actual_start = now
         confirmed, error = await self._command(on=True, entity_id=zone.valve_entity_id)
         zone.open_confirmed = confirmed
-        if confirmed:
-            zone.status = ZoneRunStatus.RUNNING
-        else:
-            # The slot is still consumed: its planned end stands, and the
-            # shortfall becomes ledger material in Epic 2 (AD-4).
-            zone.status = ZoneRunStatus.FAILED
-            self._report(
-                AnomalyKind.VALVE_OPEN_UNCONFIRMED,
-                {
-                    "cycle_id": run.cycle_id,
-                    "zone_id": zone.zone_id,
-                    "entity_id": zone.valve_entity_id,
-                },
-                error,
-            )
+        # An unconfirmed open still consumes the slot: its planned end stands,
+        # and the shortfall is ledger material (AD-4).
+        zone.status = ZoneRunStatus.RUNNING if confirmed else ZoneRunStatus.FAILED
+        self._valve_outcome(
+            run,
+            zone,
+            confirmed=confirmed,
+            error=error,
+            kind=AnomalyKind.VALVE_OPEN_UNCONFIRMED,
+        )
         await self._save()
 
     async def _finish_zone(self, run: CycleRun, zone: ZoneRun, now: datetime) -> None:
@@ -538,16 +527,13 @@ class Sequencer:
         confirmed, error = await self._command(on=False, entity_id=zone.valve_entity_id)
         zone.close_confirmed = confirmed
         zone.actual_end = now
-        if not confirmed:
-            self._report(
-                AnomalyKind.VALVE_CLOSE_UNCONFIRMED,
-                {
-                    "cycle_id": run.cycle_id,
-                    "zone_id": zone.zone_id,
-                    "entity_id": zone.valve_entity_id,
-                },
-                error,
-            )
+        self._valve_outcome(
+            run,
+            zone,
+            confirmed=confirmed,
+            error=error,
+            kind=AnomalyKind.VALVE_CLOSE_UNCONFIRMED,
+        )
         if zone.status is not ZoneRunStatus.FAILED:
             zone.status = ZoneRunStatus.COMPLETED
         await self._advance_slot(run, now)
@@ -621,13 +607,17 @@ class Sequencer:
                 entity_id=run.pump_entity_id,
             )
             run.pump_off_confirmed = confirmed
-            if not confirmed:
-                self._report(
-                    AnomalyKind.PUMP_OFF_UNCONFIRMED,
-                    {"cycle_id": run.cycle_id, "entity_id": run.pump_entity_id},
-                    error,
-                )
+            self._pump_outcome(
+                run,
+                confirmed=confirmed,
+                error=error,
+                kind=AnomalyKind.PUMP_OFF_UNCONFIRMED,
+            )
         run.status = status
+        # A cycle that reaches a terminal status supersedes an interrupted
+        # one (Story 3.1): `CYCLE_INTERRUPTED` is controller-level, so ANY
+        # completed or cancelled cycle is the proof the machine runs again.
+        self._clear(AnomalyKind.CYCLE_INTERRUPTED, {"cycle_id": run.cycle_id})
         self._ledger.settle(run)
         # Appended BEFORE the save and before the deferral branch below: a
         # deferred cycle is created in this same call, and the snapshot taken
@@ -867,6 +857,53 @@ class Sequencer:
         except Exception as err:  # noqa: BLE001 — see docstring: never abort a cycle
             return False, repr(err)
 
+    def _pump_outcome(
+        self,
+        run: CycleRun,
+        *,
+        confirmed: bool,
+        error: str | None,
+        kind: AnomalyKind,
+    ) -> None:
+        """Turn one pump actuation outcome into a report or a clear (Story 3.1).
+
+        Not confirmed → report `kind`. Confirmed → clear `kind`, and ONLY
+        `kind`: a confirmation proves exactly the command it confirmed. The
+        switch adapter reads "already in the target state" as confirmed, so
+        the no-op OFF of a pump that never turned on would otherwise erase
+        the `PUMP_ON_UNCONFIRMED` it just raised. The confirmation is the
+        engine's "healthy again", said by the engine, never by Home
+        Assistant.
+        """
+        context: dict[str, object] = {
+            "cycle_id": run.cycle_id,
+            "entity_id": run.pump_entity_id,
+        }
+        if confirmed:
+            self._clear(kind, context)
+        else:
+            self._report(kind, context, error)
+
+    def _valve_outcome(
+        self,
+        run: CycleRun,
+        zone: ZoneRun,
+        *,
+        confirmed: bool,
+        error: str | None,
+        kind: AnomalyKind,
+    ) -> None:
+        """Turn one valve outcome into a report or a clear; the subject is the zone."""
+        context: dict[str, object] = {
+            "cycle_id": run.cycle_id,
+            "zone_id": zone.zone_id,
+            "entity_id": zone.valve_entity_id,
+        }
+        if confirmed:
+            self._clear(kind, context)
+        else:
+            self._report(kind, context, error)
+
     def _report(
         self,
         kind: AnomalyKind,
@@ -880,6 +917,18 @@ class Sequencer:
         # seam must not be what stops the water.
         with contextlib.suppress(Exception):
             self._anomalies.report(kind, context)
+
+    def _clear(self, kind: AnomalyKind, context: dict[str, object]) -> None:
+        """Declare `kind` healthy again, with `_report`'s exact defence.
+
+        Called on every confirmation, every successful save and every
+        terminal status whether or not anything is open: the engine keeps no
+        record of what it reported (a reload rebuilds it empty while the
+        manager may still hold the open issue), so "clear if open" is the
+        adapter's decision, not the engine's.
+        """
+        with contextlib.suppress(Exception):
+            self._anomalies.clear(kind, context)
 
     async def _save(self) -> None:
         """Journal the current state — called on EVERY transition (NFR2).
@@ -914,6 +963,9 @@ class Sequencer:
             await self._journal.async_save(snapshot)
         except Exception as err:  # noqa: BLE001 — a failed save must not stop the water
             self._report(AnomalyKind.JOURNAL_SAVE_FAILED, {}, repr(err))
+        else:
+            # Storage is back: the write that just landed is the proof.
+            self._clear(AnomalyKind.JOURNAL_SAVE_FAILED, {})
 
 
 def _live_zone(run: CycleRun) -> ZoneRun | None:
