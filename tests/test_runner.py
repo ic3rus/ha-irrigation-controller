@@ -1703,6 +1703,109 @@ async def test_suspend_during_an_in_flight_advance_arms_nothing_and_reloads_noth
     assert len(calls) == commanded
 
 
+async def test_a_manual_pause_and_resume_keep_exactly_one_registration(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    paris: None,
+) -> None:
+    """AD-3 with Story 3.4 wired: the pause arms no timer of its own.
+
+    The runner's `async_switch_observed` is a mutating command like every
+    other: ONE clock read, the engine call, then the pinned `finally` triple.
+    It must never register a second point-in-time callback — while paused the
+    handle simply holds the watchdog's next window end, and the resume points
+    it at the started cycle's first boundary.
+    """
+    live = 0
+    peak = 0
+    real = getattr(timing, "async_track_point_in_time")  # noqa: B009 — an import, not an export
+
+    def _tracked(*args: Any, **kwargs: Any) -> Callable[[], None]:
+        nonlocal live, peak
+        unsubscribe = real(*args, **kwargs)
+        live += 1
+        peak = max(peak, live)
+
+        def _wrapped() -> None:
+            nonlocal live
+            live -= 1
+            unsubscribe()
+
+        return _wrapped
+
+    monkeypatch.setattr(timing, "async_track_point_in_time", _tracked)
+    calls = register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, sequencer, _ = make_entry_runner(hass, make_plan())
+    await runner.async_start()
+    assert live == 1
+
+    await runner.async_switch_observed(VALVE_1, is_on=True, manual=True)
+
+    assert sequencer.manual_override is True
+    assert live == 1
+
+    # The daily start fires into the pause: queued, nothing commanded.
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    assert sequencer.deferred_kinds == (CycleKind.MORNING,)
+    assert calls == []
+    assert live == 1
+
+    freezer.move_to("2026-07-31 07:05:00+02:00")
+    await runner.async_switch_observed(VALVE_1, is_on=False, manual=True)
+
+    run = sequencer.current_run
+    assert run is not None
+    assert run.status is CycleStatus.RUNNING
+    assert live == 1
+    assert peak == 1
+
+    # ...and the ONE handle is now the resumed cycle's own boundary.
+    await fire_at(hass, freezer, "2026-07-31 07:15:00+02:00")
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls] == [
+        ("turn_on", PUMP),
+        ("turn_on", VALVE_1),
+        ("turn_off", VALVE_1),
+        ("turn_on", VALVE_2),
+    ]
+    assert live == 1
+    assert peak == 1
+
+    runner.async_shutdown()
+
+
+async def test_an_observation_after_shutdown_resumes_nothing(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """A suspend closes valves; none of those closes may restart the scheduler.
+
+    `async_suspend` runs `async_shutdown()` first and then commands the live
+    valve and the pump off. Were the last of those observations to release the
+    last hand-opened switch, the resume would drain the deferred queue and
+    open a valve on an entry with no timer left to close it.
+    """
+    calls = register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, sequencer, _ = make_entry_runner(hass, make_plan())
+    await runner.async_start()
+    # The pump held open by hand, and a cycle queued behind the pause.
+    await runner.async_switch_observed(PUMP, is_on=True, manual=True)
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    assert sequencer.deferred_kinds == (CycleKind.MORNING,)
+    assert calls == []
+
+    runner.async_shutdown()
+    await runner.async_switch_observed(PUMP, is_on=False, manual=False)
+
+    assert sequencer.manual_override is True
+    assert sequencer.deferred_kinds == (CycleKind.MORNING,)
+    assert sequencer.current_run is None
+    assert calls == []
+
+
 def test_ha_clock_returns_aware_local_time(hass: HomeAssistant) -> None:
     """The engine's contract: aware, HA-local — never `datetime.now()`."""
     moment = HaClock().now()

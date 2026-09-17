@@ -1250,10 +1250,12 @@ async def test_an_idle_restart_with_fresh_history_does_nothing_at_all() -> None:
     `watchdog_since` is seeded because the journal of a controller that has
     run before carries one (Story 3.3): the FIRST reconcile that finds it
     unset stamps it and saves, which is a different matrix row.
+
+    The queue is EMPTY here on purpose: an idle restart commands nothing
+    unless a deferral is waiting (Story 3.4, Decision 5 — the test below).
     """
     sequencer, switches, journal, anomalies = make_sequencer(
         history=[{"irrigation_day": "2026-07-30", "cycle_id": "2026-07-30-evening"}],
-        deferred=[(CycleKind.EVENING, aware(6, 59))],
         watchdog_since=aware(6),
     )
     assert sequencer.reconciled is True
@@ -1265,7 +1267,33 @@ async def test_an_idle_restart_with_fresh_history_does_nothing_at_all() -> None:
     assert anomalies.reports == []
     assert anomalies.clears == []
     assert journal.snapshots == []
-    assert sequencer.deferred_kinds == (CycleKind.EVENING,)
+    assert sequencer.current_run is None
+
+
+async def test_an_idle_restart_drains_a_same_day_deferral() -> None:
+    """Story 3.4, Decision 5: a restored deferral waters instead of stranding.
+
+    This amends Story 3.2's "an idle restart commands nothing". The run the
+    entry was queued behind, and the manual pause that may have deferred it,
+    both died with the process — nothing is ever going to pop it, so the
+    reconcile does, right before its `advance`, and the cycle starts in the
+    same call. Fail-wet (AD-4).
+    """
+    sequencer, switches, _, anomalies = make_sequencer(
+        deferred=[(CycleKind.EVENING, aware(6, 59))],
+        watchdog_since=aware(6),
+    )
+
+    await sequencer.async_reconcile(aware(7, 4))
+
+    run = sequencer.current_run
+    assert run is not None
+    assert run.kind is CycleKind.EVENING
+    assert run.status is CycleStatus.RUNNING
+    assert sequencer.deferred_kinds == ()
+    assert switches.commands == [("on", PUMP), ("on", VALVE_1)]
+    # A deferral is ordinary scheduled work, not a failure: nothing reported.
+    assert anomalies.reports == []
 
 
 async def test_an_idle_restart_prunes_stale_history_and_saves_once() -> None:
@@ -1298,11 +1326,61 @@ async def test_a_stale_deferred_entry_is_dropped_silently() -> None:
 
     await sequencer.async_reconcile(aware(7, 4))
 
-    assert sequencer.deferred_kinds == (CycleKind.MORNING,)
+    # The stale entry is gone and the same-day one is drained on the spot
+    # (Story 3.4, Decision 5) — so the queue ends empty and the morning
+    # cycle, not yesterday's evening, is what waters.
+    assert sequencer.deferred_kinds == ()
+    run = sequencer.current_run
+    assert run is not None
+    assert run.kind is CycleKind.MORNING
     assert anomalies.reports == []
-    assert journal.snapshots[-1]["deferred"] == [
-        {"kind": "morning", "reference": "2026-07-31T04:59:00+00:00"},
-    ]
+    assert journal.snapshots[-1]["deferred"] == []
+
+
+async def test_the_watchdog_is_asked_before_the_drain_installs_anything() -> None:
+    """Story 3.4, Decision 5: the drain must not make the day's other kind look live.
+
+    A restart at 21:00 carrying this morning's deferral. Both windows have
+    closed: the evening one is a genuine miss the watchdog can still make up.
+    A cycle popped first would be `self._run` when `missed_cycles` looked, so
+    the evening would be filed `recorded` instead of re-run — burning that
+    `(day, kind)` for ever. The watchdog is asked first, takes the machine
+    for its re-run, and the deferral waits for that run's completion like
+    every deferral.
+    """
+    sequencer, switches, _, anomalies = make_sequencer(
+        deferred=[(CycleKind.MORNING, aware(7))],
+        watchdog_since=aware(6),
+    )
+
+    await sequencer.async_reconcile(aware(21))
+
+    run = sequencer.current_run
+    assert run is not None
+    assert run.kind is CycleKind.EVENING
+    assert run.late_rerun is True
+    assert run.status is CycleStatus.RUNNING
+    assert [
+        (kind, context["outcome"])
+        for kind, context in anomalies.reports
+        if kind is AnomalyKind.MISSED_CYCLE
+    ] == [(AnomalyKind.MISSED_CYCLE, "rerun")]
+    assert sequencer.deferred_kinds == (CycleKind.MORNING,)
+    assert switches.commands == [("on", PUMP), ("on", VALVE_1)]
+
+    # ...and the deferred morning reaches the hardware behind it.
+    clock = VirtualClock(aware(21))
+    while (active := sequencer.current_run) is not None:
+        moment = sequencer.next_wakeup(clock.now())
+        assert moment is not None
+        clock.advance_to(moment)
+        await sequencer.advance(clock.now())
+        if active.kind is CycleKind.MORNING:
+            break
+    morning = sequencer.current_run
+    assert morning is not None
+    assert morning.kind is CycleKind.MORNING
+    assert not sequencer.deferred_kinds
 
 
 async def test_a_same_day_deferral_is_popped_once_the_restored_run_closes() -> None:
@@ -1428,17 +1506,24 @@ async def test_a_request_before_reconciliation_is_deferred_not_lost() -> None:
 
     await sequencer.async_reconcile(now)
 
-    # The discard pass (every valve, the pump) and nothing else: the queue is
-    # kept for the next completion to pop, like every deferral — a request
-    # made while the gate was closed is delayed, never lost.
+    # The discard pass (every valve, the pump), and then the queue itself:
+    # since Story 3.4's Decision 5 the reconcile drains what it finds when it
+    # ends idle, so the request made while the gate was closed is delayed by
+    # the length of the boot and no longer stranded behind a completion that
+    # was never coming.
     assert switches.commands == [
         ("off", VALVE_1),
         ("off", VALVE_2),
         ("off", VALVE_3),
         ("off", PUMP),
+        ("on", PUMP),
+        ("on", VALVE_1),
     ]
-    assert sequencer.deferred_kinds == (CycleKind.MORNING,)
-    assert sequencer.current_run is None
+    assert not sequencer.deferred_kinds
+    run = sequencer.current_run
+    assert run is not None
+    assert run.kind is CycleKind.MORNING
+    assert run.status is CycleStatus.RUNNING
 
 
 async def test_the_gate_lifts_even_when_a_port_raises_mid_reconcile() -> None:

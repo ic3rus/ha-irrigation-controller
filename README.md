@@ -361,6 +361,12 @@ notification, no journal write. The last completed cycle survives restarts
 and reloads too, so the per-zone **Last watering duration** sensors keep
 their values.
 
+The one thing an otherwise idle restart *does* act on is a cycle that was
+**queued** when the controller went down — deferred behind a cycle that was
+running, or behind [manual control on site](#manual-control-on-site). Nothing
+is ever going to pop that queue otherwise, so if the cycle still belongs to
+today it is watered as soon as recovery finishes.
+
 ## Missed cycles and late re-runs
 
 A scheduled cycle can fail to run without anything going wrong at the valve:
@@ -432,6 +438,74 @@ instant you flip the switch — nothing is checked until the next window end —
 so turning the season on after the day's last window makes nothing up at all,
 while turning it on at noon makes the morning up when the evening window
 closes.
+
+## Manual control on site
+
+Sometimes you just want to open a valve yourself — to flush a line, to check a
+sprinkler head, to water a new plant. The controller does not fight you.
+
+Every switch it governs — the pump and each zone's valve — is watched. A change
+that **the integration did not command** is read as manual control, and while
+at least one governed switch is being held **open** by hand the scheduler
+**pauses**:
+
+- a scheduled start falling inside the pause is **queued, not skipped** — it is
+  late, not lost, and the [missed-cycle watchdog](#missed-cycles-and-late-re-runs)
+  sees it as still due rather than missed;
+- a cycle that had been scheduled but had not commanded anything yet is put
+  back in that same queue;
+- nothing is commanded, nothing is notified. A pause is normal operation, not a
+  fault: it raises no repair, sends no notification and fires no event.
+
+When the **last** hand-opened switch goes off again — by your hand or by the
+controller's own next command — the scheduler resumes: anything queued for
+**today** is watered immediately, on freshly calculated durations (carried
+[water debt](#water-debt) and [rain credit](#rain-credit) both apply);
+anything queued for an earlier day is dropped. Two valves opened by hand need
+two closes: the pause holds while any one of them is open.
+
+A **cycle already running is never interrupted**. It waters its zones to the
+end on the schedule it started with, and a valve you close by hand mid-slot is
+not re-opened — the controller only commands at slot boundaries. What the pause
+stops is the *next* cycle starting, not the current one finishing.
+
+**Your own commands are never refused.** The pause holds back the *scheduler*,
+not you: [`run_now`](#ha_irrigation_controllerrun_now) starts a cycle while it
+is in force — that is you asking, not the schedule guessing —
+[`cancel_cycle`](#ha_irrigation_controllercancel_cycle) still stops one, and the
+season switch still works.
+
+The **Cycle status** sensor carries the whole thing as one attribute,
+`manual_override`: `true` while the scheduler is paused, `false` otherwise.
+There is no extra entity to add to a dashboard.
+
+Two limits worth knowing:
+
+- **Detection is best-effort.** Home Assistant cannot guarantee that every
+  state change can be attributed, and the controller deliberately errs towards
+  "not manual": a switch appearing at startup, one going `unavailable` and
+  back, and any change the controller can tie to one of its own commands are
+  all ignored. The failure direction is to miss a manual act, never to invent a
+  pause that stops watering.
+- **Nothing bounds the pause yet.** A valve left open by hand holds the
+  scheduler until it is closed — there is no timeout in this version, and no
+  notification to remind you. The pause is also lost across a restart or a
+  reload (the queued cycle is not: it waters once the controller is back and
+  nothing else is in progress).
+
+Two consequences of that last point are worth knowing, because in both the
+pause ends — or its queued cycle disappears — without you doing anything:
+
+- **A held-open switch that goes `unavailable`, or is removed, releases it.**
+  Once the controller can no longer see the switch open, it stops holding the
+  scheduler for it: the alternative is a pause that never ends, with no
+  watering and nothing said. If the switch comes back still open, flipping it
+  again is what pauses the scheduler anew.
+- **A pause that runs past midnight loses the cycle it deferred.** The queue
+  only ever holds today's work, so a start deferred before midnight is dropped
+  at the resume, and the [watchdog](#missed-cycles-and-late-re-runs) only looks
+  back over the current day — so that cycle is neither watered nor recorded as
+  missed. Closing the valve the same day avoids it entirely.
 
 ## Anomalies
 
