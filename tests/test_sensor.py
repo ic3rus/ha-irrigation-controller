@@ -215,12 +215,44 @@ async def test_cycle_status_is_an_enum_with_a_coarse_summary(
     assert state.attributes["current_zone"] is None
     assert state.attributes["config_change_pending"] is False
     assert state.attributes["day_credit"] is None
+    assert state.attributes["manual_override"] is False
 
     await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
     state = state_of(hass, status)
     assert state.state in state.attributes[ATTR_OPTIONS]
     assert state.attributes["cycle_id"] == "2026-07-31-morning"
     assert state.attributes["current_zone"] == "Zone A"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_manual_override_attribute_follows_the_pause(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    entry: MockConfigEntry,
+) -> None:
+    """Story 3.4, Decision 3: the ONE operator-visible surface of the pause.
+
+    False while nothing is held open, true from the hand-opened valve, false
+    again the moment it closes — one coarse attribute, no new entity and no
+    anomaly, because a pause is normal operation.
+    """
+    register_switches(hass)
+    status = entity_id_for(hass, f"{entry.entry_id}_cycle_status")
+    assert state_of(hass, status).attributes["manual_override"] is False
+
+    # A context nothing of ours issued: the operator on site.
+    hass.states.async_set(VALVE_A, STATE_ON)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert state_of(hass, status).attributes["manual_override"] is True
+    assert state_of(hass, status).state == "idle"
+
+    hass.states.async_set(VALVE_A, STATE_OFF)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert state_of(hass, status).attributes["manual_override"] is False
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

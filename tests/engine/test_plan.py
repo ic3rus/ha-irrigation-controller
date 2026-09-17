@@ -274,3 +274,40 @@ def test_irrigation_day_is_the_local_date_of_the_scheduled_start() -> None:
 def test_irrigation_day_does_no_arithmetic_of_its_own() -> None:
     """A late-evening start belongs to its own day, not the next."""
     assert irrigation_day(aware(23, 59) + timedelta(minutes=0)) == date(2026, 7, 31)
+
+
+# --------------------------------------------------------------------------
+# The governed set (Story 3.4)
+# --------------------------------------------------------------------------
+
+
+def test_governed_entities_is_the_pump_then_every_valve_in_plan_order() -> None:
+    """THE one answer to "which switches does this controller govern"."""
+    plan = make_plan(
+        make_zone("zone-1", valve="switch.a"),
+        make_zone("zone-2", valve="switch.b"),
+        pump="switch.pump",
+    )
+
+    assert plan.governed_entities == ("switch.pump", "switch.a", "switch.b")
+
+
+def test_governed_entities_deduplicates_without_reordering() -> None:
+    """Two zones sharing a valve — or a valve that IS the pump — appear once.
+
+    A set would order by PYTHONHASHSEED and a plain tuple would subscribe the
+    manual-override watch twice to the same entity.
+    """
+    plan = make_plan(
+        make_zone("zone-1", valve="switch.pump"),
+        make_zone("zone-2", valve="switch.shared"),
+        make_zone("zone-3", valve="switch.shared"),
+        pump="switch.pump",
+    )
+
+    assert plan.governed_entities == ("switch.pump", "switch.shared")
+
+
+def test_a_plan_with_no_zones_governs_only_its_pump() -> None:
+    """A controller configured with no zone yet still owns its pump."""
+    assert make_plan(pump="switch.pump").governed_entities == ("switch.pump",)

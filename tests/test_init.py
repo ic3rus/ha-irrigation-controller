@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.const import ATTR_ENTITY_ID, STATE_UNAVAILABLE
+from homeassistant.const import (
+    ATTR_ENTITY_ID,
+    EVENT_STATE_CHANGED,
+    STATE_UNAVAILABLE,
+)
 from homeassistant.helpers import (
     device_registry as dr,
     entity_registry as er,
@@ -38,6 +42,7 @@ from custom_components.ha_irrigation_controller.const import (
     CONF_EVENING_START,
     CONF_MORNING_DURATION,
     CONF_NOTIFY_TARGET,
+    CONF_PUMP_SWITCH,
     CONF_RAIN_SENSOR,
     DEFAULT_ACTUATION_TIMEOUT_S,
     DOMAIN,
@@ -149,24 +154,33 @@ async def test_the_configured_timeout_reaches_the_switch_adapter(
     """AC 3's timeout is configurable only if the parsed value gets wired in.
 
     The parser, the selector bounds and the adapter are each covered on their
-    own; this pins the wire between them. Line coverage cannot: the
-    construction runs on every setup whatever the value is, and the adapter is
-    deliberately not exposed on `runtime_data`.
+    own; this pins the wire between them — and, since Story 3.4, the two
+    manual-override providers alongside it. Line coverage cannot: the
+    construction runs on every setup whatever the values are, and the adapter
+    is deliberately not exposed on `runtime_data`.
     """
     configured_s = MAX_ACTUATION_TIMEOUT_S - 1
     captured: list[int] = []
+    governed: list[Callable[[], tuple[str, ...]]] = []
+    observers: list[Callable[[str, bool, bool], None]] = []
 
     def _spy(
         hass_: HomeAssistant,
         *,
         timeout_s: int,
         cycle_id_provider: Callable[[], str | None],
+        governed_entities: Callable[[], tuple[str, ...]],
+        on_observed: Callable[[str, bool, bool], None],
     ) -> VerifiedSwitchAdapter:
         captured.append(timeout_s)
+        governed.append(governed_entities)
+        observers.append(on_observed)
         return VerifiedSwitchAdapter(
             hass_,
             timeout_s=timeout_s,
             cycle_id_provider=cycle_id_provider,
+            governed_entities=governed_entities,
+            on_observed=on_observed,
         )
 
     monkeypatch.setattr(f"{_MODULE}.VerifiedSwitchAdapter", _spy)
@@ -179,6 +193,12 @@ async def test_the_configured_timeout_reaches_the_switch_adapter(
     await hass.async_block_till_done()
 
     assert captured == [configured_s]
+    # Both Story 3.4 providers are passed BY KEYWORD (the spy's signature is
+    # the assertion) and answer the live plan: this controller has no zone,
+    # so the governed set is its pump alone.
+    assert len(governed) == 1
+    assert governed[0]() == (CONTROLLER_OPTIONS[CONF_PUMP_SWITCH],)
+    assert len(observers) == 1
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
@@ -957,6 +977,36 @@ async def test_the_tracker_leaks_no_registry_listener_across_a_reload(
     await hass.async_block_till_done()
 
     assert hass.bus.async_listeners().get(EVENT_ENTITY_REGISTRY_UPDATED, 0) == baseline
+
+
+async def test_the_manual_override_watch_leaks_no_state_listener(
+    hass: HomeAssistant,
+) -> None:
+    """Story 3.4: ONE standing watch, gone after unload, not doubled by a reload.
+
+    The watch rides `entry.async_on_unload` right after the tracker's stop,
+    inside the ORDER CONTRACT block — and it is re-armed on the busy-reload
+    path too, which cancels the previous subscription first. `verify_cleanup`
+    cannot see bus listeners, so the count is asserted directly.
+    """
+    baseline = hass.bus.async_listeners().get(EVENT_STATE_CHANGED, 0)
+    entry = _entry_with_zones(zone_subentry_data("Zone A", VALVE_1))
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    armed = hass.bus.async_listeners().get(EVENT_STATE_CHANGED, 0)
+    assert armed > baseline
+
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+    assert hass.bus.async_listeners().get(EVENT_STATE_CHANGED, 0) == armed
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert hass.bus.async_listeners().get(EVENT_STATE_CHANGED, 0) == baseline
 
 
 async def test_setup_succeeds_on_prerelease_of_min_ha_version(

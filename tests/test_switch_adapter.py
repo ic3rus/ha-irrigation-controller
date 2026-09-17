@@ -15,11 +15,13 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from homeassistant.const import (
     ATTR_ENTITY_ID,
+    EVENT_STATE_CHANGED,
     STATE_OFF,
     STATE_ON,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
+from homeassistant.core import Context
 from homeassistant.exceptions import HomeAssistantError
 from pytest_homeassistant_custom_component.common import async_mock_service
 
@@ -34,6 +36,7 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant, ServiceCall
 
 VALVE = "switch.zone_1_valve"
+PUMP = "switch.pool_pump"
 
 
 def make_adapter(
@@ -41,12 +44,29 @@ def make_adapter(
     *,
     timeout_s: int = 5,
     cycle_id: str | None = "2026-07-31-morning",
+    governed: tuple[str, ...] | None = None,
+    observed: list[tuple[str, bool, bool]] | None = None,
 ) -> VerifiedSwitchAdapter:
-    """Build an adapter with a fixed cycle id provider."""
+    """Build an adapter with a fixed cycle id provider.
+
+    `governed` and `observed` wire the Story 3.4 watch: the set to subscribe
+    to and the list every report is appended to. Left out, the adapter is the
+    pure `SwitchPort` every command-level test below needs.
+    """
     return VerifiedSwitchAdapter(
         hass,
         timeout_s=timeout_s,
         cycle_id_provider=lambda: cycle_id,
+        governed_entities=None if governed is None else (lambda: governed),
+        on_observed=(
+            None
+            if observed is None
+            else (
+                lambda entity_id, is_on, manual: observed.append(
+                    (entity_id, is_on, manual),
+                )
+            )
+        ),
     )
 
 
@@ -343,3 +363,411 @@ async def test_is_on_follows_a_rename(hass: HomeAssistant) -> None:
 
     assert await adapter.async_is_on(VALVE) is True
     assert await adapter.async_is_on("switch.front_valve") is True
+
+
+# --------------------------------------------------------------------------
+# Manual-override detection (Story 3.4): the ONE standing watch
+# --------------------------------------------------------------------------
+
+
+def watching(
+    hass: HomeAssistant,
+    *,
+    governed: tuple[str, ...] = (VALVE, PUMP),
+) -> tuple[VerifiedSwitchAdapter, list[tuple[str, bool, bool]]]:
+    """Build an adapter with the standing watch armed; return it and its reports."""
+    reports: list[tuple[str, bool, bool]] = []
+    adapter = make_adapter(hass, governed=governed, observed=reports)
+    adapter.async_start_watch()
+    return adapter, reports
+
+
+async def test_a_foreign_context_turn_on_is_reported_manual(
+    hass: HomeAssistant,
+) -> None:
+    """AC 1: nobody of ours issued that context and nothing is in flight."""
+    hass.states.async_set(VALVE, STATE_OFF)
+    adapter, reports = watching(hass)
+
+    hass.states.async_set(VALVE, STATE_ON)
+    await hass.async_block_till_done()
+
+    assert reports == [(VALVE, True, True)]
+
+    adapter.async_stop_watch()
+
+
+async def test_an_off_is_reported_too_and_manual_is_its_own_answer(
+    hass: HomeAssistant,
+) -> None:
+    """The adapter reports every governed transition; the engine decides."""
+    hass.states.async_set(VALVE, STATE_ON)
+    adapter, reports = watching(hass)
+
+    hass.states.async_set(VALVE, STATE_OFF)
+    await hass.async_block_till_done()
+
+    assert reports == [(VALVE, False, True)]
+
+    adapter.async_stop_watch()
+
+
+async def test_our_own_command_is_not_manual(hass: HomeAssistant) -> None:
+    """AC 6: a governed change carrying a context THIS adapter minted is ours.
+
+    The fake hardware propagates `call.context` onto the resulting state, the
+    way a well-behaved switch integration does.
+    """
+    hass.states.async_set(VALVE, STATE_OFF)
+    adapter, reports = watching(hass)
+
+    async def _flip(call: ServiceCall) -> None:
+        hass.states.async_set(
+            call.data[ATTR_ENTITY_ID],
+            STATE_ON,
+            context=call.context,
+        )
+
+    hass.services.async_register("switch", "turn_on", _flip)
+
+    assert await adapter.async_turn_on(VALVE) is True
+    await hass.async_block_till_done()
+
+    assert reports == [(VALVE, True, False)]
+
+    adapter.async_stop_watch()
+
+
+async def test_a_child_context_is_ours_too(hass: HomeAssistant) -> None:
+    """Some integrations make the service context the PARENT of the state change."""
+    hass.states.async_set(VALVE, STATE_OFF)
+    adapter, reports = watching(hass)
+
+    async def _flip(call: ServiceCall) -> None:
+        hass.states.async_set(
+            call.data[ATTR_ENTITY_ID],
+            STATE_ON,
+            context=Context(parent_id=call.context.id),
+        )
+
+    hass.services.async_register("switch", "turn_on", _flip)
+
+    assert await adapter.async_turn_on(VALVE) is True
+    await hass.async_block_till_done()
+
+    assert reports == [(VALVE, True, False)]
+
+    adapter.async_stop_watch()
+
+
+async def test_a_child_context_is_ours_after_the_command_has_returned(
+    hass: HomeAssistant,
+) -> None:
+    """The parent-id clause alone, with the in-flight guard out of the way.
+
+    In the test above the state change is emitted from INSIDE the service
+    call, so the entity is still in `_in_flight` and the report would be
+    non-manual whatever the context said. Here the command has already
+    returned — a switch that reports its real state a moment later, or one
+    whose integration echoes an earlier call — so the parent link is the only
+    thing that can attribute this change to us.
+    """
+    calls = async_mock_service(hass, "switch", "turn_on")
+    hass.states.async_set(VALVE, STATE_ON)
+    adapter, reports = watching(hass)
+
+    # Confirms on the no-op branch: the command is over, nothing in flight.
+    assert await adapter.async_turn_on(VALVE) is True
+    reports.clear()
+
+    child = Context(parent_id=calls[0].context.id)
+    hass.states.async_set(VALVE, STATE_OFF, context=child)
+    await hass.async_block_till_done()
+
+    assert reports == [(VALVE, False, False)]
+
+    adapter.async_stop_watch()
+
+
+async def test_a_switch_that_drops_our_context_is_still_not_manual(
+    hass: HomeAssistant,
+) -> None:
+    """The in-flight guard is the fail-safe half: no context, still ours.
+
+    A switch integration that does not propagate the service context would
+    otherwise make every one of our own commands read as manual, and the
+    engine would pause itself the instant it opened a valve.
+    """
+    hass.states.async_set(VALVE, STATE_OFF)
+    adapter, reports = watching(hass)
+
+    async def _flip(call: ServiceCall) -> None:
+        # A FRESH context: nothing links this state change to our call.
+        hass.states.async_set(call.data[ATTR_ENTITY_ID], STATE_ON)
+
+    hass.services.async_register("switch", "turn_on", _flip)
+
+    assert await adapter.async_turn_on(VALVE) is True
+    await hass.async_block_till_done()
+
+    assert reports == [(VALVE, True, False)]
+
+    adapter.async_stop_watch()
+
+
+async def test_the_in_flight_entry_is_cleared_after_the_command(
+    hass: HomeAssistant,
+) -> None:
+    """A leaked in-flight entry would hide that entity's every later manual act."""
+    async_mock_service(hass, "switch", "turn_on")
+    hass.states.async_set(VALVE, STATE_ON)
+    adapter, reports = watching(hass)
+
+    assert await adapter.async_turn_on(VALVE) is True
+    hass.states.async_set(VALVE, STATE_OFF)
+    await hass.async_block_till_done()
+
+    assert reports == [(VALVE, False, True)]
+
+    adapter.async_stop_watch()
+
+
+async def test_a_context_from_an_earlier_cycle_is_still_ours(
+    hass: HomeAssistant,
+) -> None:
+    """`_issued` is a BOUNDED SET, not just the current cycle's one context.
+
+    The adapter mints one context per cycle id, and the watch sees the close
+    of a zone whose cycle has already been replaced by the next one's.
+    """
+    hass.states.async_set(VALVE, STATE_OFF)
+    reports: list[tuple[str, bool, bool]] = []
+    current: dict[str, str | None] = {"cycle": "2026-07-31-morning"}
+    adapter = VerifiedSwitchAdapter(
+        hass,
+        timeout_s=5,
+        cycle_id_provider=lambda: current["cycle"],
+        governed_entities=lambda: (VALVE,),
+        on_observed=lambda entity_id, is_on, manual: reports.append(
+            (entity_id, is_on, manual),
+        ),
+    )
+    adapter.async_start_watch()
+    calls = async_mock_service(hass, "switch", "turn_on")
+
+    # Both commands confirm on the no-op branch (the valve is already on), so
+    # each still mints and records its cycle's context.
+    hass.states.async_set(VALVE, STATE_ON)
+    assert await adapter.async_turn_on(VALVE) is True
+    first_context = calls[0].context
+    current["cycle"] = "2026-07-31-evening"
+    assert await adapter.async_turn_on(VALVE) is True
+    assert calls[1].context.id != first_context.id
+
+    reports.clear()
+    # The morning cycle's context, long after its cycle id was replaced.
+    hass.states.async_set(VALVE, STATE_OFF, context=first_context)
+    await hass.async_block_till_done()
+
+    assert reports == [(VALVE, False, False)]
+
+    adapter.async_stop_watch()
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (STATE_UNAVAILABLE, STATE_ON),
+        (STATE_UNKNOWN, STATE_OFF),
+        (STATE_UNAVAILABLE, STATE_UNKNOWN),
+    ],
+)
+async def test_transitions_out_of_a_doubtful_state_are_ignored(
+    hass: HomeAssistant,
+    first: str,
+    second: str,
+) -> None:
+    """A booting or reconnecting switch is not an operator — never a pause."""
+    hass.states.async_set(VALVE, first)
+    adapter, reports = watching(hass)
+
+    hass.states.async_set(VALVE, second)
+    await hass.async_block_till_done()
+
+    assert reports == []
+
+    adapter.async_stop_watch()
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (STATE_ON, STATE_UNAVAILABLE),
+        (STATE_ON, STATE_UNKNOWN),
+        (STATE_OFF, STATE_UNAVAILABLE),
+    ],
+)
+async def test_a_governed_switch_going_doubtful_is_reported_as_a_release(
+    hass: HomeAssistant,
+    first: str,
+    second: str,
+) -> None:
+    """The rules are ASYMMETRIC: they may never pause, they must always release.
+
+    An entity the engine is holding in its paused set that drops off the bus
+    would otherwise stay held for ever — the scheduler paused with no
+    watering and no anomaly. `is_on=False` can only release, never add, and
+    `manual=False` keeps it out of "the operator did this".
+    """
+    hass.states.async_set(VALVE, first)
+    adapter, reports = watching(hass)
+
+    hass.states.async_set(VALVE, second)
+    await hass.async_block_till_done()
+
+    assert reports == [(VALVE, False, False)]
+
+    adapter.async_stop_watch()
+
+
+async def test_an_entity_appearing_is_ignored(hass: HomeAssistant) -> None:
+    """`old_state is None`: a switch showing up at boot is not a manual act."""
+    adapter, reports = watching(hass)
+
+    hass.states.async_set(VALVE, STATE_ON)
+    await hass.async_block_till_done()
+
+    assert reports == []
+
+    adapter.async_stop_watch()
+
+
+async def test_an_entity_removed_is_reported_as_a_release(
+    hass: HomeAssistant,
+) -> None:
+    """`new_state is None`: gone is not open, so a held entity is released."""
+    hass.states.async_set(VALVE, STATE_ON)
+    adapter, reports = watching(hass)
+
+    hass.states.async_remove(VALVE)
+    await hass.async_block_till_done()
+
+    assert reports == [(VALVE, False, False)]
+
+    adapter.async_stop_watch()
+
+
+async def test_an_entity_removed_while_already_doubtful_is_ignored(
+    hass: HomeAssistant,
+) -> None:
+    """Nothing was holding it open: the release was reported when it went doubtful."""
+    hass.states.async_set(VALVE, STATE_UNAVAILABLE)
+    adapter, reports = watching(hass)
+
+    hass.states.async_remove(VALVE)
+    await hass.async_block_till_done()
+
+    assert reports == []
+
+    adapter.async_stop_watch()
+
+
+async def test_an_attribute_only_write_is_ignored(hass: HomeAssistant) -> None:
+    """The state did not change: `state_changed` fires all the same."""
+    hass.states.async_set(VALVE, STATE_ON)
+    adapter, reports = watching(hass)
+
+    hass.states.async_set(VALVE, STATE_ON, {"friendly_name": "Zone 1"})
+    await hass.async_block_till_done()
+
+    assert reports == []
+
+    adapter.async_stop_watch()
+
+
+async def test_an_ungoverned_entity_is_never_watched(hass: HomeAssistant) -> None:
+    """The watch covers the governed set and nothing else."""
+    hass.states.async_set("switch.kitchen_light", STATE_OFF)
+    adapter, reports = watching(hass)
+
+    hass.states.async_set("switch.kitchen_light", STATE_ON)
+    await hass.async_block_till_done()
+
+    assert reports == []
+
+    adapter.async_stop_watch()
+
+
+async def test_start_watch_replaces_the_previous_subscription(
+    hass: HomeAssistant,
+) -> None:
+    """Re-arming after a plan swap leaves exactly ONE live registration."""
+    hass.states.async_set(VALVE, STATE_OFF)
+    hass.states.async_set(PUMP, STATE_OFF)
+    adapter, reports = watching(hass)
+
+    adapter.async_start_watch()
+    hass.states.async_set(VALVE, STATE_ON)
+    await hass.async_block_till_done()
+
+    assert reports == [(VALVE, True, True)]
+
+    adapter.async_stop_watch()
+
+
+async def test_stop_watch_is_idempotent_and_really_stops(
+    hass: HomeAssistant,
+) -> None:
+    """The unload path: no report after it, and a second call is a no-op."""
+    hass.states.async_set(VALVE, STATE_OFF)
+    adapter, reports = watching(hass)
+
+    adapter.async_stop_watch()
+    adapter.async_stop_watch()
+    hass.states.async_set(VALVE, STATE_ON)
+    await hass.async_block_till_done()
+
+    assert reports == []
+
+
+async def test_an_adapter_with_no_providers_arms_nothing(
+    hass: HomeAssistant,
+) -> None:
+    """A plain `SwitchPort` is complete without the watch — and registers none."""
+    hass.states.async_set(VALVE, STATE_OFF)
+    baseline = hass.bus.async_listeners().get(EVENT_STATE_CHANGED, 0)
+    adapter = make_adapter(hass)
+
+    adapter.async_start_watch()
+
+    assert hass.bus.async_listeners().get(EVENT_STATE_CHANGED, 0) == baseline
+
+    adapter.async_stop_watch()
+
+
+async def test_an_armed_watch_really_registers_a_state_listener(
+    hass: HomeAssistant,
+) -> None:
+    """The counterpart: with providers, one listener appears and unloads cleanly."""
+    baseline = hass.bus.async_listeners().get(EVENT_STATE_CHANGED, 0)
+    adapter, _ = watching(hass)
+
+    assert hass.bus.async_listeners().get(EVENT_STATE_CHANGED, 0) > baseline
+
+    adapter.async_stop_watch()
+
+    assert hass.bus.async_listeners().get(EVENT_STATE_CHANGED, 0) == baseline
+
+
+async def test_an_empty_governed_set_subscribes_to_nothing(
+    hass: HomeAssistant,
+) -> None:
+    """A controller with nothing configured yet has nothing to watch."""
+    adapter, reports = watching(hass, governed=())
+
+    hass.states.async_set(VALVE, STATE_ON)
+    await hass.async_block_till_done()
+
+    assert reports == []
+
+    adapter.async_stop_watch()

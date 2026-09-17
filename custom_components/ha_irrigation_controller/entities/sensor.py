@@ -122,6 +122,13 @@ class CycleStatusSensor(HaIrrigationControllerEntity, SensorEntity):
         never written (AD-6). It is the operator's only view of why the next
         scheduled cycle of that day will be waived; it clears the moment that
         decision is made. Same coarse-attribute precedent as Story 2.2.
+
+        `manual_override` (Story 3.4) is true while the operator holds a
+        governed switch open by hand: the scheduler starts nothing, and a
+        start falling inside the pause is queued rather than skipped. It is
+        the ONE operator-visible surface of the pause — no new entity, no
+        anomaly, no notification, because a pause is normal operation. It
+        goes false again the moment the last hand-opened switch closes.
         """
         run = self._sequencer.current_run
         zone = None if run is None else _live_zone(run)
@@ -130,6 +137,7 @@ class CycleStatusSensor(HaIrrigationControllerEntity, SensorEntity):
             "current_zone": None if zone is None else zone.name,
             "config_change_pending": self._runner.reload_pending,
             "day_credit": self._sequencer.ledger.day_credit,
+            "manual_override": self._sequencer.manual_override,
         }
 
 

@@ -71,6 +71,24 @@ class ControllerPlan:
         """Return the summed zone durations for `kind`, in seconds."""
         return sum(zone.duration_s(kind) for zone in self.zones)
 
+    @property
+    def governed_entities(self) -> tuple[str, ...]:
+        """Return every switch this controller commands: pump, then each valve.
+
+        THE one answer to "which switches does this controller govern"
+        (Story 3.4): the manual-override watch subscribes to exactly this
+        set, and the watch has to be re-armed whenever the plan is swapped.
+
+        Ordered — pump first, then the zones in plan order — and deduplicated,
+        because nothing forbids two zones sharing a valve, or a zone valve
+        that IS the pump entity: a set would reorder by PYTHONHASHSEED and a
+        plain tuple would subscribe twice to one entity.
+        """
+        ordered = dict.fromkeys(
+            (self.pump_entity_id, *(zone.valve_entity_id for zone in self.zones)),
+        )
+        return tuple(ordered)
+
 
 @dataclass(frozen=True, slots=True)
 class ZoneWindow:

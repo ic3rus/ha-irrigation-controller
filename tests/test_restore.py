@@ -975,3 +975,121 @@ async def test_a_fresh_entry_set_up_past_a_window_end_makes_nothing_up(
     assert ir.async_get(hass).async_get_issue(DOMAIN, "missed_cycle") is None
 
     await unload(hass, entry)
+
+
+# --------------------------------------------------------------------------
+# A start deferred before the restart (Story 3.4, Decision 5)
+# --------------------------------------------------------------------------
+
+
+async def test_a_restored_deferral_waters_when_the_restart_ends_idle(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 3.4 AC 5: the pause dies with the process; the queue it fed does not.
+
+    Home Assistant restarts while the operator holds a valve open and the
+    morning start is queued behind the pause. `_manual_on` is LIVE state and
+    is not journalled, so the pause is simply gone; the queue is in the
+    journal, and reconciliation — ending with nothing running and nothing
+    held open — drains it. The cycle waters, late rather than lost.
+    """
+    entry, calls, events, pushes = await restart(
+        hass,
+        hass_storage,
+        freezer,
+        now="2026-07-31 07:05:00+02:00",
+        states=ALL_OFF,
+        deferred=[{"kind": "morning", "reference": MORNING_START_UTC}],
+    )
+
+    sequencer = entry.runtime_data.sequencer
+    assert sequencer.manual_override is False
+    assert sequencer.deferred_kinds == ()
+    run = sequencer.current_run
+    assert run is not None
+    assert run.cycle_id == "2026-07-31-morning"
+    assert run.status is CycleStatus.RUNNING
+    assert run.late_rerun is False
+    assert commands(calls) == [("turn_on", PUMP), ("turn_on", VALVE_1)]
+    # A deferred cycle finally watering is not a failure: nothing reported.
+    assert events == []
+    assert pushes == []
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "missed_cycle") is None
+
+    await fire_at(hass, freezer, "2026-07-31 07:15:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 07:25:00+02:00")
+
+    finished = sequencer.last_run
+    assert finished is not None
+    assert finished.status is CycleStatus.COMPLETED
+    assert events == []
+    assert pushes == []
+
+    await unload(hass, entry)
+
+
+async def test_a_stale_restored_deferral_is_dropped_and_waters_nothing(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Yesterday's queued cycle is the watchdog's business, never the drain's."""
+    entry, calls, events, pushes = await restart(
+        hass,
+        hass_storage,
+        freezer,
+        now="2026-07-31 06:30:00+02:00",
+        states=ALL_OFF,
+        deferred=[{"kind": "evening", "reference": "2026-07-30T18:00:00+00:00"}],
+    )
+
+    sequencer = entry.runtime_data.sequencer
+    assert sequencer.deferred_kinds == ()
+    assert sequencer.current_run is None
+    assert calls == []
+    assert events == []
+    assert pushes == []
+
+    await unload(hass, entry)
+
+
+async def test_a_nominal_restart_with_an_empty_queue_still_does_nothing(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """The other half of Decision 5: the drain must not make a restart chatty.
+
+    Nothing running, nothing queued, fresh history and a floor already
+    stamped: no command, no anomaly, no push and no journal write at all.
+    """
+    entry, calls, events, pushes = await restart(
+        hass,
+        hass_storage,
+        freezer,
+        now="2026-07-31 06:30:00+02:00",
+        states=ALL_OFF,
+        history=[history_record()],
+        deferred=[],
+    )
+    stored_before = copy.deepcopy(hass_storage[STORAGE_KEY]["data"])
+
+    sequencer = entry.runtime_data.sequencer
+    assert sequencer.current_run is None
+    assert sequencer.deferred_kinds == ()
+    assert calls == []
+    assert events == []
+    assert pushes == []
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "missed_cycle") is None
+
+    # The debounced write window passes with nothing to write.
+    await fire_at(hass, freezer, "2026-07-31 06:30:05+02:00")
+    assert hass_storage[STORAGE_KEY]["data"] == stored_before
+    assert calls == []
+
+    await unload(hass, entry)

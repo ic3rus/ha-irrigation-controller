@@ -16,6 +16,7 @@ from homeassistant.const import (
     Platform,
     __version__ as HA_VERSION,  # noqa: N812
 )
+from homeassistant.core import callback
 from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers import config_validation as cv, device_registry as dr
 from homeassistant.helpers.device_registry import DeviceEntryType
@@ -106,6 +107,10 @@ class HaIrrigationRuntimeData:
     journal: JournalAdapter
     anomalies: AnomalyManager
     tracker: ConfiguredEntityTracker
+    # The verified switch adapter, kept for ONE reason beyond the engine's
+    # port: its manual-override watch (Story 3.4) is armed over the plan's
+    # governed set, so a plan swapped mid-cycle has to re-arm it.
+    switches: VerifiedSwitchAdapter
     # The config the running engine was built from (or last given, when a
     # reload is deferred): the update listener's "did anything change?" test.
     config_fingerprint: ConfigFingerprint
@@ -242,12 +247,34 @@ async def async_setup_entry(
         if isinstance(rain_entity_id, str)
         else None
     )
+
+    @callback
+    def _async_switch_observed(entity_id: str, is_on: bool, manual: bool) -> None:  # noqa: FBT001 — the adapter's positional report, not a flag argument
+        """Hand one governed-switch observation to the engine (Story 3.4).
+
+        The adapter's standing watch is a synchronous `@callback`; the engine
+        entry point is a coroutine that takes its lock, so the hop is an
+        entry-owned BACKGROUND task (conventions): an unload cancels it with
+        the entry, and the watch callback never awaits the state machine.
+        """
+        entry.async_create_background_task(
+            hass,
+            runner.async_switch_observed(entity_id, is_on=is_on, manual=manual),
+            name=f"{entry.entry_id} switch observed {entity_id}",
+        )
+
     switches = VerifiedSwitchAdapter(
         hass,
         timeout_s=actuation_timeout_s,
         cycle_id_provider=lambda: (
             sequencer.current_run.cycle_id if sequencer.current_run else None
         ),
+        # Manual-override detection (Story 3.4). Both providers are late-bound
+        # for the same reason `cycle_id_provider` is: neither the sequencer nor
+        # the runner exists yet, and `sequencer.plan` is SWAPPED under a
+        # running cycle (AD-8) — so the governed set has to be read live.
+        governed_entities=lambda: sequencer.plan.governed_entities,
+        on_observed=_async_switch_observed,
     )
     # The ONE read of the journal: the outcome history AC 4 promises to
     # retain for 7 days, the season mode flag (Story 1.6), the water-debt
@@ -294,6 +321,7 @@ async def async_setup_entry(
         journal=journal,
         anomalies=anomalies,
         tracker=tracker,
+        switches=switches,
         config_fingerprint=config_fingerprint(entry),
     )
     # ALSO before forwarding: the manager re-seeds its open set from the
@@ -327,6 +355,12 @@ async def async_setup_entry(
     entry.async_on_unload(journal.async_flush)
     tracker.async_start()
     entry.async_on_unload(tracker.async_stop)
+    # The ONE standing state watch over the governed switches (Story 3.4),
+    # with its stop registered immediately after — same reason as the
+    # tracker's, and before anything is armed: a manual change observed
+    # before the engine has reconciled is a no-op there by design.
+    switches.async_start_watch()
+    entry.async_on_unload(switches.async_stop_watch)
     entry.async_on_unload(runner.async_shutdown)
     await runner.async_start()
     return True
@@ -397,6 +431,11 @@ async def _async_entry_updated(
         data.runner.async_replan()
     data.config_fingerprint = fingerprint
     data.tracker.async_start()
+    # The governed set moves with the plan (Story 3.4): a zone added or its
+    # valve re-pointed mid-cycle must be watched before the deferred reload
+    # lands, exactly like the tracker's re-subscription above. Re-arming
+    # cancels the previous subscription first, so this stays ONE watch.
+    data.switches.async_start_watch()
     data.runner.async_request_reload()
 
 

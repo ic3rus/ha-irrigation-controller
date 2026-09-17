@@ -186,6 +186,13 @@ class Sequencer:
         self._deferred: list[tuple[CycleKind, datetime]] = (
             [] if deferred is None else list(deferred)
         )
+        # The switches an operator is holding open BY HAND (Story 3.4).
+        # Non-empty IS the paused state — a set rather than a flag, so two
+        # hand-opened valves need two closes before the scheduler moves
+        # again. LIVE state on purpose: it is never journalled and never
+        # seeded, so a reload or a restart loses the pause (the start it
+        # deferred survives, in `_deferred`, and `async_reconcile` drains it).
+        self._manual_on: set[str] = set()
         self._zone_index = 0
         # The Story 3.2 gate: False while a restored in-flight run (or an
         # unreadable one) awaits `async_reconcile`. A machine with nothing to
@@ -212,8 +219,25 @@ class Sequencer:
 
     @property
     def deferred_kinds(self) -> tuple[CycleKind, ...]:
-        """Return the cycle kinds waiting for the active run to complete."""
+        """Return the cycle kinds queued to start later — late, never lost.
+
+        Three things put a kind here: another run was active when it was
+        requested, reconciliation had not run yet (Story 3.2), or a manual
+        override was holding a governed switch open (Story 3.4). The
+        watchdog reads this to tell "pending" from "missed".
+        """
         return tuple(kind for kind, _ in self._deferred)
+
+    @property
+    def manual_override(self) -> bool:
+        """Return whether the operator is holding a governed switch open (3.4).
+
+        THE paused state, read-only (AD-6): the cycle-status sensor projects
+        it, and `request_cycle`, `_pop_deferred` and `_check_missed` gate on
+        it. True from the first hand-opened switch until the last one is
+        observed off, whoever closed it.
+        """
+        return bool(self._manual_on)
 
     @property
     def season_enabled(self) -> bool:
@@ -276,6 +300,139 @@ class Sequencer:
             await self._save()
             return True
 
+    async def async_switch_observed(
+        self,
+        entity_id: str,
+        *,
+        is_on: bool,
+        manual: bool,
+        now: datetime,
+    ) -> None:
+        """Take one governed-switch observation and own the pause (Story 3.4).
+
+        The adapter watches every governed entity and REPORTS — entity, on or
+        off, ours or not (AD-7). This method is the whole decision, and the
+        set `self._manual_on` is the state: non-empty is paused. A manual ON
+        adds; ANY observed OFF removes, whoever commanded it — that is what
+        lets the engine's own close of a hand-opened valve end the pause, and
+        it is the hook Story 3.5's safety timeout will pull.
+
+        A manual OFF on its own never pauses (Decision 1): nothing is being
+        held open, so there is nothing to step aside from. The operator
+        closing the valve of the LIVE slot is exactly that case — the cycle
+        runs on, the valve is never re-opened (the engine only commands at
+        slot boundaries) and the slot's own close later confirms trivially.
+
+        `_manual_on` is mutated HERE, before the lock, and the lock is taken
+        only for the EFFECTS — the hand-back on the first open, the drain on
+        the last close. Two reasons, and both are load-bearing:
+
+        - an observation that changes nothing takes no lock at all. Every
+          valve and pump command is issued from inside `advance`, which holds
+          the lock while the actuation verifies, and each generates a
+          `state_changed`; queueing those behind it would serialize the whole
+          watch onto the state machine for no effect — and, since a caller's
+          `block_till_done` does not wait for the entry's background tasks,
+          would make the daily start that follows queue behind them too;
+        - the set is then never stale. A set read before the lock and
+          mutated after it would drop the OFF of a switch flipped on and
+          straight off again — that OFF testing an `_manual_on` its own ON
+          had not reached yet — and leave the entity held for ever with the
+          switch physically off. Mutating it here is safe precisely because
+          each mutation is one synchronous statement: nothing interleaves
+          with it, which is the one thing the lock is not needed for.
+
+        `_reconciled` is read before the lock for the same reason, and only
+        ever goes False→True: a no-op until reconciliation has run, exactly
+        like `advance` and `async_run_now`. A valve found open at boot is the
+        reconciler's orphan pass, not the pause's business.
+
+        On the FIRST hand-opened switch a PENDING run — one that has
+        commanded nothing — is handed back to `_deferred` as
+        `(kind, configured_start)`: the invariant is that no PENDING
+        scheduled run survives the start of a pause. A RUNNING cycle is
+        untouched; it finishes its zones.
+
+        On the LAST close the queue is drained the way every deferral is:
+        entries whose irrigation day is not today are dropped (the rule
+        `async_reconcile` already applies), the rest are popped through
+        `_pop_deferred`, and `_advance_locked` then starts the popped cycle
+        in this same call and re-runs the watchdog check that returned early
+        while the pause held.
+        """
+        if not self._reconciled:
+            return
+        if manual and is_on:
+            if entity_id in self._manual_on:
+                return
+            first = not self._manual_on
+            self._manual_on.add(entity_id)
+            if not first:
+                return
+            async with self._lock:
+                await self._defer_pending_run()
+            return
+        # An ON that is not manual can only ever be ours, and a release can
+        # only concern an entity the set holds: both are no-ops here, which
+        # is what keeps our own commands off the lock entirely.
+        if is_on or entity_id not in self._manual_on:
+            return
+        self._manual_on.discard(entity_id)
+        if self._manual_on:
+            return
+        async with self._lock:
+            await self._resume(now)
+
+    async def _defer_pending_run(self) -> None:
+        """Hand a PENDING scheduled run back to `_deferred` (Story 3.4).
+
+        Called from inside the lock, on the FIRST hand-opened switch only —
+        a second one arriving later finds no PENDING run, because
+        `request_cycle` has been deferring since the pause opened (it reads
+        the set, which this method's caller already mutated).
+
+        A run-now is NEVER handed back, PENDING though it is. The invariant
+        is that no PENDING *scheduled* run survives the start of a pause, and
+        `_deferred` holds scheduled work only: queueing a manual cycle there
+        would strip its `manual` marker, make it waivable on a day credit and
+        let it consume one — and `async_run_now` refuses to queue for exactly
+        that reason. The window is real: the runner acquires the lock twice
+        (`async_run_now`, then `advance`), and an observation can land
+        between them. Honouring run-now while paused is Decision 2.
+
+        A RUNNING cycle is untouched: it finishes its zones.
+        """
+        run = self._run
+        if run is None or run.status is not CycleStatus.PENDING or run.manual:
+            return
+        self._deferred.append((run.kind, run.configured_start))
+        self._run = None
+        self._zone_index = 0
+        await self._save()
+
+    async def _resume(self, now: datetime) -> None:
+        """Drain and restart after the LAST hand-opened switch closed (3.4).
+
+        Called from inside the lock. `manual_override` is re-read by
+        `_pop_deferred`, so a switch hand-opened again between the release
+        and this lock acquisition simply holds the queue where it is.
+
+        The save at the end covers the ONE case `_pop_deferred` cannot: a
+        stale-day deferral dropped while nothing was popped after it — the
+        queue ended empty, or a cycle is still running and holds the drain.
+        Every pop journals itself, so the length test is what tells the two
+        apart. The pause itself is live state and is never journalled.
+        """
+        today = irrigation_day(now)
+        kept = [entry for entry in self._deferred if irrigation_day(entry[1]) == today]
+        dropped = len(kept) != len(self._deferred)
+        self._deferred = kept
+        queued = len(self._deferred)
+        await self._pop_deferred(now)
+        if dropped and len(self._deferred) == queued:
+            await self._save()
+        await self._advance_locked(now)
+
     async def request_cycle(self, kind: CycleKind, now: datetime) -> None:
         """Request a cycle start; defers if another run is active.
 
@@ -297,6 +454,14 @@ class Sequencer:
         Before `async_reconcile` has run (Story 3.2) the request is deferred
         too, whatever `self._run` holds: the restored run is not yet
         resynced, and the reconciler's completion path pops the queue.
+
+        Deferred as well while a manual override holds (Story 3.4): the
+        operator has a governed switch open by hand, and a scheduled start
+        dispatched on top of them is exactly the fight this pause exists to
+        avoid. The queue is the point — the cycle is delayed, never skipped,
+        and the watchdog reads it as pending rather than missed. The season
+        gate stays FIRST: season off is a permitted non-watering cause and
+        must not queue anything.
         """
         async with self._lock:
             if not self._season_enabled:
@@ -304,7 +469,7 @@ class Sequencer:
                 # save and — the part a watchdog must not mistake for a miss —
                 # no anomaly. The daily tracker stays armed; the gate is here.
                 return
-            if self._run is not None or not self._reconciled:
+            if self._run is not None or not self._reconciled or self.manual_override:
                 self._deferred.append((kind, now))
             else:
                 self._dispatch_scheduled(kind, now, dispatch_at=None, now=now)
@@ -610,12 +775,18 @@ class Sequencer:
         The gate lifts in a `finally`: whatever a port did, the machine must
         not stay frozen. A resumed PENDING run (or a deferred cycle popped by
         a close) is then started in the same call through the ordinary
-        `advance` loop, so the caller's re-arm finds the next boundary. A
-        same-day deferral restored from the journal is NOT popped here — an
-        idle restart commands nothing — it waits for the next completion,
-        like every deferral (delayed, never skipped).
+        `advance` loop, so the caller's re-arm finds the next boundary.
 
-        A nominal restart — no run, nothing to prune, no stale deferral —
+        A same-day deferral restored from the journal IS popped here (Story
+        3.4, Decision 5), right after the gate lifts and before the
+        `advance`: an idle restart commands nothing *unless a deferral is
+        waiting*. Such an entry waits for a completion that will never come
+        — the run it was queued behind, and the manual pause that deferred
+        it, both died with the process — so leaving it would strand the
+        cycle. Popping it is the fail-wet direction (AD-4), and the ordinary
+        `advance` below starts it in this same call.
+
+        A nominal restart — no run, no deferral, nothing to prune —
         commands nothing, reports nothing and writes nothing.
         """
         async with self._lock:
@@ -643,6 +814,26 @@ class Sequencer:
                     await self._save()
             finally:
                 self._reconciled = True
+            # Story 3.4, Decision 5: a deferral restored from the journal is
+            # drained here when nothing is running and nothing is held open
+            # by hand. The pause that deferred it is LIVE state and did not
+            # survive the restart, so the queue would otherwise wait for a
+            # completion that is never coming — stranded, on a day the
+            # watchdog reads as "late, not lost" until the window closes.
+            # Fail-wet (AD-4). The `manual_override` gate inside is empty
+            # here today; it keeps this call correct the day something seeds
+            # the set before reconciliation.
+            #
+            # The watchdog runs FIRST, before the drain rather than through
+            # the `_advance_locked` below: a popped cycle is `self._run` the
+            # instant it is installed, and `missed_cycles` reads a live run
+            # as "another cycle is watering" — so the day's OTHER kind would
+            # be filed `recorded` instead of re-run, burning that
+            # `(day, kind)` for ever. Asking before installing anything lets
+            # the miss take the machine it is entitled to; the deferral then
+            # waits for that re-run's completion, like every deferral.
+            await self._check_missed(now)
+            await self._pop_deferred(now)
             await self._advance_locked(now)
 
     async def _discard_unreadable(self, raw: Mapping[str, object]) -> None:
@@ -1010,6 +1201,32 @@ class Sequencer:
         self._last_run = run
         self._run = None
         self._zone_index = 0
+        await self._pop_deferred(now)
+
+    async def _pop_deferred(self, now: datetime) -> None:
+        """Install the next deferred cycle, unless a manual pause holds (3.4).
+
+        THE drain, with three call sites: the completion that releases the
+        run, the resume that ends a pause, and `async_reconcile`. Each pop is
+        an ordinary SCHEDULED decision — `_dispatch_scheduled` asks the
+        ledger whether a run-now already credited the day — and each is
+        saved, so a crash between two pops loses neither.
+
+        The loop stops the moment something is installed: one cycle at a
+        time. It also keeps going past a WAIVED pop, which installs nothing
+        and leaves `self._run` empty, so the entry after it gets its turn in
+        the same call.
+
+        The pause gate is the whole reason this is a method rather than four
+        lines: while the operator holds a governed switch open, the scheduler
+        starts nothing — the queue is left exactly as it is and drained by
+        the last close.
+
+        Called from inside the lock by every one of its call sites; it must
+        NOT acquire the lock itself.
+        """
+        if self.manual_override:
+            return
         while self._deferred and self._run is None:
             kind, reference = self._deferred.pop(0)
             self._dispatch_scheduled(kind, reference, dispatch_at=now, now=now)
@@ -1019,10 +1236,11 @@ class Sequencer:
         """File, report and make up every cycle of today that never ran (Story 3.3).
 
         THE watchdog. Called at the top of every `_advance_locked` — so at
-        each window end the re-armed callback serves, at every cycle
-        transition, and once from inside `async_reconcile` after the gate
-        lifts and before the drain. `watchdog.missed_cycles` makes the whole
-        decision (pure, on the virtual clock); this method is the effects.
+        each window end the re-armed callback serves, and at every cycle
+        transition — and once explicitly from `async_reconcile`, after the
+        gate lifts and BEFORE its deferred-queue drain (see there).
+        `watchdog.missed_cycles` makes the whole decision (pure, on the
+        virtual clock); this method is the effects.
 
         A window that closed at or before the watchdog's floor
         (`watchdog_since`) is never a miss: the controller did not exist yet,
@@ -1076,8 +1294,20 @@ class Sequencer:
         A crash between the record and the debounced save re-detects the miss
         on the next check — the same bounded window `_dispatch_scheduled`
         already accepts for the day credit.
+
+        A manual override (Story 3.4) returns before `missed_cycles` is even
+        asked: a late re-run would fight the operator who is holding a valve
+        open, and the record it files would burn this `(day, kind)`'s one
+        detection for good. The check re-runs on resume, from the
+        `_advance_locked` the last close performs — so a pause inside one
+        irrigation day costs nothing. A pause that spans MIDNIGHT does: the
+        lookback is today only, so a window that closed before the day turned
+        is no longer visible to `missed_cycles`, and the start deferred
+        behind the pause is dropped as stale at the resume. Neither leaves a
+        record. That is the accepted cost of an unbounded pause, and it is
+        what Story 3.5's safety timeout exists to bound.
         """
-        if not self._reconciled:
+        if not self._reconciled or self.manual_override:
             return
         misses = missed_cycles(
             self.plan,

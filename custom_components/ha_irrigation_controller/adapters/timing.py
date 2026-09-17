@@ -296,6 +296,54 @@ class CycleRunner:
             self._async_push_state()
         return started
 
+    async def async_switch_observed(
+        self,
+        entity_id: str,
+        *,
+        is_on: bool,
+        manual: bool,
+    ) -> None:
+        """Hand one governed-switch observation to the engine (Story 3.4).
+
+        The switch adapter's standing watch is a synchronous `@callback`; it
+        reaches this through `entry.async_create_background_task`, so the
+        observation is served on the entry's own task and an unload cancels
+        it with the entry.
+
+        Mirrors every other mutating command: ONE clock read, the engine
+        call, then the pinned `finally` triple. The engine may have installed
+        a deferred cycle and started it (a resume), so the ONE timer has to
+        be re-pointed and the entities pushed; `_async_maybe_reload` keeps
+        its place in the middle, because a resume that completes a cycle is
+        as good a moment to fire a deferred reload as any other.
+
+        No timer of its own, and no `asyncio`: the pause is unbounded in this
+        story (Story 3.5's safety timeout is what bounds it) and every future
+        time intent hangs off `next_wakeup` (AD-3).
+
+        A no-op after shutdown, and that guard is load-bearing rather than
+        defensive: `async_suspend` calls `async_shutdown()` FIRST and then
+        commands the live valve and the pump off. Each of those closes is an
+        observation, and one of them releasing the last hand-opened switch
+        would resume the scheduler — draining the deferred queue and opening
+        a valve — on an entry that is being torn down, with no timer left to
+        close it again.
+        """
+        if self._shutdown:
+            return
+        now = self._clock.now()
+        try:
+            await self._sequencer.async_switch_observed(
+                entity_id,
+                is_on=is_on,
+                manual=manual,
+                now=now,
+            )
+        finally:
+            self._rearm()
+            self._async_maybe_reload()
+            self._async_push_state()
+
     async def async_set_season(self, *, enabled: bool) -> None:
         """Turn the season on or off and re-arm (FR10, AC 1).
 
