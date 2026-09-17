@@ -5,8 +5,9 @@ Two responsibilities, deliberately split the way AD-3 splits time intents:
 - **Daily starts** are NOT `next_wakeup()` intents. They arrive from outside
   via `sequencer.request_cycle`, driven by `async_track_time_change` — the
   only DST-safe way to express a daily wall-clock start.
-- **Intra-cycle wake-ups** (zone boundaries; later the watchdog and the
-  manual-valve timeout) are ALL `next_wakeup()` intents served by exactly ONE
+- **Intra-cycle wake-ups** (zone boundaries, the missed-cycle watchdog's
+  window-end deadline since Story 3.3; later the manual-valve timeout) are
+  ALL `next_wakeup(now)` intents served by exactly ONE
   `async_track_point_in_time` registration. A second registration anywhere
   breaks AD-3 and the Epic 3 stories that hang their intents off this
   callback.
@@ -250,8 +251,12 @@ class CycleRunner:
         runner's to own, and a mutating call that skipped them would leave the
         ONE timer pointing at a boundary the engine no longer has.
 
-        After a cancel `next_wakeup()` is `None`, so `_rearm` cancels the
-        point-in-time handle — that IS the "re-armed to nothing" half of AC 4.
+        After a cancel nothing of the cancelled cycle is left to serve, so
+        `_rearm` never points at one of its boundaries — that IS the
+        "re-armed to nothing" half of AC 4. Since Story 3.3 the handle itself
+        usually survives, holding the watchdog's next window-end deadline
+        instead; it is cancelled outright only when the engine answers `None`
+        (the season is off, or the plan has no zones).
         """
         try:
             return await self._sequencer.async_cancel_cycle(self._clock.now())
@@ -446,6 +451,11 @@ class CycleRunner:
         the timer, or a long cycle would recurse. A `next_wakeup()` already in
         the past is fine — `async_track_point_in_time` fires it immediately
         and the loop converges.
+
+        The clock read is handed to the engine (Story 3.3): while a cycle is
+        active the answer is its own boundary, and while the machine is idle
+        it is the watchdog's next cycle-window end — which is why the handle
+        now normally exists between cycles too, still exactly one of it.
         """
         if self._unsub_point is not None:
             self._unsub_point()
@@ -456,7 +466,7 @@ class CycleRunner:
             # in-flight step would arm a fresh timer AFTER shutdown ran, and
             # the entry would leak a timer per reload.
             return
-        when = self._sequencer.next_wakeup()
+        when = self._sequencer.next_wakeup(self._clock.now())
         if when is None:
             return
         self._unsub_point = async_track_point_in_time(

@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from custom_components.ha_irrigation_controller.engine.plan import CycleKind
+from custom_components.ha_irrigation_controller.engine.ports import AnomalyKind
 from custom_components.ha_irrigation_controller.engine.runs import (
     CycleStatus,
     ZoneRunStatus,
@@ -196,7 +197,12 @@ async def test_a_renamed_gauge_costs_exactly_one_banking_cycle() -> None:
         (120, 480),
         (120, 480),
     ]
-    assert anomalies.reports == []
+    # The one anomaly is Story 3.3's, not this story's: this sequencer's first
+    # `advance` is at 20:00 on the 31st, so the watchdog rightly reads the
+    # 07:00 morning nobody ran in ITS life as missed and records it (the
+    # evening is already watering, so it is not re-run). The rain accounting
+    # above is untouched — the evening's own settlement replaces the ledger.
+    assert [kind for kind, _ in anomalies.reports] == [AnomalyKind.MISSED_CYCLE]
 
 
 async def test_a_pre_2_5_journal_quotes_one_unmodulated_cycle_then_modulates() -> None:
@@ -312,7 +318,12 @@ async def test_a_doubtful_quote_is_backfilled_into_the_next_cycle() -> None:
     assert history_of(journal)[-1]["rain_total_mm"] == 30.0
     assert baselines_of(sequencer) == {"zone-1": 30.0, "zone-2": 30.0}
     assert sequencer.ledger.as_dict()["deficits"] == {}
-    assert anomalies.reports == []
+    # The one anomaly is Story 3.3's, not this story's: this sequencer's first
+    # `advance` is at 20:00 on the 31st, so the watchdog rightly reads the
+    # 07:00 morning nobody ran in ITS life as missed and records it (the
+    # evening is already watering, so it is not re-run). The rain accounting
+    # above is untouched — the evening's own settlement replaces the ledger.
+    assert [kind for kind, _ in anomalies.reports] == [AnomalyKind.MISSED_CYCLE]
 
 
 async def test_a_backfill_after_completion_never_revisits_the_completed_run() -> None:

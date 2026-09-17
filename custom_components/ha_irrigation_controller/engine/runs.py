@@ -36,19 +36,29 @@ MAX_JOURNALED_SECONDS: Final = 7 * 86400
 class CycleStatus(StrEnum):
     """Lifecycle of a cycle run.
 
-    Four TERMINAL statuses: COMPLETED (the cycle ran its course), CANCELLED
+    Five TERMINAL statuses: COMPLETED (the cycle ran its course), CANCELLED
     (Story 1.6's explicit operator cancel, the only thing that stops a running
     cycle), WAIVED (Story 2.3: a scheduled cycle the ledger's day credit
     excused because a completed run-now had already watered its irrigation
-    day) and INTERRUPTED (Story 3.2: a run found in the journal at startup
+    day), INTERRUPTED (Story 3.2: a run found in the journal at startup
     that could not be resumed — a later irrigation day, or a PENDING run
     under season OFF — and was closed by the reconciler so its shortfalls
-    reach the ledger). WAIVED is terminal AT BIRTH — such a run is built,
-    filed to history and dropped in one step; it is never `current_run`,
-    never `last_run`, never settled and commands nothing. Nothing anywhere
+    reach the ledger) and MISSED (Story 3.3: a scheduled cycle whose window
+    closed with no record of it at all — the watchdog's marker that it was
+    never performed). WAIVED and MISSED are terminal AT BIRTH — such a run is
+    built, filed to history and dropped in one step; it is never
+    `current_run`, never `last_run` and commands nothing (a MISSED run IS
+    settled when it will not be re-run, so its shortfall reaches the ledger;
+    a WAIVED one never is). Nothing anywhere
     assumes "terminal == completed" — the completion path is shared and
     takes the terminal status as a parameter, and every reader keys off the
     value rather than off the absence of a run.
+
+    The MISSED record is also the at-most-once marker of the late re-run
+    (Story 3.3): it is filed BEFORE the re-run is dispatched, it is pruned
+    with history by irrigation day, and its presence makes the same
+    (irrigation day, kind) undetectable forever after. There is no second
+    persisted field.
     """
 
     PENDING = "pending"
@@ -57,6 +67,7 @@ class CycleStatus(StrEnum):
     CANCELLED = "cancelled"
     WAIVED = "waived"
     INTERRUPTED = "interrupted"
+    MISSED = "missed"
 
     @property
     def is_terminal(self) -> bool:
@@ -76,9 +87,11 @@ class ZoneRunStatus(StrEnum):
     no instants so `effective_seconds` reads 0, and its quote was 0 so the
     ledger books no deficit. It is a ZONE status, not a cycle status: a cycle
     with one skipped zone still COMPLETES, and a cycle whose zones are all
-    skipped completes without ever starting the pump. Epic 3's watchdog reads
-    a skipped zone with `rain_credit_s > 0` as a PERMITTED non-watering
-    cause, never as a miss.
+    skipped completes without ever starting the pump. That completion is
+    also what keeps Story 3.3's watchdog silent about it: the watchdog asks
+    only whether a record exists for the irrigation day and kind, so a
+    rain-skipped cycle is handled by its own COMPLETED entry and no zone
+    status is ever inspected.
     """
 
     PENDING = "pending"
@@ -349,6 +362,13 @@ class CycleRun:
     It rides into the history record so Epic 4 can show that a cycle's
     figures come from a recovery, and it is optional on read — a journal
     written before this story has no such key.
+
+    `late_rerun` (Story 3.3) is the watchdog's marker: True on the run the
+    watchdog dispatched to make up for a cycle it found missing, False on
+    every other run — the MISSED record itself included, which is the miss,
+    not the make-up. It rides into the history record so Epic 4 can show
+    that a cycle watered late, and it is optional on read for the same
+    reason `recovery` is.
     """
 
     cycle_id: str
@@ -364,6 +384,7 @@ class CycleRun:
     rain_total_mm: float | None = None
     rain_source: str | None = None
     recovery: str | None = None
+    late_rerun: bool = False
 
     def as_dict(self) -> dict[str, object]:
         """Return a plain serializable snapshot of this cycle run."""
@@ -380,6 +401,7 @@ class CycleRun:
             "rain_total_mm": self.rain_total_mm,
             "rain_source": self.rain_source,
             "recovery": self.recovery,
+            "late_rerun": self.late_rerun,
             "zones": [zone.as_dict() for zone in self.zone_runs],
         }
 
@@ -396,10 +418,13 @@ class CycleRun:
         when absent), and the adapter
         then refuses the whole run (the reconciler closes every configured
         switch and books nothing rather than act on a snapshot it cannot
-        trust). Two deliberate exceptions: `manual` reads through `is_manual`
-        (only a real `True` is manual — the one home of that rule) and
-        `recovery` is optional (absent in every journal written before this
-        story). `zone_index` is NOT part of the run and is never read: the
+        trust). Three deliberate exceptions: `manual` reads through
+        `is_manual` (only a real `True` is manual — the one home of that
+        rule), `recovery` is optional (absent in every journal written before
+        Story 3.2) and `late_rerun` is optional too, read the same
+        conservative way as `manual`: only a real `True` marks a late re-run,
+        so a pre-3.3 journal and a hand edit both read as an ordinary cycle.
+        `zone_index` is NOT part of the run and is never read: the
         live slot is derived from the zone statuses. `tz` is the HA-local
         zone every instant is converted back into.
         """
@@ -447,6 +472,7 @@ class CycleRun:
             rain_total_mm=None if total is None else float(total),
             rain_source=source,
             recovery=recovery,
+            late_rerun=data.get("late_rerun") is True,
         )
 
 

@@ -231,6 +231,11 @@ async def idle_entry(
     Arming the daily trackers at 09:30 instead puts the next morning start on
     tomorrow and the evening one at 20:00: both stay in the future for the whole
     of these tests.
+
+    09:30 is also past the morning WINDOW, and the journal is empty — which is
+    exactly a first install. Story 3.3's floor is what keeps that quiet: the
+    reconcile stamps 09:30, and a window that closed before it was never this
+    controller's to make up.
     """
     freezer.move_to("2026-07-31 09:30:00+02:00")
     config_entry = MockConfigEntry(

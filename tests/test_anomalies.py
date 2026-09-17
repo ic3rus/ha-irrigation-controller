@@ -167,6 +167,7 @@ async def test_first_report_opens_an_issue_pushes_once_and_fires_the_event(
         "entity_id": "switch.zone_1_valve",
         "zone_id": "zone-1",
         "cycle_id": "2026-07-31-morning",
+        "kind": "-",
         "role": "-",
         "outcome": "-",
     }
@@ -273,6 +274,15 @@ async def test_a_repeat_report_refreshes_the_issue_and_never_pushes_again(
             "cycle_recovered",
         ),
         (
+            AnomalyKind.MISSED_CYCLE,
+            {
+                "cycle_id": "2026-07-31-morning",
+                "kind": "morning",
+                "outcome": "rerun",
+            },
+            "missed_cycle",
+        ),
+        (
             AnomalyKind.JOURNAL_SAVE_FAILED,
             {"error": "OSError()"},
             "journal_save_failed",
@@ -315,6 +325,7 @@ async def test_absent_placeholders_read_as_a_dash(
         "entity_id": "-",
         "zone_id": "-",
         "cycle_id": "2026-07-31-morning",
+        "kind": "morning",
         "role": "-",
         "outcome": "-",
     }
@@ -348,6 +359,7 @@ async def test_cycle_recovered_carries_its_outcome_and_is_never_auto_cleared(
         "entity_id": "-",
         "zone_id": "zone-1",
         "cycle_id": "2026-07-31-morning",
+        "kind": "morning",
         "role": "-",
         "outcome": "resumed",
     }
@@ -372,6 +384,62 @@ async def test_cycle_recovered_carries_its_outcome_and_is_never_auto_cleared(
     assert len(notify.sent) == 1
 
     ir.async_delete_issue(hass, DOMAIN, "cycle_recovered")
+    await hass.async_block_till_done()
+    assert manager.open_anomalies == ()
+
+
+async def test_missed_cycle_carries_its_outcome_and_is_never_auto_cleared(
+    hass: HomeAssistant,
+    manager: AnomalyManager,
+    notify: RecordingNotify,
+) -> None:
+    """Story 3.3 AC 5: one issue, one push, `kind` + `outcome` — acknowledge only.
+
+    The engine never calls `clear` for this kind, so the only way the issue
+    goes is the operator's. A second missed cycle — the day's other one,
+    recorded rather than re-run — refreshes the same controller-level issue
+    with the new context and pushes nothing new.
+    """
+    manager.report(
+        AnomalyKind.MISSED_CYCLE,
+        {
+            "cycle_id": "2026-07-31-morning",
+            "kind": "morning",
+            "outcome": "rerun",
+        },
+    )
+    await hass.async_block_till_done()
+
+    issue = issue_of(hass, "missed_cycle")
+    assert issue is not None
+    assert issue.translation_placeholders == {
+        "entity_id": "-",
+        "zone_id": "-",
+        "cycle_id": "2026-07-31-morning",
+        "kind": "morning",
+        "role": "-",
+        "outcome": "rerun",
+    }
+    assert len(notify.sent) == 1
+    assert "missed cycle" in notify.sent[0][0]
+    assert "outcome rerun" in notify.sent[0][1]
+
+    manager.report(
+        AnomalyKind.MISSED_CYCLE,
+        {
+            "cycle_id": "2026-07-31-evening",
+            "kind": "evening",
+            "outcome": "recorded",
+        },
+    )
+    await hass.async_block_till_done()
+    issue = issue_of(hass, "missed_cycle")
+    assert issue is not None
+    assert issue.translation_placeholders is not None
+    assert issue.translation_placeholders["outcome"] == "recorded"
+    assert len(notify.sent) == 1
+
+    ir.async_delete_issue(hass, DOMAIN, "missed_cycle")
     await hass.async_block_till_done()
     assert manager.open_anomalies == ()
 

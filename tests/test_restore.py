@@ -32,6 +32,7 @@ from homeassistant.const import (
 from homeassistant.core import CoreState, callback
 from homeassistant.helpers import entity_registry as er, issue_registry as ir
 from homeassistant.setup import async_setup_component
+from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.ha_irrigation_controller.adapters.journal import STORAGE_KEY
@@ -51,6 +52,7 @@ from tests.common import (
     VALVE_2,
     crashed_during_zone_a,
     fire_at,
+    history_record,
     journal_document,
     register_notify_domain,
     register_switch_domain,
@@ -471,8 +473,11 @@ async def test_next_day_restart_closes_the_run_and_carries_the_deficits(
     assert len(pushes) == 1
     assert "outcome closed" in pushes[0].data["message"]
     assert health_of(hass, entry) == STATE_ON
-    # No timer is left on the closed run; the day's own starts are armed.
-    assert sequencer.next_wakeup() is None
+    # No timer is left on the closed run; what remains is Story 3.3's
+    # watchdog deadline on THIS day's own morning window end, still open.
+    assert sequencer.next_wakeup(dt_util.now()) == dt_util.parse_datetime(
+        "2026-08-01 07:20:00+02:00"
+    )
 
     await unload(hass, entry)
     stored = hass_storage[STORAGE_KEY]["data"]
@@ -626,6 +631,10 @@ async def test_a_completed_run_left_under_run_is_the_last_run_not_a_recovery(
         now="2026-07-31 09:00:00+02:00",
         states=ALL_OFF,
         run=completed,
+        # The completion write put the record and the run in the SAME save, so
+        # a restart reading this journal knows the morning ran — and Story
+        # 3.3's watchdog has nothing to make up for.
+        history=[history_record()],
     )
 
     assert calls == []
@@ -759,4 +768,210 @@ async def test_boot_time_recovery_waits_for_homeassistant_started(
     assert finished.status is CycleStatus.COMPLETED
 
     hass.set_state(CoreState.running)
+    await unload(hass, entry)
+
+
+# --------------------------------------------------------------------------
+# A window Home Assistant slept through: the missed-cycle watchdog (Story 3.3)
+# --------------------------------------------------------------------------
+
+
+async def test_a_slept_through_window_is_re_run_once_and_only_once(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 3.3 AC 1 + AC 2 at the integration level, across two restarts.
+
+    Home Assistant was down from before 07:00 to 09:00 — the journal holds no
+    run, no history and nothing to recover — so setup files the morning cycle
+    as `missed`, raises ONE `missed_cycle` issue with one push and one event,
+    and waters it at once on quoted durations. A second setup the same day,
+    reading the journal the first one left, re-runs nothing and says nothing.
+    """
+    entry, calls, events, pushes = await restart(
+        hass,
+        hass_storage,
+        freezer,
+        now="2026-07-31 09:00:00+02:00",
+        states=ALL_OFF,
+        run=None,
+    )
+
+    sequencer = entry.runtime_data.sequencer
+    run = sequencer.current_run
+    assert run is not None
+    assert run.cycle_id == "2026-07-31-morning-2"
+    assert run.late_rerun is True
+    assert run.scheduled_start.isoformat() == "2026-07-31T09:00:00+02:00"
+    assert commands(calls) == [("turn_on", PUMP), ("turn_on", VALVE_1)]
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, "missed_cycle")
+    assert issue is not None
+    assert issue.translation_placeholders is not None
+    assert issue.translation_placeholders["outcome"] == "rerun"
+    assert issue.translation_placeholders["kind"] == "morning"
+    assert anomaly_events(events) == [("anomaly", "missed_cycle")]
+    assert len(pushes) == 1
+    assert health_of(hass, entry) == STATE_ON
+
+    # The make-up cycle runs itself out through the ONE re-armed timer.
+    await fire_at(hass, freezer, "2026-07-31 09:10:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 09:20:00+02:00")
+    finished = sequencer.last_run
+    assert finished is not None
+    assert finished.status is CycleStatus.COMPLETED
+    await unload(hass, entry)
+
+    stored = hass_storage[STORAGE_KEY]["data"]
+    assert [(record["cycle_id"], record["status"]) for record in stored["history"]] == [
+        ("2026-07-31-morning", "missed"),
+        ("2026-07-31-morning-2", "completed"),
+    ]
+
+    # A second restart the same day, on THAT journal: the `missed` record is
+    # the at-most-once marker, so nothing is detected, watered or reported.
+    freezer.move_to("2026-07-31 09:30:00+02:00")
+    again = two_zone_entry()
+    again.add_to_hass(hass)
+    calls.clear()
+    events.clear()
+    pushes.clear()
+    assert await hass.config_entries.async_setup(again.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert calls == []
+    assert events == []
+    assert pushes == []
+    assert again.runtime_data.sequencer.current_run is None
+
+    await unload(hass, again)
+
+
+async def test_a_nominal_restart_after_both_cycles_ran_is_silent(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 3.3 AC 3: the counter-metric, at the integration level.
+
+    Both of the day's cycles are in history, so a restart after the evening
+    window commands nothing, files nothing and notifies nothing.
+    """
+    entry, calls, events, pushes = await restart(
+        hass,
+        hass_storage,
+        freezer,
+        now="2026-07-31 21:00:00+02:00",
+        states=ALL_OFF,
+        run=None,
+        history=[history_record("morning"), history_record("evening")],
+    )
+
+    assert calls == []
+    assert events == []
+    assert pushes == []
+    assert entry.runtime_data.sequencer.current_run is None
+    assert health_of(hass, entry) == STATE_OFF
+
+    await unload(hass, entry)
+
+
+async def test_a_miss_after_the_days_later_cycle_is_recorded_not_re_run(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 3.3 AC 5: `outcome: recorded`, no run, one base duration of debt."""
+    entry, calls, _events, pushes = await restart(
+        hass,
+        hass_storage,
+        freezer,
+        now="2026-07-31 20:40:00+02:00",
+        states=ALL_OFF,
+        run=None,
+        history=[history_record("evening")],
+    )
+
+    sequencer = entry.runtime_data.sequencer
+    assert sequencer.current_run is None
+    assert calls == []
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, "missed_cycle")
+    assert issue is not None
+    assert issue.translation_placeholders is not None
+    assert issue.translation_placeholders["outcome"] == "recorded"
+    assert len(pushes) == 1
+    # Each zone carries its base duration forward — never more (FR13's cap).
+    assert sequencer.ledger.deficit_s("zone-a") == 600
+    assert sequencer.ledger.deficit_s("zone-b") == 600
+
+    await unload(hass, entry)
+
+
+async def test_a_fresh_entry_set_up_past_a_window_end_makes_nothing_up(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 3.3's floor, end to end: a first install is never late for anything.
+
+    No journal at all — a controller configured for the first time at 16:00,
+    long past the morning window. There is nothing to recover and, crucially,
+    nothing to make up: the cycle closed before this controller existed, so
+    nobody skipped it. The reconcile stamps that instant as the floor and
+    everything after it is watched normally.
+
+    This is the case that made the config-flow suite time-of-day dependent:
+    without the floor, any real-clock test setting an entry up after 07:20
+    would file a miss and start watering.
+    """
+    hass_storage.clear()
+    freezer.move_to("2026-07-31 16:00:00+02:00")
+    assert await async_setup_component(hass, "switch", {})
+    calls = register_switch_domain(hass, seed_states=False)
+    for entity_id, state in ALL_OFF.items():
+        hass.states.async_set(entity_id, state)
+    pushes = register_notify_domain(hass)
+    events = record_events(hass)
+    entry = two_zone_entry()
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    sequencer = entry.runtime_data.sequencer
+    assert sequencer.current_run is None
+    assert calls == []
+    assert events == []
+    assert pushes == []
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "missed_cycle") is None
+    assert health_of(hass, entry) == STATE_OFF
+
+    # The one thing the reconcile DID write is the floor itself (the debounced
+    # write lands a few seconds later, which commands nothing).
+    await fire_at(hass, freezer, "2026-07-31 16:00:05+02:00")
+    stored = hass_storage[STORAGE_KEY]["data"]
+    assert stored["history"] == []
+    assert stored["run"] is None
+    assert stored["watchdog_since"] == "2026-07-31T14:00:00+00:00"
+    assert calls == []
+
+    # The evening it WILL be there for runs from its own daily start, and the
+    # window end that follows finds it recorded: still nothing made up, and
+    # still not one anomaly on a controller installed hours after a window.
+    await fire_at(hass, freezer, "2026-07-31 20:00:00+02:00")
+    run = sequencer.current_run
+    assert run is not None
+    assert run.cycle_id == "2026-07-31-evening"
+    assert run.late_rerun is False
+    await fire_at(hass, freezer, "2026-07-31 20:15:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 20:30:00+02:00")
+
+    assert sequencer.current_run is None
+    assert events == []
+    assert pushes == []
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "missed_cycle") is None
+
     await unload(hass, entry)

@@ -359,7 +359,11 @@ class Ledger:
     def settle(self, run: CycleRun) -> bool:
         """Record what a terminal `run` owes; False when already settled.
 
-        THE only write. Per zone::
+        THE only write, and it has exactly TWO call sites, both in the
+        sequencer: `_complete_cycle`, for every run that reaches a terminal
+        status through the shared completion path, and `_check_missed`
+        (Story 3.3), for a cycle whose window closed with nothing to show for
+        it and which nothing is going to water. Per zone::
 
             new_deficit = clamp(quoted_s - effective_seconds(zone), 0, base_s)
 

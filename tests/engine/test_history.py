@@ -131,6 +131,9 @@ def test_history_entry_is_a_compact_serializable_outcome() -> None:
         # Story 3.2's recovery marker, written on every record too: None for
         # a cycle that was never interrupted.
         "recovery": None,
+        # Story 3.3's late-re-run marker, likewise on every record: True only
+        # on the make-up cycle the watchdog dispatched for a missed one.
+        "late_rerun": False,
         "configured_start": "2026-07-31T05:00:00+00:00",
         "scheduled_start": "2026-07-31T05:00:00+00:00",
         "ended_at": "2026-07-31T05:26:00+00:00",

@@ -85,8 +85,17 @@ def make_sequencer(
 
 
 async def run_to_idle(sequencer: Sequencer, clock: VirtualClock) -> None:
-    """Drive the engine with the exact wake-up loop the runner uses."""
-    while (moment := sequencer.next_wakeup()) is not None:
+    """Drive the ACTIVE cycle with the exact wake-up loop the runner uses.
+
+    Stops the moment the machine goes idle. Since Story 3.3 `next_wakeup`
+    answers the watchdog's next window-end deadline while idle — the runner's
+    loop is the same one and simply never stops — so a test loop that only
+    watched it would walk the calendar for ever.
+    """
+    while sequencer.current_run is not None:
+        moment = sequencer.next_wakeup(clock.now())
+        if moment is None:
+            break
         clock.advance_to(moment)
         await sequencer.advance(clock.now())
 
@@ -192,7 +201,7 @@ async def test_rain_since_the_previous_cycle_reduces_the_next_one() -> None:
     assert snapshot_run["zones"][0]["rain_credit_s"] == 210
 
     await sequencer.advance(clock.now())
-    assert sequencer.next_wakeup() == aware(7, 6, 30, day=1, month=8)
+    assert sequencer.next_wakeup(clock.now()) == aware(7, 6, 30, day=1, month=8)
     await run_to_idle(sequencer, clock)
 
     assert [effective_seconds(z) for z in finished(sequencer).zone_runs] == [390, 390]
@@ -414,7 +423,7 @@ async def test_an_all_covered_cycle_never_starts_the_pump() -> None:
     assert switches.commands == []
     assert anomalies.reports == []
     assert sequencer.current_run is None
-    assert sequencer.next_wakeup() is None
+    assert sequencer.next_wakeup(clock.now()) == aware(7, 20)
     assert [record["status"] for record in zone_records(journal)] == [
         "skipped",
         "skipped",
@@ -475,11 +484,15 @@ async def test_next_wakeup_never_points_at_a_skipped_slot_across_an_await() -> N
     clock = VirtualClock(aware(7))
     # (what the runner would re-arm at, the engine time it was asked) pairs.
     observed: list[tuple[datetime | None, datetime]] = []
-    journal.observer = lambda: observed.append((sequencer.next_wakeup(), clock.now()))
+    journal.observer = lambda: observed.append(
+        (sequencer.next_wakeup(clock.now()), clock.now())
+    )
     await sequencer.request_cycle(CycleKind.MORNING, clock.now())
 
     steps = 0
-    while (moment := sequencer.next_wakeup()) is not None:
+    while sequencer.current_run is not None:
+        moment = sequencer.next_wakeup(clock.now())
+        assert moment is not None
         steps += 1
         assert steps <= 4, "the drive loop did not converge"
         clock.advance_to(moment)

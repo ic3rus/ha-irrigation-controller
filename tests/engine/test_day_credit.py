@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from custom_components.ha_irrigation_controller.engine.plan import CycleKind
+from custom_components.ha_irrigation_controller.engine.ports import AnomalyKind
 from custom_components.ha_irrigation_controller.engine.runs import (
     CycleRun,
     CycleStatus,
@@ -78,8 +79,17 @@ def make_sequencer(
 
 
 async def run_to_idle(sequencer: Sequencer, clock: VirtualClock) -> None:
-    """Drive the engine with the exact wake-up loop the runner uses."""
-    while (moment := sequencer.next_wakeup()) is not None:
+    """Drive the ACTIVE cycle with the exact wake-up loop the runner uses.
+
+    Stops the moment the machine goes idle. Since Story 3.3 `next_wakeup`
+    answers the watchdog's next window-end deadline while idle — the runner's
+    loop is the same one and simply never stops — so a test loop that only
+    watched it would walk the calendar for ever.
+    """
+    while sequencer.current_run is not None:
+        moment = sequencer.next_wakeup(clock.now())
+        if moment is None:
+            break
         clock.advance_to(moment)
         await sequencer.advance(clock.now())
 
@@ -152,7 +162,10 @@ async def test_a_completed_run_now_waives_the_next_scheduled_cycle_of_its_day() 
     await sequencer.advance(clock.now())
 
     assert sequencer.current_run is None
-    assert sequencer.next_wakeup() is None
+    # Idle: the only intent left is the watchdog's deadline on the morning
+    # window end — and the waived record is what keeps it from reading as a
+    # miss when that deadline fires (Story 3.3).
+    assert sequencer.next_wakeup(clock.now()) == aware(7, 20)
     assert sequencer.last_run is run_now
     assert sequencer.deferred_kinds == ()
     assert switches.commands == commands_before
@@ -200,6 +213,7 @@ async def test_the_waived_record_is_the_snapshot_a_real_run_would_have_had() -> 
         "manual": False,
         "waived_by": "2026-07-31-morning",
         "recovery": None,
+        "late_rerun": False,
         "configured_start": "2026-07-31T05:00:00+00:00",
         "scheduled_start": "2026-07-31T05:00:00+00:00",
         "ended_at": "2026-07-31T05:00:00+00:00",
@@ -306,7 +320,7 @@ async def test_a_cycle_deferred_behind_the_run_now_is_waived_when_popped() -> No
 
     assert clock.now() == aware(7, 15)
     assert sequencer.current_run is None
-    assert sequencer.next_wakeup() is None
+    assert sequencer.next_wakeup(clock.now()) == aware(7, 20)
     assert not sequencer.deferred_kinds
     assert switches.commands[-1] == ("off", PUMP)
     assert len(switches.commands) == 6
@@ -467,6 +481,12 @@ async def test_a_credit_with_no_later_cycle_that_day_is_cleared_next_day() -> No
     The first scheduled decision is another day's, so the credit is cleared
     and the cycle waters — the operator loses a waiver they could not have
     used, never water.
+
+    The 21:00 run-now is the first thing this machine ever does, so its own
+    `advance` also lets Story 3.3's watchdog see a 07:00 morning that really
+    never ran that day: it is filed `missed` and, with the run-now already
+    watering, recorded rather than re-run. Unrelated to the credit and
+    asserted here only so the day's records stay fully accounted for.
     """
     sequencer, _, journal, anomalies = make_sequencer(two_zone_plan())
     clock = VirtualClock(aware(21))
@@ -482,10 +502,11 @@ async def test_a_credit_with_no_later_cycle_that_day_is_cleared_next_day() -> No
     await run_to_idle(sequencer, clock)
 
     assert outcomes(journal) == [
+        ("2026-07-31-morning", "missed", None),
         ("2026-07-31-evening", "completed", None),
         ("2026-08-01-morning", "completed", None),
     ]
-    assert anomalies.reports == []
+    assert [kind for kind, _ in anomalies.reports] == [AnomalyKind.MISSED_CYCLE]
 
 
 async def test_a_run_now_across_midnight_credits_the_day_it_was_configured_for() -> (
@@ -613,7 +634,7 @@ async def test_a_seeded_credit_waives_the_first_scheduled_cycle_of_its_day() -> 
 
     assert sequencer.current_run is None
     assert sequencer.last_run is None
-    assert sequencer.next_wakeup() is None
+    assert sequencer.next_wakeup(clock.now()) == aware(7, 20)
     assert switches.commands == []
     assert anomalies.reports == []
     assert sequencer.ledger.day_credit is None

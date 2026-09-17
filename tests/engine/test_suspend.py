@@ -98,7 +98,7 @@ async def test_suspend_of_a_pending_run_reports_the_interruption_only() -> None:
     assert run is not None
     assert run.status is CycleStatus.PENDING
     saves = len(journal.snapshots)
-    wakeup = sequencer.next_wakeup()
+    wakeup = sequencer.next_wakeup(clock.now())
 
     assert await sequencer.async_suspend(clock.now()) is True
 
@@ -113,7 +113,7 @@ async def test_suspend_of_a_pending_run_reports_the_interruption_only() -> None:
     assert sequencer.current_run is run
     assert run.status is CycleStatus.PENDING
     assert len(journal.snapshots) == saves
-    assert sequencer.next_wakeup() == wakeup
+    assert sequencer.next_wakeup(clock.now()) == wakeup
 
 
 async def test_suspend_of_a_running_cycle_closes_the_valve_then_the_pump() -> None:
@@ -130,7 +130,7 @@ async def test_suspend_of_a_running_cycle_closes_the_valve_then_the_pump() -> No
     run = sequencer.current_run
     assert run is not None
     saves = len(journal.snapshots)
-    wakeup = sequencer.next_wakeup()
+    wakeup = sequencer.next_wakeup(clock.now())
     clock.advance_to(aware(7, 4))
 
     assert await sequencer.async_suspend(clock.now()) is True
@@ -156,7 +156,7 @@ async def test_suspend_of_a_running_cycle_closes_the_valve_then_the_pump() -> No
     assert zone.close_confirmed is None
     assert run.pump_off_confirmed is None
     assert len(journal.snapshots) == saves
-    assert sequencer.next_wakeup() == wakeup == aware(7, 10)
+    assert sequencer.next_wakeup(clock.now()) == wakeup == aware(7, 10)
 
 
 async def test_suspend_with_unconfirmed_closes_reports_both_and_still_succeeds() -> (
@@ -229,11 +229,11 @@ async def test_a_plan_swap_mid_run_leaves_the_running_cycle_untouched() -> None:
     sequencer.plan = two_zone_plan(zone_2_s=300)
 
     assert run.zone_runs[1].duration_s == 600
-    assert sequencer.next_wakeup() == aware(7, 10)
+    assert sequencer.next_wakeup(clock.now()) == aware(7, 10)
     clock.advance_to(aware(7, 10))
     await sequencer.advance(clock.now())
     # Zone 2 still closes at its snapshotted 07:20, not at 07:15.
-    assert sequencer.next_wakeup() == aware(7, 20)
+    assert sequencer.next_wakeup(clock.now()) == aware(7, 20)
     clock.advance_to(aware(7, 15))
     await sequencer.advance(clock.now())
     assert switches.commands[-1] == ("on", VALVE_2)
@@ -279,7 +279,7 @@ async def test_a_deferred_cycle_popped_after_the_swap_uses_the_new_plan() -> Non
     assert evening.status is CycleStatus.RUNNING
     assert [zone.duration_s for zone in evening.zone_runs] == [300, 120]
     assert evening.zone_runs[0].planned_end == aware(7, 25)
-    assert sequencer.next_wakeup() == aware(7, 25)
+    assert sequencer.next_wakeup(clock.now()) == aware(7, 25)
 
 
 async def test_suspend_clears_what_it_confirms_before_reporting_the_interruption() -> (

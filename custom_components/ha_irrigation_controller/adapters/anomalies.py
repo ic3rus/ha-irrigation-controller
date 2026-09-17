@@ -73,13 +73,25 @@ _SUBJECT_KEYS: Final[dict[AnomalyKind, tuple[str, ...]]] = {
     # Story 3.2: one issue for the whole controller, like the interruption
     # it supersedes. Never cleared by the engine — acknowledge only.
     AnomalyKind.CYCLE_RECOVERED: (),
+    # Story 3.3: one issue for the whole controller, like the recovery it
+    # sits next to. Never cleared by the engine — acknowledge only.
+    AnomalyKind.MISSED_CYCLE: (),
     AnomalyKind.JOURNAL_SAVE_FAILED: (),
 }
 
 # Every placeholder the issue texts may reference, always provided so a
 # translation can name any of them for any kind; `-` stands for "absent".
-# `outcome` (Story 3.2) is `CYCLE_RECOVERED`'s resumed/closed/discarded.
-_PLACEHOLDERS: Final = ("entity_id", "zone_id", "cycle_id", "role", "outcome")
+# `outcome` (Story 3.2) is `CYCLE_RECOVERED`'s resumed/closed/discarded,
+# and (Story 3.3) `MISSED_CYCLE`'s rerun/recorded; `kind` is the cycle kind
+# every cycle-level context already carries.
+_PLACEHOLDERS: Final = (
+    "entity_id",
+    "zone_id",
+    "cycle_id",
+    "kind",
+    "role",
+    "outcome",
+)
 _ABSENT: Final = "-"
 
 # Issue `data` keys — what a rebuilt manager re-seeds from.

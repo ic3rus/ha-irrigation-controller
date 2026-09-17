@@ -189,8 +189,9 @@ async def test_cycle_status_is_an_enum_with_a_coarse_summary(
 
     state = state_of(hass, status)
     assert state.attributes[ATTR_DEVICE_CLASS] == SensorDeviceClass.ENUM
-    # `cancelled` (Story 1.6), `waived` (Story 2.3) and `interrupted` (Story
-    # 3.2) ride in through the CycleStatus comprehension. No push point can
+    # `cancelled` (Story 1.6), `waived` (Story 2.3), `interrupted` (Story
+    # 3.2) and `missed` (Story 3.3) ride in through the CycleStatus
+    # comprehension. No push point can
     # surface any of them today — the
     # dispatcher fires after `advance` returns, by which point `current_run`
     # is released, and a waived cycle is never `current_run` at all — so what
@@ -206,6 +207,7 @@ async def test_cycle_status_is_an_enum_with_a_coarse_summary(
         "cancelled",
         "waived",
         "interrupted",
+        "missed",
     ]
     assert ATTR_STATE_CLASS not in state.attributes
     assert ATTR_UNIT_OF_MEASUREMENT not in state.attributes

@@ -55,9 +55,11 @@ def history_entry(
 
     A zone quoted at zero because rain covered it is filed `status:
     "skipped"` with `effective_s: 0` and the credit that skipped it (Story
-    2.4). That is how history records WHY nothing flowed: Epic 3's watchdog
-    reads a skipped zone with `rain_credit_s > 0` as a PERMITTED
-    non-watering cause, like a waived cycle. Records written before 2.4 have
+    2.4). That is how history records WHY nothing flowed, for the operator
+    and for Epic 4. Story 3.3's watchdog needs no such detail: rain-skipped
+    zones live inside a COMPLETED cycle, and the existence of ANY record for
+    the irrigation day and kind is what makes the cycle handled — it never
+    looks inside the zone list. Records written before 2.4 have
     no `rain_credit_s` key and are not backfilled — Epic 4's reader defaults
     it, as it does `planned_s`.
 
@@ -78,9 +80,9 @@ def history_entry(
     reader gets one shape. A waived cycle never started, so its zone records
     keep their pre-run values: `status: "pending"`, `effective_s: 0`, and
     `planned_s` the duration the ledger quoted (with `carried_s` the deficit
-    it would have applied). Epic 3's watchdog reads a waived record as a
-    PERMITTED non-watering cause, never as a missed cycle: the water it
-    accounts for flowed in the run-now it names.
+    it would have applied). Story 3.3's watchdog reads a waived record as a
+    PERMITTED non-watering cause like any other record, on its mere
+    existence: the water it accounts for flowed in the run-now it names.
 
     `recovery` (Story 3.2) rides along verbatim from the run: `None` for a
     cycle that was never interrupted, `"resumed"` for one the startup
@@ -88,6 +90,15 @@ def history_entry(
     filed `interrupted` — written on EVERY record, so Epic 4's history view
     can mark a recovered cycle without asking whether the key exists.
     Records written before 3.2 have no such key and are not backfilled.
+
+    `late_rerun` (Story 3.3) rides along verbatim from the run too: True on
+    the make-up cycle the watchdog dispatched for a missed one, False
+    everywhere else — including on the `missed` record itself, which is the
+    miss rather than the make-up. A record filed with `status: "missed"` is
+    the watchdog's at-most-once marker: it never started, so every zone
+    record keeps its pre-run values (`status: "pending"`, `effective_s: 0`,
+    `planned_s` the duration the ledger quoted). Records written before 3.3
+    have no `late_rerun` key and are not backfilled.
     """
     zone_runs = run.zone_runs
     return {
@@ -98,6 +109,7 @@ def history_entry(
         MANUAL_KEY: run.manual,
         "waived_by": waived_by,
         "recovery": run.recovery,
+        "late_rerun": run.late_rerun,
         "configured_start": utc_iso(run.configured_start),
         "scheduled_start": utc_iso(run.scheduled_start),
         "ended_at": utc_iso(ended_at),

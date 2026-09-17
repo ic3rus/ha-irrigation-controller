@@ -68,8 +68,17 @@ def make_sequencer(
 
 
 async def run_to_idle(sequencer: Sequencer, clock: VirtualClock) -> None:
-    """Drive the engine with the exact wake-up loop the runner uses."""
-    while (moment := sequencer.next_wakeup()) is not None:
+    """Drive the ACTIVE cycle with the exact wake-up loop the runner uses.
+
+    Stops the moment the machine goes idle. Since Story 3.3 `next_wakeup`
+    answers the watchdog's next window-end deadline while idle — the runner's
+    loop is the same one and simply never stops — so a test loop that only
+    watched it would walk the calendar for ever.
+    """
+    while sequencer.current_run is not None:
+        moment = sequencer.next_wakeup(clock.now())
+        if moment is None:
+            break
         clock.advance_to(moment)
         await sequencer.advance(clock.now())
 
@@ -106,7 +115,9 @@ async def test_season_off_creates_no_run_queues_nothing_and_saves_nothing() -> N
     assert switches.commands == []
     assert journal.snapshots == []
     assert anomalies.reports == []
-    assert sequencer.next_wakeup() is None
+    # Nothing armed either: with the season off the watchdog can only ever
+    # find nothing, so it names no deadline (Story 3.3).
+    assert sequencer.next_wakeup(clock.now()) is None
 
 
 async def test_season_on_behaves_exactly_as_before() -> None:
@@ -247,7 +258,9 @@ async def test_cancelling_a_pending_run_commands_nothing_at_all() -> None:
     assert filed is not None
     assert filed.status is CycleStatus.CANCELLED
     assert filed.pump_off_confirmed is None
-    assert sequencer.next_wakeup() is None
+    # Nothing of the cancelled run is left to serve; the watchdog's deadline
+    # on the morning window end is (the cancelled record makes it a no-op).
+    assert sequencer.next_wakeup(clock.now()) == aware(7, 20)
 
 
 async def test_cancelling_mid_zone_closes_the_live_valve_then_the_pump() -> None:
@@ -281,7 +294,7 @@ async def test_cancelling_mid_zone_closes_the_live_valve_then_the_pump() -> None
     # the shortfall from the ONE helper for free (AD-5).
     assert second.status is ZoneRunStatus.PENDING
     assert effective_seconds(second) == 0
-    assert sequencer.next_wakeup() is None
+    assert sequencer.next_wakeup(clock.now()) == aware(7, 20)
 
 
 async def test_a_cancelled_cycle_is_filed_in_history() -> None:
@@ -321,8 +334,10 @@ async def test_cancel_drops_a_deferred_cycle_instead_of_starting_it() -> None:
         ("off", VALVE_1),
         ("off", PUMP),
     ]
-    # The half of AC 4 a test must assert, not assume: nothing left to re-arm.
-    assert sequencer.next_wakeup() is None
+    # The half of AC 4 a test must assert, not assume: no cycle boundary left
+    # to re-arm — only the watchdog's standing deadline.
+    assert sequencer.current_run is None
+    assert sequencer.next_wakeup(clock.now()) == aware(7, 20)
 
     await run_to_idle(sequencer, clock)
     assert switches.commands[-1] == ("off", PUMP)
