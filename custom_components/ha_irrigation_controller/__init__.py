@@ -249,21 +249,16 @@ async def async_setup_entry(
             sequencer.current_run.cycle_id if sequencer.current_run else None
         ),
     )
-    # The ONLY things read back from storage here: the outcome history AC 4
-    # promises to retain for 7 days, the season mode flag (Story 1.6) and the
-    # water-debt ledger (Story 2.2). Without the history seed the first
-    # journal write of every reload overwrites the stored section with an
-    # empty list, without the season seed a reload would silently resume
-    # watering after the operator ended the season, and without the ledger
-    # seed a zone's deficit would vanish on every reload — the reload regime
-    # runs on every config change — let alone across an HA restart (FR13).
-    #
-    # None is machine state, which is why this is NOT AD-11's recovery path:
-    # a 7-day outcome list is history, the season is a runtime mode and the
-    # ledger is accounting between cycles, so none resumes an in-flight
-    # cycle. `run`, `last_run`, `zone_index` and `deferred` stay unread —
-    # restoring those is Story 3.2's, and it extends this ONE seed read
-    # rather than adding a second reader.
+    # The ONE read of the journal: the outcome history AC 4 promises to
+    # retain for 7 days, the season mode flag (Story 1.6), the water-debt
+    # ledger (Story 2.2) and — Story 3.2, AD-11's recovery path — the
+    # machine state: the in-flight run, the last completed run and the
+    # deferred queue, each validated at the adapter's trust boundary. Seeding
+    # them acts on nothing: the runner's `async_start` below runs the
+    # engine's `async_reconcile` before it arms a single timer, and that is
+    # the only code that resumes or closes a restored run. An unreadable run
+    # reaches the engine as `run_unreadable`, raw, so the reconciler can make
+    # the hardware safe without trusting it.
     seed = await journal.async_load_seed()
     sequencer = Sequencer(
         plan,
@@ -274,6 +269,10 @@ async def async_setup_entry(
         history=seed.history,
         season_enabled=seed.season_enabled,
         ledger=seed.ledger,
+        run=seed.run,
+        last_run=seed.last_run,
+        deferred=seed.deferred,
+        run_unreadable=seed.run_unreadable,
     )
     runner = CycleRunner(hass, entry, sequencer=sequencer, clock=clock)
     # Follows the configured entities through the registry: renames rewrite
@@ -319,6 +318,11 @@ async def async_setup_entry(
     # daily start armed while a later one raises would otherwise have no
     # registered cancel and leak for the process lifetime. The tracker's stop
     # is registered IMMEDIATELY after its start for the same reason.
+    #
+    # `runner.async_start` is LAST: it reconciles the restored run against
+    # the hardware (Story 3.2) — commanding switches through the adapter and
+    # possibly completing a cycle through the journal — so everything it may
+    # touch is wired and every unload hook that must undo it is registered.
     entry.async_on_unload(journal.async_flush)
     tracker.async_start()
     entry.async_on_unload(tracker.async_stop)

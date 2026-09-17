@@ -18,6 +18,12 @@ Every port call is defended: a port that raises must never abort a cycle and
 leave a valve open with no completion path (AD-4). Adapters are expected to
 translate their own failures into a not-confirmed outcome; the engine treats
 a leaked exception as exactly that and reports it.
+
+A third entry point, ``async_reconcile(now)`` (Story 3.2, AD-11), runs ONCE
+per setup before the adapter arms anything: it resyncs the run the journal
+restored against the actual switch states, closes orphans, then resumes or
+closes the cycle. Until it has run, ``advance`` is a no-op and
+``request_cycle`` only defers — nothing acts on a restored run before it.
 """
 
 from __future__ import annotations
@@ -30,16 +36,19 @@ from .history import history_entry, prune_history
 from .ledger import Ledger
 from .plan import derive_schedule, irrigation_day, zone_windows
 from .ports import AnomalyKind
+from .reconcile import RecoveryOutcome, plan_recovery
 from .runs import (
     CycleRun,
     CycleStatus,
     ZoneRun,
     ZoneRunStatus,
     cycle_id_for,
+    live_zone,
     utc_iso,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
     from datetime import datetime
 
     from .plan import ControllerPlan, CycleKind
@@ -59,7 +68,7 @@ class Sequencer:
     skipped (AD-4, runtime half of the overlap defense).
     """
 
-    def __init__(  # noqa: PLR0913 — four injected ports plus the three seeds; collapsing them into a config object would hide which are ports and which are state
+    def __init__(  # noqa: PLR0913 — four injected ports plus the journal seeds; collapsing them into a config object would hide which are ports and which are state
         self,
         plan: ControllerPlan,
         *,
@@ -70,6 +79,10 @@ class Sequencer:
         history: list[dict[str, object]] | None = None,
         season_enabled: bool = True,
         ledger: dict[str, object] | None = None,
+        run: CycleRun | None = None,
+        last_run: CycleRun | None = None,
+        deferred: Sequence[tuple[CycleKind, datetime]] | None = None,
+        run_unreadable: Mapping[str, object] | None = None,
     ) -> None:
         """Wire the sequencer to its plan, its ports and any prior state.
 
@@ -78,16 +91,27 @@ class Sequencer:
         unmodulated — the engine never distinguishes "no gauge" from "gauge
         doubtful", both quote full durations.
 
-        `history`, `season_enabled` and `ledger` are the ONLY state this
-        constructor accepts back, and none is machine state: outcome records
-        are not, a season flag is a runtime MODE, and the water-debt ledger is
-        ACCOUNTING between cycles, not an in-flight cycle. Seeding them is
-        therefore not resuming a cycle (AD-11's recovery path stays Story
-        3.2's, and it restores `run`/`last_run`/`deferred`). Without the
-        history seed the first `_save` of every reload would overwrite the
-        stored 7-day section with an empty list, and without the ledger seed a
-        deficit would not survive the reload regime that runs on every config
-        change — let alone an HA restart.
+        `history`, `season_enabled` and `ledger` are seeds that are NOT
+        machine state: outcome records are not, a season flag is a runtime
+        MODE, and the water-debt ledger is ACCOUNTING between cycles. Without
+        the history seed the first `_save` of every reload would overwrite
+        the stored 7-day section with an empty list, and without the ledger
+        seed a deficit would not survive the reload regime that runs on every
+        config change — let alone an HA restart.
+
+        `run`, `last_run`, `deferred` and `run_unreadable` (Story 3.2) ARE
+        machine state — the journal's intent, validated by the adapter
+        (`CycleRun.from_dict` is the trust boundary; the engine trusts what
+        reaches here). Seeding them does not act on them: `async_reconcile`
+        is the ONLY recovery path (AD-11), and until it has run `advance` is
+        a no-op and `request_cycle` only defers. A restored `run` whose
+        status is already terminal is the completion write that filed it
+        under `run` before the release (`_complete_cycle` saves, THEN moves
+        it to `last_run`): it is not in flight, so it becomes `last_run` and
+        the restart is a nominal one. `run_unreadable` is the raw `run`
+        document the adapter refused (or `{}` when it was not even a
+        mapping): the reconciler then closes every configured switch and
+        reports the discard without ever trusting it.
 
         `season_enabled` defaults to True — fail-wet (AD-4): doubt about the
         stored value resolves toward watering, so an absent or unreadable key
@@ -108,7 +132,15 @@ class Sequencer:
         self._anomalies = anomalies
         self._rain = rain
         self._run: CycleRun | None = None
-        self._last_run: CycleRun | None = None
+        self._last_run: CycleRun | None = last_run
+        if run is not None:
+            if run.status.is_terminal:
+                self._last_run = run
+            else:
+                self._run = run
+        # The raw run document the adapter could not validate — see
+        # `async_reconcile`. Consumed there, never trusted.
+        self._unreadable_run = run_unreadable
         # Completed-cycle outcomes, oldest→newest, pruned to the retention
         # window on every completion. Journalled with the rest of the state:
         # Epic 4's state view reads it from here, never from storage (AD-14).
@@ -130,8 +162,16 @@ class Sequencer:
         # request: that is what its configured start (and therefore its
         # irrigation day) is derived from, so a cycle deferred across midnight
         # stays filed under the day it was requested for.
-        self._deferred: list[tuple[CycleKind, datetime]] = []
+        self._deferred: list[tuple[CycleKind, datetime]] = (
+            [] if deferred is None else list(deferred)
+        )
         self._zone_index = 0
+        # The Story 3.2 gate: False while a restored in-flight run (or an
+        # unreadable one) awaits `async_reconcile`. A machine with nothing to
+        # recover has nothing to protect and starts reconciled — which is
+        # also what keeps every virtual-clock suite driving `request_cycle`
+        # and `advance` directly, without a reconcile step, honest.
+        self._reconciled = self._run is None and run_unreadable is None
         # The state machine mutates run state across `await` boundaries. Two
         # overlapping calls — a re-armed timer firing while a slow verified
         # service call is still in flight — would interleave those mutations,
@@ -158,6 +198,11 @@ class Sequencer:
     def season_enabled(self) -> bool:
         """Return whether scheduling is active at all, read-only (AD-6)."""
         return self._season_enabled
+
+    @property
+    def reconciled(self) -> bool:
+        """Return whether startup reconciliation has run (or was not needed)."""
+        return self._reconciled
 
     @property
     def ledger(self) -> Ledger:
@@ -227,6 +272,10 @@ class Sequencer:
         deferred request is not decided here — it is decided when it is
         popped, in `_complete_cycle`, so the credit the running run-now is
         about to record can excuse it.
+
+        Before `async_reconcile` has run (Story 3.2) the request is deferred
+        too, whatever `self._run` holds: the restored run is not yet
+        resynced, and the reconciler's completion path pops the queue.
         """
         async with self._lock:
             if not self._season_enabled:
@@ -234,7 +283,7 @@ class Sequencer:
                 # save and — the part a watchdog must not mistake for a miss —
                 # no anomaly. The daily tracker stays armed; the gate is here.
                 return
-            if self._run is not None:
+            if self._run is not None or not self._reconciled:
                 self._deferred.append((kind, now))
             else:
                 self._dispatch_scheduled(kind, now, dispatch_at=None, now=now)
@@ -281,18 +330,28 @@ class Sequencer:
         *scheduled* cycle is delayed rather than skipped (AD-4); an operator
         command that cannot run now is an error to report, not work to
         remember — the operator can see the cycle running and call again.
+
+        Refused too while `async_reconcile` has not run (Story 3.2): the
+        journal's run is not resynced yet, and only the reconciler may act
+        on it. That window is Home Assistant's own boot.
         """
         async with self._lock:
-            if self._run is not None or not self.plan.zones:
+            if self._run is not None or not self.plan.zones or not self._reconciled:
                 return False
             self._create_run(kind, now, dispatch_at=now, manual=True)
             await self._save()
             return True
 
     def next_wakeup(self) -> datetime | None:
-        """Return the earliest pending time intent, or None when idle."""
+        """Return the earliest pending time intent, or None when idle.
+
+        None too while `async_reconcile` has not run (Story 3.2): a restored
+        run's boundaries are not the engine's intent until it has been
+        resynced — `advance` would serve nothing, and a boundary already in
+        the past would otherwise fire, do nothing and be re-armed at once.
+        """
         run = self._run
-        if run is None:
+        if run is None or not self._reconciled:
             return None
         if run.status is CycleStatus.PENDING:
             return run.scheduled_start
@@ -313,10 +372,13 @@ class Sequencer:
         engine must stay importable with no Home Assistant and speaks no
         user-facing errors, so the caller (the service) is what turns a False
         into a `ServiceValidationError`.
+
+        False too while `async_reconcile` has not run (Story 3.2): a restored
+        run is the reconciler's to close or resume, and it runs during boot.
         """
         async with self._lock:
             run = self._run
-            if run is None:
+            if run is None or not self._reconciled:
                 return False
             # Cancelling "the cycle" must not immediately start the next one:
             # emptied BEFORE `_complete_cycle`, whose deferral branch is then
@@ -368,7 +430,7 @@ class Sequencer:
                 return False
             zone: ZoneRun | None = None
             if run.status is CycleStatus.RUNNING:
-                zone = _live_zone(run)
+                zone = live_zone(run)
                 if zone is not None:
                     confirmed, error = await self._command(
                         on=False,
@@ -404,7 +466,7 @@ class Sequencer:
     async def _close_live_zone(self, run: CycleRun, now: datetime) -> None:
         """Close the zone whose slot is open, if any — the cancel's valve half.
 
-        The live zone is found by `_live_zone`'s "started but not finished"
+        The live zone is found by `live_zone`'s "started but not finished"
         rule, never by status: a FAILED zone is indistinguishable by status
         from a finished one and still owns the open slot.
 
@@ -413,7 +475,7 @@ class Sequencer:
         returns 0 for them and Epic 2's deficit reads the shortfall from the
         ONE helper that owns the math (AD-5).
         """
-        zone = _live_zone(run)
+        zone = live_zone(run)
         if zone is None:
             return
         confirmed, error = await self._command(on=False, entity_id=zone.valve_entity_id)
@@ -437,22 +499,270 @@ class Sequencer:
         A single late call drains all missed boundaries: the loop keeps
         transitioning until the next intent lies in the future. Calling twice
         with the same ``now`` performs nothing the second time.
+
+        A no-op before `async_reconcile` has run (Story 3.2): a restored run
+        is resynced against the hardware before anything steps it.
         """
         async with self._lock:
-            while (run := self._run) is not None:
-                if run.status is CycleStatus.PENDING:
-                    if now < run.scheduled_start:
-                        return
-                    await self._start_cycle(run, now)
-                # No bounds guard needed on the index here (unlike in
-                # `next_wakeup`, which outside callers reach mid-transition):
-                # a run whose last zone has closed is completed and cleared
-                # before control returns to this loop, and a zero-zone run
-                # never reaches RUNNING with the loop still holding it.
-                elif now >= (zone := run.zone_runs[self._zone_index]).planned_end:
-                    await self._finish_zone(run, zone, now)
-                else:
+            if not self._reconciled:
+                return
+            await self._advance_locked(now)
+
+    async def _advance_locked(self, now: datetime) -> None:
+        """Run the `advance` loop for a caller that already holds the lock."""
+        while (run := self._run) is not None:
+            if run.status is CycleStatus.PENDING:
+                if now < run.scheduled_start:
                     return
+                await self._start_cycle(run, now)
+            # No bounds guard needed on the index here (unlike in
+            # `next_wakeup`, which outside callers reach mid-transition):
+            # a run whose last zone has closed is completed and cleared
+            # before control returns to this loop, and a zero-zone run
+            # never reaches RUNNING with the loop still holding it.
+            elif now >= (zone := run.zone_runs[self._zone_index]).planned_end:
+                await self._finish_zone(run, zone, now)
+            else:
+                return
+
+    async def async_reconcile(self, now: datetime) -> None:
+        """Resync the journal's intent against the hardware, ONCE, at startup.
+
+        THE recovery path (Story 3.2, AD-11) and the only one: the adapter
+        calls it before arming any timer, and nothing else acts on a restored
+        run. Under the lock, in this order:
+
+        1. history is pruned to the retention window from `now` and every
+           deferred entry whose reference is on another irrigation day is
+           dropped (the watchdog owns missed cycles — Story 3.3) — a save
+           follows only if either changed, so a nominal restart with fresh
+           history writes nothing;
+        2. an UNREADABLE run closes EVERY configured valve, then the pump,
+           reports `CYCLE_RECOVERED{outcome: "discarded"}` and is dropped
+           from the journal — nothing is booked, the ledger is untouched;
+        3. a restored in-flight run goes through `_recover`: the orphan pass
+           (each zone valve, then the pump — whatever is not OFF is commanded
+           off through the verified port), then `plan_recovery`'s pure
+           decision, then its application: resume through the same helpers a
+           live cycle uses, or close through `_complete_cycle` so the ledger
+           books the shortfalls exactly once.
+
+        The gate lifts in a `finally`: whatever a port did, the machine must
+        not stay frozen. A resumed PENDING run (or a deferred cycle popped by
+        a close) is then started in the same call through the ordinary
+        `advance` loop, so the caller's re-arm finds the next boundary. A
+        same-day deferral restored from the journal is NOT popped here — an
+        idle restart commands nothing — it waits for the next completion,
+        like every deferral (delayed, never skipped).
+
+        A nominal restart — no run, nothing to prune, no stale deferral —
+        commands nothing, reports nothing and writes nothing.
+        """
+        async with self._lock:
+            try:
+                today = irrigation_day(now)
+                pruned = prune_history(self._history, today)
+                kept = [
+                    entry
+                    for entry in self._deferred
+                    if irrigation_day(entry[1]) == today
+                ]
+                changed = len(pruned) != len(self._history) or len(kept) != len(
+                    self._deferred
+                )
+                self._history = pruned
+                self._deferred = kept
+                if self._unreadable_run is not None:
+                    await self._discard_unreadable(self._unreadable_run)
+                elif (run := self._run) is not None:
+                    await self._recover(run, now)
+                elif changed:
+                    await self._save()
+            finally:
+                self._reconciled = True
+            await self._advance_locked(now)
+
+    async def _discard_unreadable(self, raw: Mapping[str, object]) -> None:
+        """Make the hardware safe after a run the adapter could not trust.
+
+        The journal said a cycle was in flight but not which valve, so EVERY
+        configured valve is commanded off (plan order), then the pump — the
+        run's own snapshot is exactly what cannot be read. The raw document
+        is consulted for the anomaly's `cycle_id` and `kind` only, and only
+        when they are strings; then the save drops it from the journal.
+        """
+        self._unreadable_run = None
+        cycle_id = raw.get("cycle_id")
+        kind = raw.get("kind")
+        context: dict[str, object] = {
+            "cycle_id": cycle_id if isinstance(cycle_id, str) else None,
+            "kind": kind if isinstance(kind, str) else None,
+        }
+        for spec in self.plan.zones:
+            confirmed, error = await self._command(
+                on=False, entity_id=spec.valve_entity_id
+            )
+            self._outcome(
+                AnomalyKind.VALVE_CLOSE_UNCONFIRMED,
+                {**context, "zone_id": spec.zone_id, "entity_id": spec.valve_entity_id},
+                confirmed=confirmed,
+                error=error,
+            )
+        confirmed, error = await self._command(
+            on=False,
+            entity_id=self.plan.pump_entity_id,
+        )
+        self._outcome(
+            AnomalyKind.PUMP_OFF_UNCONFIRMED,
+            {**context, "entity_id": self.plan.pump_entity_id},
+            confirmed=confirmed,
+            error=error,
+        )
+        # Superseded like any recovery: the interrupted cycle is gone for good.
+        self._clear(AnomalyKind.CYCLE_INTERRUPTED, {"cycle_id": context["cycle_id"]})
+        self._report(
+            AnomalyKind.CYCLE_RECOVERED,
+            {**context, "zone_id": None, "outcome": RecoveryOutcome.DISCARDED.value},
+        )
+        await self._save()
+
+    async def _recover(self, run: CycleRun, now: datetime) -> None:
+        """Orphan pass, pure decision, application — for one restored run.
+
+        The orphan pass records confirmation outcomes through the same
+        `_valve_outcome`/`_pump_outcome` a live cycle uses (an unconfirmed
+        close reports `VALVE_CLOSE_UNCONFIRMED`/`PUMP_OFF_UNCONFIRMED`, a
+        confirmed one clears it) but mutates NO zone field: the live zone may
+        be about to be re-opened, and its `close_confirmed` belongs to the
+        close that ends its slot.
+
+        A CLOSED decision completes the run as INTERRUPTED with
+        `pump_was_on=False` — the orphan pass has just commanded the pump
+        off, and `_complete_cycle` clears `CYCLE_INTERRUPTED`, settles (the
+        ledger refuses an id it already settled, so a replay books nothing
+        twice), files history and pops the deferred queue. A RESUMED decision
+        re-opens the machine: pump on through the shared helper, then either
+        the live zone re-opened on its kept `actual_start` (its window is
+        already what it always was), or the next slot opened through
+        `_open_zone` exactly as a boundary would — and a resume with no slot
+        left completes the run COMPLETED. `CYCLE_INTERRUPTED` is cleared as
+        superseded and `CYCLE_RECOVERED` reported LAST, once the hardware
+        outcome is known, so the one push describes the final state.
+        """
+        self._follow_renames(run)
+        states = await self._read_states(run)
+        for zone in run.zone_runs:
+            if states.get(zone.valve_entity_id) is not False:
+                confirmed, error = await self._command(
+                    on=False,
+                    entity_id=zone.valve_entity_id,
+                )
+                self._valve_outcome(
+                    run,
+                    zone,
+                    confirmed=confirmed,
+                    error=error,
+                    kind=AnomalyKind.VALVE_CLOSE_UNCONFIRMED,
+                )
+        if states.get(run.pump_entity_id) is not False:
+            confirmed, error = await self._command(
+                on=False, entity_id=run.pump_entity_id
+            )
+            self._pump_outcome(
+                run,
+                confirmed=confirmed,
+                error=error,
+                kind=AnomalyKind.PUMP_OFF_UNCONFIRMED,
+            )
+        recovery = plan_recovery(
+            run,
+            now=now,
+            states=states,
+            season_enabled=self._season_enabled,
+        )
+        run.recovery = recovery.outcome.value
+        context: dict[str, object] = {
+            "cycle_id": run.cycle_id,
+            "kind": run.kind.value,
+            "zone_id": recovery.live_zone_id,
+            "outcome": recovery.outcome.value,
+        }
+        if recovery.outcome is RecoveryOutcome.CLOSED:
+            await self._complete_cycle(
+                run,
+                now,
+                pump_was_on=False,
+                status=CycleStatus.INTERRUPTED,
+            )
+            self._report(AnomalyKind.CYCLE_RECOVERED, context)
+            return
+        self._zone_index = recovery.slot
+        self._clear(AnomalyKind.CYCLE_INTERRUPTED, {"cycle_id": run.cycle_id})
+        if run.status is CycleStatus.PENDING:
+            # Re-timed to start at `now`: the `advance` loop that follows
+            # takes the ordinary `_start_cycle` path.
+            await self._save()
+        elif recovery.slot >= len(run.zone_runs):
+            await self._complete_cycle(run, now, pump_was_on=False)
+        else:
+            await self._pump_on(run)
+            await self._save()
+            zone = run.zone_runs[recovery.slot]
+            if zone.status is ZoneRunStatus.RUNNING:
+                await self._reopen_zone(run, zone)
+            else:
+                await self._open_zone(run, zone, now)
+        self._report(AnomalyKind.CYCLE_RECOVERED, context)
+
+    def _follow_renames(self, run: CycleRun) -> None:
+        """Point the journaled run at the entity ids the plan knows NOW.
+
+        The registry tracker (Story 1.7) rewrites a renamed entity into the
+        stored options and subentries and into the running adapter's alias
+        map — the latter dies with the process. A run journaled before a
+        rename and restored after it would read, close and re-open a dead
+        id while the real valve stays on. The plan built at this setup is
+        the current truth for every zone still in it (same `zone_id`) and
+        for the pump; a zone no longer in the plan keeps its journaled id,
+        the only one anybody has. Mutated in place, so the remapped ids are
+        what the journal carries from here on.
+        """
+        current = {spec.zone_id: spec.valve_entity_id for spec in self.plan.zones}
+        for zone in run.zone_runs:
+            zone.valve_entity_id = current.get(zone.zone_id, zone.valve_entity_id)
+        run.pump_entity_id = self.plan.pump_entity_id
+
+    async def _read_states(self, run: CycleRun) -> dict[str, bool | None]:
+        """Read every governed switch of `run`; a port that raises reads as doubtful."""
+        states: dict[str, bool | None] = {}
+        for entity_id in (
+            *(zone.valve_entity_id for zone in run.zone_runs),
+            run.pump_entity_id,
+        ):
+            try:
+                states[entity_id] = await self._switches.async_is_on(entity_id)
+            except Exception:  # noqa: BLE001 — a doubtful read is "not OFF", never a crash
+                states[entity_id] = None
+        return states
+
+    async def _reopen_zone(self, run: CycleRun, zone: ZoneRun) -> None:
+        """Re-open the live zone the orphan pass just closed; `actual_start` kept.
+
+        `_open_zone` would stamp a new `actual_start` and lose the proven
+        watering since the original one — the whole point of the credit rule.
+        The confirmation outcome is recorded exactly as an open's.
+        """
+        confirmed, error = await self._command(on=True, entity_id=zone.valve_entity_id)
+        zone.open_confirmed = confirmed
+        zone.status = ZoneRunStatus.RUNNING if confirmed else ZoneRunStatus.FAILED
+        self._valve_outcome(
+            run,
+            zone,
+            confirmed=confirmed,
+            error=error,
+            kind=AnomalyKind.VALVE_OPEN_UNCONFIRMED,
+        )
+        await self._save()
 
     async def _start_cycle(self, run: CycleRun, now: datetime) -> None:
         """Start the cycle: pump on (FR3), journal, then open the first zone.
@@ -472,19 +782,25 @@ class Sequencer:
             await self._save()
             await self._complete_cycle(run, now, pump_was_on=False)
             return
+        await self._pump_on(run)
+        run.status = CycleStatus.RUNNING
+        await self._save()
+        await self._open_zone(run, run.zone_runs[0], now)
+
+    async def _pump_on(self, run: CycleRun) -> None:
+        """Command the pump on and record the outcome — shared by start and resume.
+
+        Fail-wet (AD-4/FR4): pressure is doubtful, zones still run their
+        slots; aborting would be the one unforgivable branch.
+        """
         confirmed, error = await self._command(on=True, entity_id=run.pump_entity_id)
         run.pump_on_confirmed = confirmed
-        # Fail-wet (AD-4/FR4): pressure is doubtful, zones still run their
-        # slots; aborting would be the one unforgivable branch.
         self._pump_outcome(
             run,
             confirmed=confirmed,
             error=error,
             kind=AnomalyKind.PUMP_ON_UNCONFIRMED,
         )
-        run.status = CycleStatus.RUNNING
-        await self._save()
-        await self._open_zone(run, run.zone_runs[0], now)
 
     async def _open_zone(self, run: CycleRun, zone: ZoneRun, now: datetime) -> None:
         """Open one zone's valve and record the commanded-vs-verified outcome.
@@ -582,9 +898,10 @@ class Sequencer:
         rather than stranding it behind a cycle that never existed.
 
         `status` is the TERMINAL status to file the run under: COMPLETED for
-        the normal path, CANCELLED for `async_cancel_cycle`. Both go through
-        here so the pump-off, the settlement, the history append, the prune
-        and the release have exactly one implementation.
+        the normal path, CANCELLED for `async_cancel_cycle`, INTERRUPTED for
+        a run the startup reconciler could not resume (Story 3.2). All go
+        through here so the pump-off, the settlement, the history append,
+        the prune and the release have exactly one implementation.
 
         The ledger is settled right after the status turns terminal and
         BEFORE the snapshot is saved (Story 2.2): the journal written for this
@@ -597,8 +914,8 @@ class Sequencer:
         below is credited only for rain the gauge has counted since this
         run was quoted — never the same millimetres twice.
 
-        Called from inside the lock by `advance` and directly by
-        `async_cancel_cycle`, which already holds it — this method must NOT
+        Called from inside the lock by `advance`, `async_reconcile` and
+        `async_cancel_cycle`, which already hold it — this method must NOT
         acquire the lock itself.
         """
         if pump_was_on:
@@ -857,6 +1174,26 @@ class Sequencer:
         except Exception as err:  # noqa: BLE001 — see docstring: never abort a cycle
             return False, repr(err)
 
+    def _outcome(
+        self,
+        kind: AnomalyKind,
+        context: dict[str, object],
+        *,
+        confirmed: bool,
+        error: str | None,
+    ) -> None:
+        """Report `kind` when not confirmed, clear it when confirmed — no run needed.
+
+        The discard pass of `async_reconcile` commands switches from the
+        PLAN, not from a run (the run is what could not be read), so it
+        cannot go through `_pump_outcome`/`_valve_outcome`; the rule is the
+        same.
+        """
+        if confirmed:
+            self._clear(kind, context)
+        else:
+            self._report(kind, context, error)
+
     def _pump_outcome(
         self,
         run: CycleRun,
@@ -937,13 +1274,14 @@ class Sequencer:
         debounce/immediacy is the adapter's policy.
 
         The snapshot carries everything needed to rebuild the machine, not
-        just to display it: `zone_index` says which zone is open (a FAILED
-        zone looks identical whether it is the current slot or a finished
-        one), `last_run` keeps the completed cycle that would otherwise be
-        overwritten the moment a deferred cycle is created, and the deferred
-        queue keeps each entry's reference instant. `ledger` is the water
-        debt between cycles (Story 2.2) — seeded back on setup, which is how a
-        deficit survives a restart.
+        just to display it: `last_run` keeps the completed cycle that would
+        otherwise be overwritten the moment a deferred cycle is created, and
+        the deferred queue keeps each entry's reference instant. `ledger` is
+        the water debt between cycles (Story 2.2) — seeded back on setup,
+        which is how a deficit survives a restart. `zone_index` is written
+        for the record but NOT read back (Story 3.2): the reconciler derives
+        the live slot from the zone statuses and instants, which a hand edit
+        cannot desynchronize from the index.
         """
         last_run = self._last_run
         snapshot: dict[str, object] = {
@@ -966,25 +1304,3 @@ class Sequencer:
         else:
             # Storage is back: the write that just landed is the proof.
             self._clear(AnomalyKind.JOURNAL_SAVE_FAILED, {})
-
-
-def _live_zone(run: CycleRun) -> ZoneRun | None:
-    """Return the zone whose slot is currently open, or None.
-
-    Identified by "started but not finished" rather than by status: a FAILED
-    zone is indistinguishable by status from a finished one, and it is still
-    the live slot until its planned end (fail-wet consumes the slot, AD-4).
-
-    Shared by the cancel (which closes and mutates it) and the suspend (which
-    closes and mutates nothing). `entities/sensor.py::_live_zone` encodes the
-    SAME rule for the projection — the engine may not import from
-    `entities/`, so the two must be edited together.
-    """
-    return next(
-        (
-            zone
-            for zone in run.zone_runs
-            if zone.actual_start is not None and zone.actual_end is None
-        ),
-        None,
-    )

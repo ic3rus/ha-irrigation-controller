@@ -81,6 +81,13 @@ def history_entry(
     it would have applied). Epic 3's watchdog reads a waived record as a
     PERMITTED non-watering cause, never as a missed cycle: the water it
     accounts for flowed in the run-now it names.
+
+    `recovery` (Story 3.2) rides along verbatim from the run: `None` for a
+    cycle that was never interrupted, `"resumed"` for one the startup
+    reconciler continued on the same irrigation day, `"closed"` for one it
+    filed `interrupted` — written on EVERY record, so Epic 4's history view
+    can mark a recovered cycle without asking whether the key exists.
+    Records written before 3.2 have no such key and are not backfilled.
     """
     zone_runs = run.zone_runs
     return {
@@ -90,6 +97,7 @@ def history_entry(
         "status": run.status.value,
         MANUAL_KEY: run.manual,
         "waived_by": waived_by,
+        "recovery": run.recovery,
         "configured_start": utc_iso(run.configured_start),
         "scheduled_start": utc_iso(run.scheduled_start),
         "ended_at": utc_iso(ended_at),
@@ -119,9 +127,11 @@ def prune_history(
     dated in the FUTURE are kept — a clock that jumped backwards (a restored
     backup, an NTP correction) must not silently erase real history.
 
-    Every entry is one this module built (the journal is write-only in Story
-    1.5; loading storage back is Story 3.2's, AD-11), so the day field is
-    always the ISO string `history_entry` wrote.
+    Every entry is one this module built or one the journal adapter's seed
+    let through (`_seed_entry` refuses any record whose `irrigation_day` is
+    not an ISO date, AD-11), so the day field is always parseable here.
+    Called on every completion AND once at load (Story 3.2), so entries age
+    out even when no cycle completes for a while.
     """
     horizon = timedelta(days=days)
     return [

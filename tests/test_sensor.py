@@ -189,8 +189,9 @@ async def test_cycle_status_is_an_enum_with_a_coarse_summary(
 
     state = state_of(hass, status)
     assert state.attributes[ATTR_DEVICE_CLASS] == SensorDeviceClass.ENUM
-    # `cancelled` (Story 1.6) and `waived` (Story 2.3) ride in through the
-    # CycleStatus comprehension. No push point can surface either today — the
+    # `cancelled` (Story 1.6), `waived` (Story 2.3) and `interrupted` (Story
+    # 3.2) ride in through the CycleStatus comprehension. No push point can
+    # surface any of them today — the
     # dispatcher fires after `advance` returns, by which point `current_run`
     # is released, and a waived cycle is never `current_run` at all — so what
     # is asserted is that the sensor DECLARES them (HA raises on an unlisted
@@ -204,6 +205,7 @@ async def test_cycle_status_is_an_enum_with_a_coarse_summary(
         "completed",
         "cancelled",
         "waived",
+        "interrupted",
     ]
     assert ATTR_STATE_CLASS not in state.attributes
     assert ATTR_UNIT_OF_MEASUREMENT not in state.attributes
@@ -281,6 +283,42 @@ async def test_zone_sensor_reports_its_effective_seconds_after_the_cycle(
     assert state.attributes[ATTR_DEVICE_CLASS] == SensorDeviceClass.DURATION
     assert state.attributes[ATTR_UNIT_OF_MEASUREMENT] == UnitOfTime.SECONDS
     assert state.attributes[ATTR_STATE_CLASS] == SensorStateClass.MEASUREMENT
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_last_watering_sensor_keeps_its_value_across_a_reload(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    entry: MockConfigEntry,
+) -> None:
+    """Story 3.2: `last_run` is restored from the journal — no `unknown` flap on reload.
+
+    The reload-per-config-change regime rebuilds the entity constantly; a
+    MEASUREMENT sensor resetting to `unknown` each time would pollute its
+    long-term statistics. The figure comes from the restored run, not from
+    `RestoreEntity` (AD-2: the journal is the one authority).
+    """
+    register_switches(hass)
+    zone = zone_of(entry, "Zone A")
+    duration = entity_id_for(
+        hass,
+        f"{entry.entry_id}_{zone.subentry_id}_last_watering_duration",
+    )
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    assert state_of(hass, duration).state == "600"
+
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    state = state_of(hass, duration)
+    assert state.state == "600"
+    assert state.attributes["carried_deficit"] == 0
+    assert state.attributes["pending_deficit"] == 0
+    assert state.attributes["rain_credit"] == 0
+    assert hass.states.is_state(PUMP, STATE_OFF)
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

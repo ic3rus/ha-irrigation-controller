@@ -283,9 +283,12 @@ cycle completes and the reload fires.
 **Forced reloads are different.** Reloading the integration yourself (the
 "Reload" menu entry, `homeassistant.reload_config_entry`), disabling it or
 removing it while a cycle runs does not wait: the open valve is closed, then
-the pump, and a `cycle_interrupted` anomaly is raised. The interrupted cycle
-is not resumed in this version — but the hardware is left safe and you are
-told.
+the pump, and a `cycle_interrupted` anomaly is raised. When the integration
+loads again — at once for a reload, whenever you re-enable it otherwise —
+the cycle is recovered exactly as after a restart (see [Restarts and
+recovery](#restarts-and-recovery)): on the same irrigation day it resumes,
+the interrupted zone being re-run in full since a closed valve cannot prove
+what it watered, and `cycle_interrupted` is superseded by `cycle_recovered`.
 
 ## Entity renames
 
@@ -308,6 +311,55 @@ Two limits:
   when the entity is re-created (enabled) under its stored id or re-enabled,
   and also when you point the role at another entity or delete the zone —
   the reconfiguration supersedes it (see [Anomalies](#anomalies)).
+
+## Restarts and recovery
+
+Every cycle transition is journaled, so a Home Assistant restart (or a crash)
+mid-cycle loses seconds of progress, never minutes. A valve left open by a
+crash stays open until Home Assistant is back: there is no reliable shutdown
+hook, nothing is ever closed from a shutdown handler, and bounded
+over-watering is accepted. Recovery is therefore automatic and runs **once, at
+startup, before any timer is armed** — immediately on a reload, and once Home
+Assistant has fully started on a boot, so the valve and pump switches have had
+time to report a real state.
+
+Recovery reconciles the journaled cycle against the *actual* switch states:
+
+1. **Orphans are closed first.** Every valve of the journaled cycle, then the
+   pump, that is not reported `off` is commanded off through the verified
+   switch path; a switch that is `unknown` or `unavailable` counts as not
+   off. An unconfirmed close raises the usual `valve_close_unconfirmed` /
+   `pump_off_unconfirmed` anomaly.
+2. **Same irrigation day → the cycle resumes**, on the durations it was
+   quoted with: nothing is re-quoted, so a deficit or rain credit that
+   appeared meanwhile applies to the *next* cycle. The zone that was watering
+   is credited only what can be proven — found `on`, it watered continuously
+   since it opened and finishes its remaining time (or is closed at once if
+   that time is up); found `off` or unknown, it is re-run in full, at most one
+   zone's worth of over-watering. The zones after it follow back to back. A
+   cycle that had not started yet starts immediately. The season being off
+   does not stop a cycle in progress from completing; a cycle that had not
+   started under season off is closed instead.
+3. **A later day → the cycle is closed** and recorded as `interrupted`: the
+   zone that was watering is credited its span if its valve was found on and
+   nothing otherwise, the zones never reached are credited nothing, and each
+   shortfall is carried forward as [water debt](#water-debt), capped as usual.
+4. **An unreadable journal** (a restored backup, a hand edit, schema drift)
+   is never trusted: every configured valve and the pump are commanded off,
+   nothing is booked, and the cycle is dropped.
+
+Every recovery raises one `cycle_recovered` anomaly whose `outcome` is
+`resumed`, `closed` or `discarded` — one Repairs issue, one push
+notification, one bus event; a further recovery while that issue is still
+unacknowledged refreshes the issue with the new outcome and fires the event
+again but, like every anomaly, pushes nothing new — and the recovered
+cycle's history record
+carries `recovery: "resumed"` or `"closed"`. A `cycle_interrupted` issue left
+by a forced reload is cleared by the recovery that supersedes it. A nominal
+restart, with no cycle in progress, is silent: no command, no anomaly, no
+notification, no journal write. The last completed cycle survives restarts
+and reloads too, so the per-zone **Last watering duration** sensors keep
+their values.
 
 ## Anomalies
 
@@ -337,13 +389,14 @@ When something does go wrong, each anomaly fans out to four places at once:
 | `valve_close_unconfirmed` | a zone's valve did not report OFF within the timeout | that zone's valve next confirms **closing** |
 | `journal_save_failed` | Home Assistant's storage refused a write of the cycle journal | the next journal write succeeds |
 | `configured_entity_missing` | a configured pump, valve, sensor or notify target was removed from or disabled in the entity registry | the entity is re-created (enabled) under its stored id or re-enabled; or the role is pointed at another entity or the zone deleted |
-| `cycle_interrupted` | a forced reload, a disable or a removal of the integration stopped a running cycle | the next cycle completes or is cancelled |
+| `cycle_interrupted` | a forced reload, a disable or a removal of the integration stopped a running cycle | the cycle is recovered at the next load, or the next cycle completes or is cancelled |
+| `cycle_recovered` | a cycle found in progress in the journal at startup was resumed, closed or discarded (see [Restarts and recovery](#restarts-and-recovery)) | never — acknowledge it |
 
 Issues are **per subject**: an unconfirmed valve is one issue per zone, an
 unconfirmed pump one per pump entity, a missing entity one per zone (for a
 valve) or per role (for the pump, the sensors and the notify target);
-`journal_save_failed` and `cycle_interrupted` are one issue for the whole
-controller.
+`journal_save_failed`, `cycle_interrupted` and `cycle_recovered` are one
+issue for the whole controller.
 
 A confirmation clears only the kind it proves: a confirmed ON clears the
 `*_on` / `*_open` anomaly of that pump or zone, a confirmed OFF the `*_off` /

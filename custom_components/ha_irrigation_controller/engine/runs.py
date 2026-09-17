@@ -8,37 +8,47 @@ running cycle — Story 1.7 relies on exactly this.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
-from .plan import irrigation_day
+from .plan import CycleKind, irrigation_day
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-
-    from .plan import CycleKind
+    from datetime import tzinfo
 
 # The serialized key carrying Story 2.1's manual marker, in BOTH the run
 # snapshot and the history record. Named once so the journal adapter, the
 # history reader and Story 2.3's day credit cannot spell it three ways.
 MANUAL_KEY: Final = "manual"
 
+# The largest seconds value a journaled zone field may carry on read (a week).
+# No real slot comes near it — the ceiling exists so a hand-edited or corrupt
+# `duration_s` cannot overflow the datetime arithmetic the reconciler does
+# with it and raise out of setup; anything above it is refused at the trust
+# boundary like any other drift.
+MAX_JOURNALED_SECONDS: Final = 7 * 86400
+
 
 class CycleStatus(StrEnum):
     """Lifecycle of a cycle run.
 
-    Three TERMINAL statuses: COMPLETED (the cycle ran its course), CANCELLED
+    Four TERMINAL statuses: COMPLETED (the cycle ran its course), CANCELLED
     (Story 1.6's explicit operator cancel, the only thing that stops a running
-    cycle) and WAIVED (Story 2.3: a scheduled cycle the ledger's day credit
+    cycle), WAIVED (Story 2.3: a scheduled cycle the ledger's day credit
     excused because a completed run-now had already watered its irrigation
-    day). WAIVED is terminal AT BIRTH — such a run is built, filed to history
-    and dropped in one step; it is never `current_run`, never `last_run`,
-    never settled and commands nothing. Nothing anywhere assumes "terminal ==
-    completed" — the completion path is shared and takes the terminal status
-    as a parameter, and every reader keys off the value rather than off the
-    absence of a run.
+    day) and INTERRUPTED (Story 3.2: a run found in the journal at startup
+    that could not be resumed — a later irrigation day, or a PENDING run
+    under season OFF — and was closed by the reconciler so its shortfalls
+    reach the ledger). WAIVED is terminal AT BIRTH — such a run is built,
+    filed to history and dropped in one step; it is never `current_run`,
+    never `last_run`, never settled and commands nothing. Nothing anywhere
+    assumes "terminal == completed" — the completion path is shared and
+    takes the terminal status as a parameter, and every reader keys off the
+    value rather than off the absence of a run.
     """
 
     PENDING = "pending"
@@ -46,6 +56,12 @@ class CycleStatus(StrEnum):
     COMPLETED = "completed"
     CANCELLED = "cancelled"
     WAIVED = "waived"
+    INTERRUPTED = "interrupted"
+
+    @property
+    def is_terminal(self) -> bool:
+        """Return whether a run in this status is finished for good."""
+        return self not in (CycleStatus.PENDING, CycleStatus.RUNNING)
 
 
 class ZoneRunStatus(StrEnum):
@@ -80,6 +96,88 @@ def utc_iso(moment: datetime | None) -> str | None:
     (the deferred queue's reference instants) serializes through it too.
     """
     return None if moment is None else moment.astimezone(UTC).isoformat()
+
+
+def _instant(value: object, key: str, tz: tzinfo) -> datetime:
+    """Parse the aware instant `utc_iso` wrote under `key`, into `tz`.
+
+    Half of the `from_dict` trust boundary: anything but an ISO-8601 string
+    carrying an offset is a `ValueError` naming the key, so the journal
+    adapter can log WHAT was wrong. The instant is handed back HA-local: the
+    engine's contract is aware local datetimes, and `irrigation_day` reads
+    the local calendar date — a UTC instant would file a late-evening cycle
+    under the wrong day.
+    """
+    if not isinstance(value, str):
+        msg = f"{key}: expected an ISO-8601 instant, got {type(value).__name__}"
+        raise ValueError(msg)  # noqa: TRY004 — ONE exception type at the trust boundary
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as err:
+        msg = f"{key}: {err}"
+        raise ValueError(msg) from err
+    if parsed.tzinfo is None:
+        msg = f"{key}: naive instant {value!r}"
+        raise ValueError(msg)
+    try:
+        return parsed.astimezone(tz)
+    except OverflowError as err:
+        # An instant at the edge of `datetime`'s range with an offset cannot
+        # be converted: drift, refused like any other rather than raised out
+        # of setup.
+        msg = f"{key}: instant {value!r} out of range"
+        raise ValueError(msg) from err
+
+
+def _optional_instant(value: object, key: str, tz: tzinfo) -> datetime | None:
+    """`_instant`, with `None` passing through (an instant not reached yet)."""
+    return None if value is None else _instant(value, key, tz)
+
+
+def _int(value: object, key: str) -> int:
+    """Return `value` as an `int` in `[0, MAX_JOURNALED_SECONDS]` (never a `bool`)."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= MAX_JOURNALED_SECONDS
+    ):
+        msg = f"{key}: expected an int in [0, {MAX_JOURNALED_SECONDS}], got {value!r}"
+        raise ValueError(msg)
+    return value
+
+
+def _str(value: object, key: str) -> str:
+    """Return `value` as a `str`, or raise."""
+    if not isinstance(value, str):
+        msg = f"{key}: expected a str, got {type(value).__name__}"
+        raise ValueError(msg)  # noqa: TRY004 — ONE exception type at the trust boundary
+    return value
+
+
+def _optional_bool(value: object, key: str) -> bool | None:
+    """Return `value` as a `bool` or `None` (a confirmation outcome), or raise."""
+    if value is not None and not isinstance(value, bool):
+        msg = f"{key}: expected a bool or None, got {value!r}"
+        raise ValueError(msg)
+    return value
+
+
+def _enum[E: StrEnum](cls: type[E], value: object, key: str) -> E:
+    """Return `value` as a member of `cls`, or raise a `ValueError` naming `key`."""
+    text = _str(value, key)
+    try:
+        return cls(text)
+    except ValueError as err:
+        msg = f"{key}: {err}"
+        raise ValueError(msg) from err
+
+
+def _mapping(value: object, key: str) -> Mapping[str, object]:
+    """Return `value` as a mapping, or raise."""
+    if not isinstance(value, dict):
+        msg = f"{key}: expected a mapping, got {type(value).__name__}"
+        raise ValueError(msg)  # noqa: TRY004 — ONE exception type at the trust boundary
+    return value
 
 
 @dataclass(slots=True)
@@ -140,14 +238,51 @@ class ZoneRun:
             "close_confirmed": self.close_confirmed,
         }
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object], *, tz: tzinfo) -> ZoneRun:
+        """Rebuild a zone run from its `as_dict` form; `ValueError` on drift.
+
+        The inverse of `as_dict`, STRICT: every key that method writes with a
+        non-None value must be present with its type — the None-legal keys
+        (`actual_start`, `actual_end`, `open_confirmed`, `close_confirmed`)
+        read as None when absent — or the whole run is refused;
+        Story 3.2's reconciler acts on this snapshot (it re-times windows
+        from `duration_s`, credits watering from `actual_start`), so a
+        field it cannot trust is a run it must not resume. `tz` is the
+        HA-local zone the instants are converted back into (see `_instant`).
+        """
+        return cls(
+            zone_id=_str(data.get("zone_id"), "zone_id"),
+            name=_str(data.get("name"), "name"),
+            valve_entity_id=_str(data.get("valve_entity_id"), "valve_entity_id"),
+            duration_s=_int(data.get("duration_s"), "duration_s"),
+            base_s=_int(data.get("base_s"), "base_s"),
+            carried_s=_int(data.get("carried_s"), "carried_s"),
+            rain_credit_s=_int(data.get("rain_credit_s"), "rain_credit_s"),
+            planned_start=_instant(data.get("planned_start"), "planned_start", tz),
+            planned_end=_instant(data.get("planned_end"), "planned_end", tz),
+            status=_enum(ZoneRunStatus, data.get("status"), "status"),
+            actual_start=_optional_instant(
+                data.get("actual_start"), "actual_start", tz
+            ),
+            actual_end=_optional_instant(data.get("actual_end"), "actual_end", tz),
+            open_confirmed=_optional_bool(data.get("open_confirmed"), "open_confirmed"),
+            close_confirmed=_optional_bool(
+                data.get("close_confirmed"), "close_confirmed"
+            ),
+        )
+
 
 def effective_seconds(zone_run: ZoneRun) -> int:
     """Return the seconds this zone actually watered — THE single helper.
 
     Zero when the open never confirmed (status FAILED: the valve never opened,
-    so nothing was watered) and zero while either instant is still missing.
-    Otherwise the elapsed open-to-close time — an unconfirmed CLOSE still
-    watered its slot (possibly longer, which fail-wet accepts, AD-4).
+    so nothing was watered — and, since Story 3.2, when the reconciler found
+    the zone's valve OFF or unknown at a later-day recovery: its watering
+    cannot be proven, so it reads as none) and zero while either instant is
+    still missing. Otherwise the elapsed open-to-close time — an unconfirmed
+    CLOSE still watered its slot (possibly longer, which fail-wet accepts,
+    AD-4).
 
     Epic 2's deficit input and Story 1.5's per-zone sensor both read THIS
     function: AD-5's "no feature re-implements the math" starts here.
@@ -207,6 +342,13 @@ class CycleRun:
     source when the run settles with a readable total. Snapshotting it here
     is what lets settlement re-bank under the right gauge without a second
     port read, even after a restart or a mid-cycle sensor change.
+
+    `recovery` (Story 3.2) is the reconciler's marker: `None` for a run that
+    was never interrupted, `"resumed"` for one the reconciler continued on
+    the same irrigation day and `"closed"` for one it filed `interrupted`.
+    It rides into the history record so Epic 4 can show that a cycle's
+    figures come from a recovery, and it is optional on read — a journal
+    written before this story has no such key.
     """
 
     cycle_id: str
@@ -221,6 +363,7 @@ class CycleRun:
     manual: bool = False
     rain_total_mm: float | None = None
     rain_source: str | None = None
+    recovery: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         """Return a plain serializable snapshot of this cycle run."""
@@ -236,8 +379,108 @@ class CycleRun:
             MANUAL_KEY: self.manual,
             "rain_total_mm": self.rain_total_mm,
             "rain_source": self.rain_source,
+            "recovery": self.recovery,
             "zones": [zone.as_dict() for zone in self.zone_runs],
         }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object], *, tz: tzinfo) -> CycleRun:
+        """Rebuild a cycle run from its `as_dict` form; `ValueError` on drift.
+
+        THE trust boundary of Story 3.2's journal read (AD-11): the inverse
+        of `as_dict`, strict about every key that method writes with a
+        non-None value — a missing key, a wrong type, an unparsable instant
+        or an unknown status value all raise a `ValueError` naming the
+        offending key (the None-legal keys `pump_on_confirmed`,
+        `pump_off_confirmed`, `rain_total_mm`, `rain_source` read as None
+        when absent), and the adapter
+        then refuses the whole run (the reconciler closes every configured
+        switch and books nothing rather than act on a snapshot it cannot
+        trust). Two deliberate exceptions: `manual` reads through `is_manual`
+        (only a real `True` is manual — the one home of that rule) and
+        `recovery` is optional (absent in every journal written before this
+        story). `zone_index` is NOT part of the run and is never read: the
+        live slot is derived from the zone statuses. `tz` is the HA-local
+        zone every instant is converted back into.
+        """
+        zones = data.get("zones")
+        if not isinstance(zones, list):
+            msg = f"zones: expected a list, got {type(zones).__name__}"
+            raise ValueError(msg)  # noqa: TRY004 — ONE exception type at the trust boundary
+        total = data.get("rain_total_mm")
+        if total is not None and (
+            isinstance(total, bool)
+            or not isinstance(total, int | float)
+            or not math.isfinite(total)
+        ):
+            msg = f"rain_total_mm: expected a finite number or None, got {total!r}"
+            raise ValueError(msg)
+        source = data.get("rain_source")
+        if source is not None and not isinstance(source, str):
+            msg = f"rain_source: expected a str or None, got {source!r}"
+            raise ValueError(msg)
+        recovery = data.get("recovery")
+        if recovery is not None and not isinstance(recovery, str):
+            msg = f"recovery: expected a str or None, got {recovery!r}"
+            raise ValueError(msg)
+        return cls(
+            cycle_id=_str(data.get("cycle_id"), "cycle_id"),
+            kind=_enum(CycleKind, data.get("kind"), "kind"),
+            configured_start=_instant(
+                data.get("configured_start"), "configured_start", tz
+            ),
+            scheduled_start=_instant(
+                data.get("scheduled_start"), "scheduled_start", tz
+            ),
+            pump_entity_id=_str(data.get("pump_entity_id"), "pump_entity_id"),
+            zone_runs=tuple(
+                _zone_run(zone, index, tz) for index, zone in enumerate(zones)
+            ),
+            status=_enum(CycleStatus, data.get("status"), "status"),
+            pump_on_confirmed=_optional_bool(
+                data.get("pump_on_confirmed"), "pump_on_confirmed"
+            ),
+            pump_off_confirmed=_optional_bool(
+                data.get("pump_off_confirmed"), "pump_off_confirmed"
+            ),
+            manual=is_manual(data),
+            rain_total_mm=None if total is None else float(total),
+            rain_source=source,
+            recovery=recovery,
+        )
+
+
+def _zone_run(zone: object, index: int, tz: tzinfo) -> ZoneRun:
+    """Rebuild `zones[index]`, prefixing a refusal inside it with its path."""
+    path = f"zones[{index}]"
+    try:
+        return ZoneRun.from_dict(_mapping(zone, path), tz=tz)
+    except ValueError as err:
+        msg = str(err) if str(err).startswith(path) else f"{path}.{err}"
+        raise ValueError(msg) from err
+
+
+def live_zone(run: CycleRun) -> ZoneRun | None:
+    """Return the zone whose slot is currently open, or None.
+
+    Identified by "started but not finished" rather than by status: a FAILED
+    zone is indistinguishable by status from a finished one, and it is still
+    the live slot until its planned end (fail-wet consumes the slot, AD-4).
+
+    Shared by the cancel (which closes and mutates it), the suspend (which
+    closes and mutates nothing) and Story 3.2's reconciler (which decides
+    what the crash left open). `entities/sensor.py::_live_zone` encodes the
+    SAME rule for the projection — the engine may not import from
+    `entities/`, so the two must be edited together.
+    """
+    return next(
+        (
+            zone
+            for zone in run.zone_runs
+            if zone.actual_start is not None and zone.actual_end is None
+        ),
+        None,
+    )
 
 
 def is_manual(record: Mapping[str, object]) -> bool:

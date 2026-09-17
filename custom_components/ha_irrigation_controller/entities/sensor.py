@@ -95,9 +95,11 @@ class CycleStatusSensor(HaIrrigationControllerEntity, SensorEntity):
         # already released `current_run` (so a finished cycle reads `idle`).
         # Declaring the full CycleStatus keeps the sensor safe for Epic 3's
         # mid-advance pushes instead of making them a breaking change.
-        # CANCELLED (Story 1.6) and WAIVED (Story 2.3) join CycleStatus and
-        # land here for free — WAIVED can never be the state either, since a
-        # waived cycle is never `current_run`, but it needs its translation.
+        # CANCELLED (Story 1.6), WAIVED (Story 2.3) and INTERRUPTED (Story
+        # 3.2) join CycleStatus and land here for free — none of the three
+        # can be the state either (a waived cycle is never `current_run`, a
+        # cancelled or interrupted one is released before the push), but each
+        # needs its translation.
         self._attr_options = [STATE_IDLE, *(status.value for status in CycleStatus)]
 
     @property
@@ -189,16 +191,22 @@ class ZoneLastWateringSensor(HaIrrigationZoneEntity, SensorEntity):
         it is fresher than `last_run`, and the operator watching a cycle
         should see the zone that just finished, not yesterday's figure.
 
-        Two cases where a zone with no `actual_end` is still an ANSWER rather
-        than missing data — both water zero seconds, which is what the README
-        documents and what `effective_seconds` returns for them, and either
-        would otherwise flap a MEASUREMENT sensor to `unknown` and pollute
-        its long-term statistics:
+        Three cases where a zone with no `actual_end` is still an ANSWER
+        rather than missing data — all water zero seconds, which is what the
+        README documents and what `effective_seconds` returns for them, and
+        any would otherwise flap a MEASUREMENT sensor to `unknown` and
+        pollute its long-term statistics:
 
         - a CANCELLED run: the cancel stopped the cycle before that zone's
           slot;
+        - an INTERRUPTED run (Story 3.2): the startup reconciler closed the
+          cycle before that zone's slot — its shortfall is in
+          `pending_deficit`;
         - a SKIPPED zone (Story 2.4): rain covered its whole base, so the
           slot was never commanded — the `rain_credit` attribute says why.
+
+        `last_run` survives a reload since Story 3.2 (the journal restores
+        it), so a reload no longer resets this sensor to `unknown`.
         """
         for run in (self._sequencer.current_run, self._sequencer.last_run):
             if run is None:
@@ -206,7 +214,7 @@ class ZoneLastWateringSensor(HaIrrigationZoneEntity, SensorEntity):
             zone = _zone_run(run, self._zone_id)
             if zone is not None and (
                 zone.actual_end is not None
-                or run.status is CycleStatus.CANCELLED
+                or run.status in (CycleStatus.CANCELLED, CycleStatus.INTERRUPTED)
                 or zone.status is ZoneRunStatus.SKIPPED
             ):
                 return zone
@@ -225,11 +233,10 @@ def _live_zone(run: CycleRun) -> ZoneRun | None:
     zone is indistinguishable by status from a finished one, and it is still
     the live slot until its planned end (fail-wet consumes the slot, AD-4).
 
-    The SAME rule is encoded in `engine/sequencer.py::_live_zone`, which is
-    what a cancel and a suspend close. The duplication is deliberate (the
-    engine may not import from `entities/`), so the two must be edited
-    together — promoting it to a shared `engine/runs.py` helper is the clean
-    follow-up.
+    The SAME rule is encoded in `engine/runs.py::live_zone`, which is what
+    a cancel, a suspend and the startup reconciler act on. The duplication
+    is deliberate (the entity layer keeps its own reading of the engine's
+    types), so the two must be edited together.
     """
     return next(
         (

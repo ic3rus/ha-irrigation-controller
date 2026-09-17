@@ -128,6 +128,9 @@ def test_history_entry_is_a_compact_serializable_outcome() -> None:
         # Story 2.3: the id of the run-now that excused a waived cycle — on
         # every record, None for one that ran, so Epic 4 reads one shape.
         "waived_by": None,
+        # Story 3.2's recovery marker, written on every record too: None for
+        # a cycle that was never interrupted.
+        "recovery": None,
         "configured_start": "2026-07-31T05:00:00+00:00",
         "scheduled_start": "2026-07-31T05:00:00+00:00",
         "ended_at": "2026-07-31T05:26:00+00:00",

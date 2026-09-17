@@ -199,6 +199,7 @@ async def test_the_waived_record_is_the_snapshot_a_real_run_would_have_had() -> 
         "status": "waived",
         "manual": False,
         "waived_by": "2026-07-31-morning",
+        "recovery": None,
         "configured_start": "2026-07-31T05:00:00+00:00",
         "scheduled_start": "2026-07-31T05:00:00+00:00",
         "ended_at": "2026-07-31T05:00:00+00:00",
