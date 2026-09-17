@@ -140,6 +140,22 @@ class AnomalyKind(StrEnum):
       every configured switch was commanded off and nothing was booked).
       Controller-level, like CYCLE_INTERRUPTED, and NEVER cleared by the
       engine: a recovery is news the operator acknowledges.
+    - MISSED_CYCLE (Story 3.3) — a scheduled cycle whose window closed with
+      no record of it at all: Home Assistant was down over the window, the
+      daily tracker never fired (a start inside the spring-forward gap), or
+      the dispatch itself raised. The watchdog files the cycle to history as
+      `missed` and, unless a later cycle of the same irrigation day has
+      already run, re-dispatches it at once as a late re-run — at most one
+      per missed cycle, ever. Context: `cycle_id`, `kind` and `outcome`:
+      `rerun` (the cycle is watering now, on freshly quoted durations) or
+      `recorded` (no re-run; each zone's shortfall was booked to the ledger,
+      capped at one base duration). Controller-level, like CYCLE_RECOVERED,
+      and NEVER cleared by the engine: a missed cycle is news the operator
+      acknowledges. A PERMITTED non-watering cause is never reported here —
+      the season being off, a disabled morning cycle, a plan with no zones,
+      a cycle already in history in any status (completed, waived, cancelled
+      or interrupted), a live or deferred run for that day and kind, and an
+      unconsumed day credit are all silent.
     """
 
     PUMP_ON_UNCONFIRMED = "pump_on_unconfirmed"
@@ -150,6 +166,7 @@ class AnomalyKind(StrEnum):
     CONFIGURED_ENTITY_MISSING = "configured_entity_missing"
     CYCLE_INTERRUPTED = "cycle_interrupted"
     CYCLE_RECOVERED = "cycle_recovered"
+    MISSED_CYCLE = "missed_cycle"
 
 
 class AnomalyPort(Protocol):

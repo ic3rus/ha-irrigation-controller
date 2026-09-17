@@ -1,8 +1,10 @@
 """Sequencer state machine on a virtual clock (AC 2, 3, 4, 5).
 
 Every test drives the engine exactly the way Story 1.5's adapter will:
-`while (t := engine.next_wakeup()) is not None: clock.advance_to(t);
-await engine.advance(clock.now())` — no sleeps, no wall clock, no HA.
+`while engine.current_run is not None: t = engine.next_wakeup(clock.now());
+clock.advance_to(t); await engine.advance(clock.now())` — no sleeps, no wall
+clock, no HA. Since Story 3.3 an idle engine still names a wake-up, the
+watchdog's next cycle-window end, so the loop watches the run rather than it.
 """
 
 from __future__ import annotations
@@ -69,8 +71,17 @@ def make_sequencer(
 
 
 async def run_to_idle(sequencer: Sequencer, clock: VirtualClock) -> None:
-    """Drive the engine with the exact wake-up loop the 1.5 adapter will use."""
-    while (moment := sequencer.next_wakeup()) is not None:
+    """Drive the ACTIVE cycle with the exact wake-up loop the runner uses.
+
+    Stops the moment the machine goes idle. Since Story 3.3 `next_wakeup`
+    answers the watchdog's next window-end deadline while idle — the runner's
+    loop is the same one and simply never stops — so a test loop that only
+    watched it would walk the calendar for ever.
+    """
+    while sequencer.current_run is not None:
+        moment = sequencer.next_wakeup(clock.now())
+        if moment is None:
+            break
         clock.advance_to(moment)
         await sequencer.advance(clock.now())
 
@@ -94,7 +105,9 @@ async def test_full_cycle_command_ordering() -> None:
         ("off", PUMP),
     ]
     assert anomalies.reports == []
-    assert sequencer.next_wakeup() is None
+    # Idle again: what remains is the watchdog's deadline on the evening
+    # window end (Story 3.3), never a boundary of the finished cycle.
+    assert sequencer.next_wakeup(clock.now()) == aware(20, 45)
 
 
 async def test_close_is_always_commanded_before_the_next_open() -> None:
@@ -151,16 +164,21 @@ async def test_completed_run_statuses_and_timestamps() -> None:
 
 
 async def test_next_wakeup_contract() -> None:
-    """Idle → None; pending → scheduled start; running → next zone boundary."""
+    """Idle → watchdog deadline; pending → scheduled start; running → boundary.
+
+    The idle answer is Story 3.3's: the earliest cycle-window end strictly
+    after `now` — here the morning's own 07:30, since the clock sits at 07:00
+    before anything is requested. A run always wins over it.
+    """
     sequencer, _, _, _ = make_sequencer(three_zone_plan())
     clock = VirtualClock(aware(7))
-    assert sequencer.next_wakeup() is None
+    assert sequencer.next_wakeup(clock.now()) == aware(7, 30)
 
     await sequencer.request_cycle(CycleKind.MORNING, clock.now())
-    assert sequencer.next_wakeup() == aware(7)
+    assert sequencer.next_wakeup(clock.now()) == aware(7)
 
     await sequencer.advance(clock.now())
-    assert sequencer.next_wakeup() == aware(7, 10)
+    assert sequencer.next_wakeup(clock.now()) == aware(7, 10)
 
 
 async def test_advance_is_idempotent_for_a_given_now() -> None:
@@ -193,7 +211,7 @@ async def test_advance_before_the_scheduled_start_is_a_noop() -> None:
     run = sequencer.current_run
     assert run is not None
     assert run.status is CycleStatus.PENDING
-    assert sequencer.next_wakeup() == aware(7)
+    assert sequencer.next_wakeup(aware(6, 59)) == aware(7)
 
 
 async def test_advance_mid_zone_is_a_noop() -> None:
@@ -208,7 +226,7 @@ async def test_advance_mid_zone_is_a_noop() -> None:
 
     await sequencer.advance(clock.now())
     assert switches.commands == commands
-    assert sequencer.next_wakeup() == aware(7, 10)
+    assert sequencer.next_wakeup(clock.now()) == aware(7, 10)
 
 
 async def test_one_late_advance_performs_every_due_transition() -> None:
@@ -232,7 +250,9 @@ async def test_one_late_advance_performs_every_due_transition() -> None:
     run = sequencer.last_run
     assert run is not None
     assert run.status is CycleStatus.COMPLETED
-    assert sequencer.next_wakeup() is None
+    # Idle: only the watchdog's evening deadline remains — and the COMPLETED
+    # record is what keeps the drained morning from reading as a miss.
+    assert sequencer.next_wakeup(aware(9)) == aware(20, 45)
     # The limitation itself: zero elapsed watering, recorded as success.
     for zone in run.zone_runs:
         assert zone.status is ZoneRunStatus.COMPLETED
@@ -453,7 +473,9 @@ async def test_cycle_requested_while_pending_is_deferred() -> None:
     run = sequencer.last_run
     assert run is not None
     assert run.kind is CycleKind.EVENING
-    assert sequencer.next_wakeup() is None
+    # Both cycles are in history, so the watchdog finds no miss; what is left
+    # armed is its deadline on this evening's own window end.
+    assert sequencer.next_wakeup(clock.now()) == aware(20, 10)
 
 
 async def test_empty_plan_cycle_completes_without_commands() -> None:
@@ -469,7 +491,9 @@ async def test_empty_plan_cycle_completes_without_commands() -> None:
     run = sequencer.last_run
     assert run is not None
     assert run.status is CycleStatus.COMPLETED
-    assert sequencer.next_wakeup() is None
+    # A zoneless plan has no cycle to miss, so the watchdog names no
+    # deadline: nothing at all is left armed.
+    assert sequencer.next_wakeup(clock.now()) is None
 
 
 async def test_snapshot_survives_zone_spec_replacement() -> None:
@@ -485,7 +509,7 @@ async def test_snapshot_survives_zone_spec_replacement() -> None:
     run = sequencer.current_run
     assert run is not None
     assert run.zone_runs[0].duration_s == 600
-    assert sequencer.next_wakeup() == aware(7)
+    assert sequencer.next_wakeup(clock.now()) == aware(7)
 
 
 async def test_run_is_anchored_on_the_plans_configured_start() -> None:
@@ -518,7 +542,7 @@ async def test_next_wakeup_is_safe_at_every_instant_the_engine_yields() -> None:
     sequencer, _, journal, _ = make_sequencer(three_zone_plan())
     clock = VirtualClock(aware(7))
     seen: list[object] = []
-    journal.observer = lambda: seen.append(sequencer.next_wakeup())
+    journal.observer = lambda: seen.append(sequencer.next_wakeup(clock.now()))
 
     await sequencer.request_cycle(CycleKind.MORNING, clock.now())
     await run_to_idle(sequencer, clock)
@@ -531,7 +555,7 @@ async def test_next_wakeup_is_safe_for_a_running_empty_cycle() -> None:
     """A zero-zone run reaches RUNNING with no zone to point at."""
     sequencer, _, journal, _ = make_sequencer(make_plan())
     seen: list[object] = []
-    journal.observer = lambda: seen.append(sequencer.next_wakeup())
+    journal.observer = lambda: seen.append(sequencer.next_wakeup(aware(7)))
 
     await sequencer.request_cycle(CycleKind.MORNING, aware(7))
     await sequencer.advance(aware(7))
@@ -552,7 +576,7 @@ async def test_concurrent_advance_calls_do_not_interleave() -> None:
     await asyncio.gather(sequencer.advance(aware(7)), sequencer.advance(aware(7)))
 
     assert switches.commands == [("on", PUMP), ("on", VALVE_1)]
-    assert sequencer.next_wakeup() == aware(7, 10)
+    assert sequencer.next_wakeup(aware(7)) == aware(7, 10)
 
 
 async def test_a_switch_port_that_raises_is_treated_as_unconfirmed() -> None:
@@ -615,7 +639,9 @@ async def test_repeated_requests_get_distinct_cycle_ids() -> None:
     assert sequencer.deferred_kinds == (CycleKind.MORNING, CycleKind.MORNING)
 
     ids: list[str] = []
-    while (moment := sequencer.next_wakeup()) is not None:
+    while sequencer.current_run is not None:
+        moment = sequencer.next_wakeup(clock.now())
+        assert moment is not None
         clock.advance_to(moment)
         await sequencer.advance(clock.now())
         run = sequencer.last_run
@@ -635,11 +661,17 @@ async def test_a_cycle_deferred_across_midnight_keeps_its_irrigation_day() -> No
     `irrigation_day` is THE helper FR12's waiver, FR18's resume and FR21's
     re-run window all key off; a deferred evening cycle that happens to start
     after midnight still belongs to the day it was scheduled for.
+
+    Both starts sit just before midnight on purpose: with a 20:00 evening the
+    watchdog would (rightly) read the untouched 23:55 machine as having
+    missed that evening and file a `missed` record for the day, which is a
+    different story's subject and would take the bare cycle id from the run
+    this one is about.
     """
     plan = make_plan(
         make_zone("zone-1", valve=VALVE_1, morning_s=600, evening_s=600),
         morning_start=time(23, 55),
-        evening_start=time(20, 0),
+        evening_start=time(23, 58),
     )
     sequencer, _, _, _ = make_sequencer(plan)
     clock = VirtualClock(aware(23, 55))
@@ -655,7 +687,7 @@ async def test_a_cycle_deferred_across_midnight_keeps_its_irrigation_day() -> No
     assert run.kind is CycleKind.EVENING
     # Dispatched after midnight, still filed under the day it was requested for.
     assert run.scheduled_start == aware(0, 5, day=1, month=8)
-    assert run.configured_start == aware(20)
+    assert run.configured_start == aware(23, 58)
     assert run.cycle_id == "2026-07-31-evening"
 
 

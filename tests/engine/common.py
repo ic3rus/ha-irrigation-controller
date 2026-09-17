@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 from datetime import datetime, time, timedelta, timezone
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 from custom_components.ha_irrigation_controller.engine.plan import (
     ControllerPlan,
@@ -36,6 +37,25 @@ def aware(
 ) -> datetime:
     """Return an aware HA-local datetime on 2026-`month`-`day`."""
     return datetime(2026, month, day, hour, minute, second, tzinfo=TZ)
+
+
+# A real DST-observing zone, for the cases a fixed offset cannot express:
+# Story 3.3's watchdog deadline has to survive both transitions, and
+# `derive_schedule` attaches the configured start to whatever tzinfo it is
+# handed — so only a `ZoneInfo` exercises the 23- and 25-hour days.
+PARIS = ZoneInfo("Europe/Paris")
+
+
+def paris(  # noqa: PLR0913 — a datetime constructor; one keyword per field is the readable shape
+    year: int,
+    month: int,
+    day: int,
+    hour: int,
+    minute: int = 0,
+    second: int = 0,
+) -> datetime:
+    """Return an aware Europe/Paris datetime (the DST-observing test clock)."""
+    return datetime(year, month, day, hour, minute, second, tzinfo=PARIS)
 
 
 class VirtualClock:

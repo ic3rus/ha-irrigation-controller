@@ -361,6 +361,69 @@ notification, no journal write. The last completed cycle survives restarts
 and reloads too, so the per-zone **Last watering duration** sensors keep
 their values.
 
+## Missed cycles and late re-runs
+
+A scheduled cycle can fail to run without anything going wrong at the valve:
+Home Assistant is down across the window, or the start falls inside the hour
+the clocks skip forward on the spring daylight-saving change (02:30 simply does
+not happen that day). Before, that left no trace at all — no run, no history
+entry, no notification.
+
+The **missed-cycle watchdog** closes that hole. It compares what the plan
+*expected* of today against what the journal actually records, and it looks at
+two moments: **at startup**, and **at the end of each cycle's watering
+window**. Both are served by the same single timer everything else uses.
+
+A cycle whose window has closed with nothing to show for it is:
+
+1. recorded in history as **`missed`** — that record is also the promise that
+   it happens **at most once**: the same cycle is never detected, notified or
+   re-run a second time, on this day, after a reload or after a restart;
+2. reported as one `missed_cycle` anomaly — one Repairs issue, one push
+   notification, one bus event; a further miss while that issue is still
+   unacknowledged refreshes the issue with the new cycle and fires the event
+   again but, like every anomaly, pushes nothing new;
+3. **watered immediately**, on the same irrigation day, with durations
+   calculated fresh (carried [water debt](#water-debt) and rain reduction both
+   apply). One late re-run per missed cycle, ever — never a backlog.
+
+The exception is a miss noticed **after the day's later cycle has already
+run**. Watering on top of it would be the runaway compensation the controller
+is built to avoid, so the cycle is recorded instead, and its missed watering is
+carried forward as water debt — capped, as always, at one base duration per
+zone. The same applies when the day's morning *and* evening were both missed:
+only the evening is watered, and the morning is booked. If a cycle happens to
+be watering at the moment the miss is noticed, the record is still filed but
+nothing is booked: that cycle's own accounting replaces the ledger when it
+finishes, so the debt would be discarded rather than carried.
+
+The lookback is **today only**. If Home Assistant was down for three days, the
+day it comes back is made up; the days it slept through simply have no entry
+in the 7-day history.
+
+Nothing that is a legitimate reason not to water is ever flagged, and nothing
+of that kind is ever re-run:
+
+- the **season is off**, or the **morning cycle is disabled** in the controller
+  options;
+- the cycle is **already in history** in any state — completed, rain-skipped,
+  [waived](#ha_irrigation_controllerrun_now), cancelled, or recovered after an
+  interruption;
+- the cycle is **running or waiting** (deferred behind another cycle): it is
+  late, not lost;
+- a completed **run now** has already credited the irrigation day.
+
+A nominal day is therefore completely silent: both window ends come and go
+with no record, no notification and not even a journal write.
+
+One consequence worth knowing: the watchdog can only read the journal, so a
+controller configured for the first time *after* a window has passed looks
+exactly like one that slept through it — it will water that cycle once,
+straight away. Turning the season back on part-way through a day has the same
+effect on the cycles that day has already passed, but not immediately: nothing
+is checked at the moment you flip the switch, only at the next window end. Turn
+the season on after the day's last window and nothing is made up at all.
+
 ## Anomalies
 
 Everything that goes wrong reaches you through **one pipeline**, and nominal
@@ -391,12 +454,13 @@ When something does go wrong, each anomaly fans out to four places at once:
 | `configured_entity_missing` | a configured pump, valve, sensor or notify target was removed from or disabled in the entity registry | the entity is re-created (enabled) under its stored id or re-enabled; or the role is pointed at another entity or the zone deleted |
 | `cycle_interrupted` | a forced reload, a disable or a removal of the integration stopped a running cycle | the cycle is recovered at the next load, or the next cycle completes or is cancelled |
 | `cycle_recovered` | a cycle found in progress in the journal at startup was resumed, closed or discarded (see [Restarts and recovery](#restarts-and-recovery)) | never — acknowledge it |
+| `missed_cycle` | a scheduled cycle's watering window closed with no record of it — it was re-run at once, or recorded and its watering carried forward as debt (see [Missed cycles and late re-runs](#missed-cycles-and-late-re-runs)) | never — acknowledge it |
 
 Issues are **per subject**: an unconfirmed valve is one issue per zone, an
 unconfirmed pump one per pump entity, a missing entity one per zone (for a
 valve) or per role (for the pump, the sensors and the notify target);
-`journal_save_failed`, `cycle_interrupted` and `cycle_recovered` are one
-issue for the whole controller.
+`journal_save_failed`, `cycle_interrupted`, `cycle_recovered` and
+`missed_cycle` are one issue for the whole controller.
 
 A confirmation clears only the kind it proves: a confirmed ON clears the
 `*_on` / `*_open` anomaly of that pump or zone, a confirmed OFF the `*_off` /

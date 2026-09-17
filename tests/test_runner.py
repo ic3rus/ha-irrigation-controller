@@ -3,7 +3,7 @@
 The runner is the same loop `tests/engine/` drives on a virtual clock, with
 `async_track_point_in_time` in place of `VirtualClock.advance_to`:
 
-    arm ONE timer at sequencer.next_wakeup()
+    arm ONE timer at sequencer.next_wakeup(dt_util.now())
       → on fire: await sequencer.advance(dt_util.now())
       → re-arm
 """
@@ -23,6 +23,7 @@ from homeassistant.const import (
     STATE_ON,
 )
 from homeassistant.core import CoreState
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.event import (
     async_track_point_in_time,
@@ -72,6 +73,7 @@ from tests.common import (
     VALVE_2,
     crashed_during_zone_a,
     fire_at,
+    history_record,
     register_switch_domain,
     zone_subentry_data,
 )
@@ -114,15 +116,34 @@ def make_plan(*, morning_enabled: bool = True) -> ControllerPlan:
     )
 
 
+def missed_issue(hass: HomeAssistant) -> ir.IssueEntry | None:
+    """Return the controller-level `missed_cycle` Repairs issue, if one is open."""
+    return ir.async_get(hass).async_get_issue(DOMAIN, "missed_cycle")
+
+
+def day_done(day: str) -> list[dict[str, object]]:
+    """Return the history a fully-watered `day` leaves behind (both cycles).
+
+    Story 3.3's watchdog reads an empty history as "this day's windows closed
+    with nothing to show for them" and rightly makes the cycles up. A test
+    whose clock starts AFTER a window end therefore seeds the day as done
+    unless the miss is what it is about.
+    """
+    return [history_record(kind, day=day) for kind in ("morning", "evening")]
+
+
 def make_runner(
     hass: HomeAssistant,
     plan: ControllerPlan,
     *,
     rain: RainSensorAdapter | None = None,
+    history: list[dict[str, object]] | None = None,
 ) -> tuple[CycleRunner, Sequencer]:
     """Wire a runner over the real adapters, exactly as `async_setup_entry` does.
 
     `rain` is the gauge adapter (Story 2.4); None is an entry with no gauge.
+    `history` is the journal's 7-day section (Story 3.3: what the watchdog
+    reads to tell a missed cycle from a performed one).
     """
     entry = MockConfigEntry(domain="ha_irrigation_controller")
     clock = HaClock()
@@ -138,6 +159,7 @@ def make_runner(
         journal=JournalAdapter(hass),
         anomalies=AnomalyManager(hass, entry),
         rain=rain,
+        history=history,
     )
     return CycleRunner(hass, entry, sequencer=sequencer, clock=clock), sequencer
 
@@ -339,11 +361,14 @@ async def test_at_most_one_point_in_time_registration_at_any_instant(
     assert peak == 1
     await fire_at(hass, freezer, "2026-07-31 07:20:00+02:00")
 
-    # The completed cycle leaves nothing armed: next_wakeup() is None.
+    # The completed cycle leaves no BOUNDARY armed — what the one live handle
+    # now holds is Story 3.3's watchdog deadline on the evening window end,
+    # which is exactly the point of AD-3: two intents, one registration.
     assert peak == 1
-    assert live == 0
+    assert live == 1
 
     runner.async_shutdown()
+    assert live == 0
 
 
 async def test_daily_start_holds_its_wall_clock_time_across_a_dst_change(
@@ -359,7 +384,9 @@ async def test_daily_start_holds_its_wall_clock_time_across_a_dst_change(
     """
     calls = register_switch_domain(hass)
     freezer.move_to("2027-03-27 20:30:00+01:00")
-    runner, sequencer = make_runner(hass, make_plan())
+    # The 27th is already watered, so the watchdog has nothing to make up for
+    # and the only commands below are the 28th's own daily start (Story 3.3).
+    runner, sequencer = make_runner(hass, make_plan(), history=day_done("2027-03-27"))
     await runner.async_start()
 
     await fire_at(hass, freezer, "2027-03-28 07:00:00+02:00")
@@ -487,7 +514,7 @@ async def test_shutdown_during_an_in_flight_advance_arms_nothing(
     run = sequencer.current_run
     assert run is not None
     assert run.status is CycleStatus.RUNNING
-    assert sequencer.next_wakeup() is not None
+    assert sequencer.next_wakeup(dt_util.now()) is not None
     commanded = len(calls)
 
     await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
@@ -524,32 +551,42 @@ async def test_a_wakeup_already_in_the_past_still_converges(
         "turn_off",
     ]
     assert sequencer.current_run is None
-    assert sequencer.next_wakeup() is None
+    # Re-armed to the watchdog's next window end, never to a past boundary.
+    assert sequencer.next_wakeup(dt_util.now()) == dt_util.parse_datetime(
+        "2026-07-31 20:20:00+02:00"
+    )
 
     runner.async_shutdown()
 
 
-async def test_the_runner_arms_nothing_while_idle(
+async def test_the_runner_arms_the_watchdog_deadline_while_idle(
     hass: HomeAssistant,
     freezer: FrozenDateTimeFactory,
     paris: None,
 ) -> None:
-    """Starting an idle runner arms the daily starts only (no point-in-time)."""
+    """An idle runner arms the daily starts and the ONE watchdog deadline.
+
+    Before Story 3.3 an idle engine named no time intent at all; now it names
+    the next cycle-window end, still through the single point-in-time
+    registration. Nothing is COMMANDED while idle, which is what this checks:
+    the handle exists, it is 20 minutes away, and a tick 30 s later serves it
+    no more than it serves a zone boundary that has not arrived.
+    """
     calls = register_switch_domain(hass)
     freezer.move_to("2026-07-31 06:59:00+02:00")
     runner, sequencer = make_runner(hass, make_plan())
 
     await runner.async_start()
 
-    # A point-in-time handle exists only when a cycle has a pending boundary;
-    # firing 30 s later must therefore command nothing.
     freezer.tick(timedelta(seconds=30))
     async_fire_time_changed(hass)
     await hass.async_block_till_done()
 
     assert calls == []
     assert sequencer.current_run is None
-    assert sequencer.next_wakeup() is None
+    assert sequencer.next_wakeup(dt_util.now()) == dt_util.parse_datetime(
+        "2026-07-31 07:20:00+02:00"
+    )
 
     runner.async_shutdown()
 
@@ -744,7 +781,12 @@ async def test_season_off_makes_a_daily_start_arm_nothing_at_all(
 
     calls = register_switch_domain(hass)
     freezer.move_to("2026-07-31 06:59:00+02:00")
-    runner, sequencer = make_runner(hass, make_plan())
+    # The morning is seeded as already watered: the watchdog would otherwise
+    # (rightly) make it up the moment the season comes back on, and what this
+    # test is about is the daily START being gated, not the make-up.
+    runner, sequencer = make_runner(
+        hass, make_plan(), history=[history_record("morning")]
+    )
     await runner.async_start()
     await runner.async_set_season(enabled=False)
 
@@ -752,8 +794,10 @@ async def test_season_off_makes_a_daily_start_arm_nothing_at_all(
 
     assert sequencer.current_run is None
     assert calls == []
+    # Nothing armed at all: the season gate refuses the run, and the watchdog
+    # names no deadline while it could only ever find nothing (Story 3.3).
     assert live == 0
-    assert sequencer.next_wakeup() is None
+    assert sequencer.next_wakeup(dt_util.now()) is None
 
     # ...and turning it back on honours the very next daily start — the same
     # day's evening one, so the assertion needs no clock jump across a second
@@ -768,6 +812,67 @@ async def test_season_off_makes_a_daily_start_arm_nothing_at_all(
         ("turn_on", PUMP),
         ("turn_on", VALVE_1),
     ]
+
+    runner.async_shutdown()
+
+
+async def test_a_season_turned_back_on_mid_day_makes_up_at_the_next_window_end(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 3.3: the make-up waits for a window end — it never rides the toggle.
+
+    The season was off across the 07:00 window, so nothing ran and nothing
+    recorded it; the engine keeps no memory of WHEN it was off, so once it is
+    back on that morning reads as missed like any other. What this pins is
+    WHEN: turning the switch on commands nothing and arms the watchdog's next
+    deadline, and the make-up happens there — at the evening window end,
+    where the evening's own start has already run and the morning is the
+    day's earlier cycle, so it is recorded rather than watered a second time.
+    """
+    calls = register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, sequencer = make_runner(hass, make_plan())
+    await runner.async_start()
+    await runner.async_set_season(enabled=False)
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    assert calls == []
+
+    freezer.move_to("2026-07-31 12:00:00+02:00")
+    await runner.async_set_season(enabled=True)
+
+    # Nothing is checked, commanded or recorded by the toggle itself...
+    assert calls == []
+    assert sequencer.current_run is None
+    assert missed_issue(hass) is None
+    # ...only the deadline on the evening window end is armed.
+    assert sequencer.next_wakeup(dt_util.now()) == dt_util.parse_datetime(
+        "2026-07-31 20:20:00+02:00"
+    )
+
+    # The evening runs normally from its own daily start...
+    await fire_at(hass, freezer, "2026-07-31 20:00:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 20:10:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 20:20:00+02:00")
+
+    # ...and the window end that follows records the morning without
+    # watering it: the day's later cycle has already run.
+    last = sequencer.last_run
+    assert last is not None
+    assert last.kind is CycleKind.EVENING
+    assert sequencer.current_run is None
+    issue = missed_issue(hass)
+    assert issue is not None
+    assert issue.translation_placeholders is not None
+    assert issue.translation_placeholders["outcome"] == "recorded"
+    assert issue.translation_placeholders["kind"] == "morning"
+    # Nothing is booked for it, and deliberately so: a cycle that runs its
+    # planned duration finishes at the very instant its window closes, so the
+    # deadline lands while the evening run is still live — and a debt written
+    # there would be replaced by that run's own settlement moments later.
+    assert sequencer.ledger.settled_cycle_id == "2026-07-31-evening"
+    assert sequencer.ledger.as_dict()["deficits"] == {}
 
     runner.async_shutdown()
 
@@ -821,8 +926,12 @@ async def test_cancel_drives_the_real_switch_services_and_leaves_nothing_armed(
     run = sequencer.last_run
     assert run is not None
     assert run.status is CycleStatus.CANCELLED
-    assert sequencer.next_wakeup() is None
-    assert live == 0
+    # No boundary of the cancelled cycle survives; the ONE handle now holds
+    # the watchdog's deadline, and the cancelled record makes it a no-op.
+    assert sequencer.next_wakeup(dt_util.now()) == dt_util.parse_datetime(
+        "2026-07-31 07:20:00+02:00"
+    )
+    assert live == 1
 
     # The zone boundary the cancelled cycle would have had never fires.
     commanded = len(calls)
@@ -864,7 +973,9 @@ async def test_run_now_starts_in_the_same_tick_and_arms_the_next_boundary(
     """
     calls = register_switch_domain(hass)
     freezer.move_to("2026-07-31 09:30:00+02:00")
-    runner, sequencer = make_runner(hass, make_plan())
+    # 09:30 is past the morning window, so the day is seeded as watered: the
+    # operator's run-now is what this test is about, not a watchdog make-up.
+    runner, sequencer = make_runner(hass, make_plan(), history=day_done("2026-07-31"))
     await runner.async_start()
 
     assert await runner.async_run_now(CycleKind.MORNING) is True
@@ -877,7 +988,7 @@ async def test_run_now_starts_in_the_same_tick_and_arms_the_next_boundary(
         ("turn_on", PUMP),
         ("turn_on", VALVE_1),
     ]
-    assert sequencer.next_wakeup() == dt_util.parse_datetime(
+    assert sequencer.next_wakeup(dt_util.now()) == dt_util.parse_datetime(
         "2026-07-31 09:40:00+02:00",
     )
 
@@ -896,7 +1007,10 @@ async def test_run_now_starts_in_the_same_tick_and_arms_the_next_boundary(
     assert finished is not None
     assert finished.status is CycleStatus.COMPLETED
     assert finished.manual is True
-    assert sequencer.next_wakeup() is None
+    # Idle again: the ONE handle holds the watchdog's evening deadline.
+    assert sequencer.next_wakeup(dt_util.now()) == dt_util.parse_datetime(
+        "2026-07-31 20:20:00+02:00"
+    )
 
     runner.async_shutdown()
 
@@ -919,14 +1033,14 @@ async def test_a_refused_run_now_reports_false_and_leaves_the_timer_alone(
     await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
     live = sequencer.current_run
     commanded = len(calls)
-    wakeup = sequencer.next_wakeup()
+    wakeup = sequencer.next_wakeup(dt_util.now())
 
     freezer.move_to("2026-07-31 07:04:00+02:00")
     assert await runner.async_run_now(CycleKind.EVENING) is False
 
     assert sequencer.current_run is live
     assert len(calls) == commanded
-    assert sequencer.next_wakeup() == wakeup
+    assert sequencer.next_wakeup(dt_util.now()) == wakeup
 
     # And the boundary the live cycle was waiting for still fires.
     await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
@@ -1287,7 +1401,9 @@ async def test_replan_rearms_the_daily_starts_from_the_new_plan(
     await fire_at(hass, freezer, "2026-07-31 07:22:00+02:00")
     assert sequencer.current_run is None
     assert reloads == [entry.entry_id]
-    assert live == 0
+    # One live registration throughout — now the watchdog's deadline rather
+    # than a cycle boundary, still exactly one (AD-3).
+    assert live == 1
     assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls][-3:] == [
         ("turn_on", VALVE_1),
         ("turn_off", VALVE_1),
@@ -1725,7 +1841,7 @@ async def test_start_reconciles_before_arming_any_timer(
     assert run is not None
     assert run.status is CycleStatus.RUNNING
     assert run.recovery == "resumed"
-    assert sequencer.next_wakeup() == dt_util.parse_datetime(
+    assert sequencer.next_wakeup(dt_util.now()) == dt_util.parse_datetime(
         "2026-07-31 07:10:00+02:00"
     )
 
@@ -1782,7 +1898,7 @@ async def test_start_waits_for_homeassistant_started_during_boot(
         ("turn_on", PUMP),
         ("turn_on", VALVE_1),
     ]
-    assert sequencer.next_wakeup() == dt_util.parse_datetime(
+    assert sequencer.next_wakeup(dt_util.now()) == dt_util.parse_datetime(
         "2026-07-31 07:10:00+02:00"
     )
 
@@ -1847,7 +1963,7 @@ async def test_a_reconcile_that_raises_is_logged_and_the_timers_are_still_armed(
     # Both daily starts armed (morning and evening); no point-in-time handle,
     # since the engine reports no wake-up while the gate still holds the run.
     assert order == ["arm", "arm"]
-    assert sequencer.next_wakeup() is None
+    assert sequencer.next_wakeup(dt_util.now()) is None
     errors = [
         record
         for record in caplog.records

@@ -74,8 +74,17 @@ def make_sequencer(
 
 
 async def run_to_idle(sequencer: Sequencer, clock: VirtualClock) -> None:
-    """Drive the engine with the exact wake-up loop the runner uses."""
-    while (moment := sequencer.next_wakeup()) is not None:
+    """Drive the ACTIVE cycle with the exact wake-up loop the runner uses.
+
+    Stops the moment the machine goes idle. Since Story 3.3 `next_wakeup`
+    answers the watchdog's next window-end deadline while idle — the runner's
+    loop is the same one and simply never stops — so a test loop that only
+    watched it would walk the calendar for ever.
+    """
+    while sequencer.current_run is not None:
+        moment = sequencer.next_wakeup(clock.now())
+        if moment is None:
+            break
         clock.advance_to(moment)
         await sequencer.advance(clock.now())
 
@@ -151,7 +160,7 @@ async def test_run_now_dispatches_at_once_rather_than_at_the_configured_start() 
     assert run is not None
     assert run.configured_start == aware(7)
     assert run.scheduled_start == aware(14, 30)
-    assert sequencer.next_wakeup() == aware(14, 30)
+    assert sequencer.next_wakeup(clock.now()) == aware(14, 30)
 
 
 # --------------------------------------------------------------------------
@@ -253,7 +262,7 @@ async def test_run_now_is_refused_while_a_cycle_is_pending() -> None:
 
     assert pending.status is CycleStatus.PENDING
     assert switches.commands == []
-    assert sequencer.next_wakeup() == aware(7)
+    assert sequencer.next_wakeup(clock.now()) == aware(7)
 
 
 async def test_run_now_is_refused_while_a_cycle_is_running() -> None:
@@ -320,7 +329,9 @@ async def test_run_now_on_a_zoneless_plan_files_no_phantom_run() -> None:
     assert switches.commands == []
     assert journal.snapshots == []
     assert anomalies.reports == []
-    assert sequencer.next_wakeup() is None
+    # A zoneless plan waters nothing by construction, so there is no cycle to
+    # miss and the watchdog names no deadline either (Story 3.3).
+    assert sequencer.next_wakeup(clock.now()) is None
 
 
 async def test_run_now_morning_waters_a_plan_whose_morning_cycle_is_off() -> None:

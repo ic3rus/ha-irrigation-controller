@@ -92,8 +92,17 @@ def make_sequencer(
 
 
 async def run_to_idle(sequencer: Sequencer, clock: VirtualClock) -> None:
-    """Drive the engine with the exact wake-up loop the adapter uses."""
-    while (moment := sequencer.next_wakeup()) is not None:
+    """Drive the ACTIVE cycle with the exact wake-up loop the adapter uses.
+
+    Stops the moment the machine goes idle. Since Story 3.3 `next_wakeup`
+    answers the watchdog's next window-end deadline while idle — the runner's
+    loop is the same one and simply never stops — so a test loop that only
+    watched it would walk the calendar for ever.
+    """
+    while sequencer.current_run is not None:
+        moment = sequencer.next_wakeup(clock.now())
+        if moment is None:
+            break
         clock.advance_to(moment)
         await sequencer.advance(clock.now())
 
@@ -201,19 +210,33 @@ async def test_from_dict_round_trips_every_journaled_shape(at: str) -> None:
     assert CycleRun.from_dict(run.as_dict(), tz=TZ) == run
 
 
-async def test_from_dict_reads_the_manual_marker_and_an_absent_recovery_key() -> None:
-    """`manual` goes through `is_manual`; `recovery` is optional (pre-3.2 journals)."""
+async def test_from_dict_reads_the_optional_markers_conservatively() -> None:
+    """`manual` and `late_rerun` go through the "only a real True" rule.
+
+    `recovery` (pre-3.2) and `late_rerun` (pre-3.3) are both optional on
+    read, and a restart must not silently strip a marker it CAN read: a late
+    re-run interrupted by a restart is still a late re-run, and Epic 4 shows
+    it as one.
+    """
     sequencer, _, journal, _ = make_sequencer()
     clock = VirtualClock(aware(9))
     assert await sequencer.async_run_now(CycleKind.MORNING, clock.now())
     document = dict(journal.snapshots[-1]["run"])  # type: ignore[call-overload]
     del document["recovery"]
+    del document["late_rerun"]
 
     run = CycleRun.from_dict(document, tz=TZ)
 
     assert run.manual is True
     assert run.recovery is None
+    assert run.late_rerun is False
     assert CycleRun.from_dict({**document, "manual": "true"}, tz=TZ).manual is False
+    # The marker really does survive the boundary, both ways round.
+    marked = CycleRun.from_dict({**document, "late_rerun": True}, tz=TZ)
+    assert marked.late_rerun is True
+    assert marked.as_dict()["late_rerun"] is True
+    hand_edited = CycleRun.from_dict({**document, "late_rerun": "true"}, tz=TZ)
+    assert hand_edited.late_rerun is False
 
 
 @pytest.mark.parametrize(
@@ -770,7 +793,7 @@ async def test_same_day_resume_re_opens_the_live_zone_and_keeps_its_start() -> N
         aware(7),
         True,
     )
-    assert sequencer.next_wakeup() == aware(7, 10)
+    assert sequencer.next_wakeup(clock.now()) == aware(7, 10)
     assert recovered(anomalies) == [
         {
             "cycle_id": "2026-07-31-morning",
@@ -856,7 +879,7 @@ async def test_an_unconfirmed_re_open_reports_and_the_cycle_continues_fail_wet()
     assert run is not None
     assert run.zone_runs[0].status is ZoneRunStatus.FAILED
     assert AnomalyKind.VALVE_OPEN_UNCONFIRMED in other_reports(anomalies)
-    assert sequencer.next_wakeup() == aware(7, 10)
+    assert sequencer.next_wakeup(clock.now()) == aware(7, 10)
 
     await run_to_idle(sequencer, clock)
     finished = sequencer.last_run
@@ -885,7 +908,7 @@ async def test_an_elapsed_live_slot_is_closed_and_the_next_zone_opened() -> None
     assert run is not None
     assert run.zone_runs[0].actual_end == aware(7, 12)
     assert run.zone_runs[1].actual_start == aware(7, 12)
-    assert sequencer.next_wakeup() == aware(7, 27)
+    assert sequencer.next_wakeup(aware(7, 12)) == aware(7, 27)
 
 
 async def test_a_live_zone_found_off_re_runs_in_full() -> None:
@@ -924,7 +947,7 @@ async def test_a_crash_between_zones_resumes_at_the_next_zone() -> None:
     assert run is not None
     assert run.zone_runs[0].status is ZoneRunStatus.COMPLETED
     assert run.zone_runs[1].actual_start == aware(7, 12)
-    assert sequencer.next_wakeup() == aware(7, 27)
+    assert sequencer.next_wakeup(aware(7, 12)) == aware(7, 27)
 
 
 async def test_a_pending_run_resumes_through_the_normal_start_path() -> None:
@@ -939,7 +962,7 @@ async def test_a_pending_run_resumes_through_the_normal_start_path() -> None:
     assert run.status is CycleStatus.RUNNING
     assert run.scheduled_start == aware(7, 3)
     assert run.zone_runs[0].actual_start == aware(7, 3)
-    assert sequencer.next_wakeup() == aware(7, 13)
+    assert sequencer.next_wakeup(aware(7, 3)) == aware(7, 13)
     assert recovered(anomalies) == [
         {
             "cycle_id": "2026-07-31-morning",
@@ -1049,7 +1072,11 @@ async def test_a_later_day_restart_closes_the_run_through_the_completion_path() 
     assert history[-1]["status"] == "interrupted"
     assert history[-1]["recovery"] == "closed"
     assert history[-1]["irrigation_day"] == "2026-07-31"
-    assert sequencer.next_wakeup() is None
+    # Idle again: only the watchdog's deadline on the next window end, which
+    # on the recovery day (2026-08-01) is that morning's own 07:30 (Story 3.3).
+    assert sequencer.next_wakeup(aware(7, 4, day=1, month=8)) == aware(
+        7, 30, day=1, month=8
+    )
 
 
 async def test_a_later_day_restart_with_the_valve_off_books_the_live_zone_in_full() -> (
@@ -1302,9 +1329,15 @@ async def test_a_terminal_journaled_run_is_the_last_run_not_a_recovery() -> None
     completed = journal.snapshots[-1]["run"]
     assert isinstance(completed, dict)
     assert completed["status"] == "completed"
+    # The same snapshot's history, as the journal adapter really seeds it: the
+    # completion wrote the record and the run in ONE save, so the restored
+    # machine knows that morning ran and Story 3.3's watchdog sees no miss.
+    stored_history = journal.snapshots[-1]["history"]
+    assert isinstance(stored_history, list)
     sequencer, switches, restored_journal, anomalies = make_sequencer(
         run=CycleRun.from_dict(completed, tz=TZ),
         last_run=run_of(await crash_snapshot("done")),
+        history=stored_history,
     )
     switches.states = dict(ALL_OFF)
 
@@ -1347,8 +1380,9 @@ async def test_nothing_acts_on_a_restored_run_before_reconciliation() -> None:
     )
     assert sequencer.reconciled is False
     now = aware(7, 12)  # zone 1's boundary is long past
-    # No time intent either: nothing for the adapter to arm before the resync.
-    assert sequencer.next_wakeup() is None
+    # No time intent either: nothing for the adapter to arm before the resync —
+    # not even the watchdog's deadline, which is gated on the same flag.
+    assert sequencer.next_wakeup(now) is None
 
     await sequencer.advance(now)
     assert switches.commands == []

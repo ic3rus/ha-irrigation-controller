@@ -52,6 +52,8 @@ from tests.common import (
     VALVE_2,
     controller_entry,
     fire_at,
+    history_record,
+    journal_document,
     register_switch_domain,
     zone_subentry_data,
 )
@@ -218,6 +220,7 @@ async def test_cancel_cycle_with_nothing_running_raises(
 @pytest.fixture
 async def idle_entry(
     hass: HomeAssistant,
+    hass_storage: dict[str, Any],
     freezer: FrozenDateTimeFactory,
     paris: None,
 ) -> MockConfigEntry:
@@ -231,8 +234,14 @@ async def idle_entry(
     Arming the daily trackers at 09:30 instead puts the next morning start on
     tomorrow and the evening one at 20:00: both stay in the future for the whole
     of these tests.
+
+    09:30 is also past the morning WINDOW, so the journal is seeded with that
+    cycle's record: without it Story 3.3's watchdog would rightly read the
+    empty history as a slept-through morning and water it — a second cycle
+    that, again, has nothing to do with the action under test.
     """
     freezer.move_to("2026-07-31 09:30:00+02:00")
+    hass_storage[STORAGE_KEY] = journal_document(history=[history_record("morning")])
     config_entry = MockConfigEntry(
         domain=DOMAIN,
         title="Irrigation Controller",
@@ -361,8 +370,14 @@ async def test_a_completed_run_now_is_recorded_as_a_manual_run(
     await hass.async_block_till_done()
 
     history = hass_storage[STORAGE_KEY]["data"]["history"]
-    assert [record["cycle_id"] for record in history] == ["2026-07-31-morning"]
-    assert is_manual(history[0]) is True
+    # The fixture's seeded morning record (see `idle_entry`) plus the run-now,
+    # which takes the day's SECOND occurrence id because of it.
+    assert [record["cycle_id"] for record in history] == [
+        "2026-07-31-morning",
+        "2026-07-31-morning-2",
+    ]
+    assert is_manual(history[0]) is False
+    assert is_manual(history[-1]) is True
 
 
 async def test_run_now_while_a_cycle_runs_is_refused_and_changes_nothing(

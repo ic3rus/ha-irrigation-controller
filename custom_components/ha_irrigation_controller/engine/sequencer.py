@@ -3,16 +3,23 @@
 The engine never sleeps, loops on wall time or arms timers. It exposes two
 methods:
 
-- ``next_wakeup()`` — the earliest pending time intent on requested/running
-  work, ``None`` when idle. Daily cycle starts are NOT a wakeup intent: they
-  arrive from outside through ``request_cycle`` (tests call it directly;
-  Story 1.5 calls it from ``async_track_time_change``, per AD-3's split).
+- ``next_wakeup(now)`` — the earliest pending time intent: a running cycle's
+  own boundary while one is active, otherwise the watchdog's next window-end
+  deadline (Story 3.3). ``None`` in three cases: before reconciliation, when
+  the watchdog has nothing it could act on (season off, or a plan with no
+  zones), and in the transient window inside ``advance`` where the last zone
+  has closed but the cycle has not completed yet. Daily cycle starts are NOT
+  a wakeup intent: they arrive from outside through ``request_cycle`` (tests
+  call it directly; Story 1.5 calls it from ``async_track_time_change``, per
+  AD-3's split).
 - ``advance(now)`` — perform EVERY transition due at ``now``: command ports,
   update run objects, journal. Idempotent for a given state and ``now``.
 
 Story 1.5's adapter arms exactly ONE re-armed ``async_track_point_in_time``
-at ``next_wakeup()`` and calls ``advance(dt_util.now())`` when it fires;
-virtual-clock tests drive the identical loop with ``advance_to()``.
+at ``next_wakeup(now)`` and calls ``advance(dt_util.now())`` when it fires;
+virtual-clock tests drive the identical loop with ``advance_to()``. Every
+``advance`` starts with the missed-cycle check (Story 3.3), so the watchdog
+needs no timer of its own — AD-3's one callback serves it too.
 
 Every port call is defended: a port that raises must never abort a cycle and
 leave a valve open with no completion path (AD-4). Adapters are expected to
@@ -46,6 +53,7 @@ from .runs import (
     live_zone,
     utc_iso,
 )
+from .watchdog import missed_cycles, next_deadline
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -342,17 +350,44 @@ class Sequencer:
             await self._save()
             return True
 
-    def next_wakeup(self) -> datetime | None:
-        """Return the earliest pending time intent, or None when idle.
+    def next_wakeup(self, now: datetime) -> datetime | None:
+        """Return the earliest pending time intent, or None when there is none.
 
-        None too while `async_reconcile` has not run (Story 3.2): a restored
+        THE re-arm contract of the one point-in-time callback (AD-3), and
+        since Story 3.3 the home of TWO sources of intent:
+
+        - a cycle is active → its own boundary wins, exactly as before. The
+          watchdog has nothing to serve while the machine is watering, and a
+          deadline that pre-empted a zone boundary would leave a valve open.
+        - the machine is idle → `next_deadline(self.plan, now)`, the next
+          cycle window end. That is the watchdog's timer, and it is armed
+          permanently: a nominal window end fires, finds nothing missing,
+          writes nothing and re-arms on the following one. Except when the
+          watchdog provably cannot act: the season being off and a plan with
+          no zones both make `missed_cycles` return nothing whatever the
+          instant, so an off-season controller must not re-arm a timer twice
+          a day for a check that can only do nothing. Both are read live, so
+          turning the season back on re-arms it through the ordinary tail.
+
+        None while `async_reconcile` has not run (Story 3.2): a restored
         run's boundaries are not the engine's intent until it has been
         resynced — `advance` would serve nothing, and a boundary already in
         the past would otherwise fire, do nothing and be re-armed at once.
+        The watchdog is gated by the same flag for the reason AC 3 names:
+        boot must not re-run a cycle before recovery has decided what the
+        journal's run was.
+
+        `now` is the caller's clock read; the engine keeps none of its own
+        (AD-1). It is used ONLY for the idle deadline — a run's boundaries
+        are absolute instants already.
         """
-        run = self._run
-        if run is None or not self._reconciled:
+        if not self._reconciled:
             return None
+        run = self._run
+        if run is None:
+            if not self._season_enabled or not self.plan.zones:
+                return None
+            return next_deadline(self.plan, now)
         if run.status is CycleStatus.PENDING:
             return run.scheduled_start
         if self._zone_index >= len(run.zone_runs):
@@ -509,7 +544,14 @@ class Sequencer:
             await self._advance_locked(now)
 
     async def _advance_locked(self, now: datetime) -> None:
-        """Run the `advance` loop for a caller that already holds the lock."""
+        """Run the `advance` loop for a caller that already holds the lock.
+
+        The missed-cycle check (Story 3.3) runs FIRST, before any transition:
+        a late re-run it dispatches is a PENDING run scheduled at `now`, so
+        the loop below starts it in this very call — the same "delayed, never
+        skipped" tail a deferred cycle gets.
+        """
+        await self._check_missed(now)
         while (run := self._run) is not None:
             if run.status is CycleStatus.PENDING:
                 if now < run.scheduled_start:
@@ -908,7 +950,9 @@ class Sequencer:
         completion already carries the deficits it produced, and the deferred
         cycle created further down is quoted against them. Both terminal
         statuses settle — a cancelled run's un-reached zones owe their whole
-        slot — and this is the ONLY place `settle` is called. The settlement
+        slot. One of the TWO places `settle` is called: the other is
+        `_check_missed`, which settles a missed cycle nothing is going to
+        water (Story 3.3). The settlement
         is also where every zone's RAIN BASELINE advances to the run's
         quote-time gauge reading (Story 2.4), so the deferred cycle quoted
         below is credited only for rain the gauge has counted since this
@@ -950,6 +994,103 @@ class Sequencer:
             self._dispatch_scheduled(kind, reference, dispatch_at=now, now=now)
             await self._save()
 
+    async def _check_missed(self, now: datetime) -> None:
+        """File, report and make up every cycle of today that never ran (Story 3.3).
+
+        THE watchdog. Called at the top of every `_advance_locked` — so at
+        each window end the re-armed callback serves, at every cycle
+        transition, and once from inside `async_reconcile` after the gate
+        lifts and before the drain. `watchdog.missed_cycles` makes the whole
+        decision (pure, on the virtual clock); this method is the effects.
+
+        A nominal restart and a nominal window end reach here, find nothing
+        and return at once: no record, no anomaly, no command, and — the
+        counter-metric — NO journal write. The single `_save` at the end runs
+        only when something really changed.
+
+        Per miss, in this order:
+
+        1. build the record with `_build_run` (pure: the same snapshot code,
+           the same ledger quote and the same gauge read a real cycle gets)
+           and stamp it `MISSED`;
+        2. SETTLE it — but only when nothing else is watering AND it will not
+           be re-run (Decision 2). Every zone is PENDING, so
+           `effective_seconds` reads 0 and each deficit clamps to `base_s`:
+           exactly the "deficits at one base duration" cap, since the quote
+           already folded in whatever was carried and `settle` REPLACES the
+           ledger with this run's zones. Two cases never settle, for the same
+           reason — the ledger they wrote would be thrown away minutes later:
+           a miss that IS re-run (the re-run waters in full and its own
+           completion settles it, and settling first would put the same
+           shortfall into the re-run's quote as well), and a miss recorded
+           while another cycle is live (that cycle's completion replaces the
+           ledger with ITS zones). The live-run case therefore records the
+           miss without booking anything: the record is the truth kept, the
+           debt is not;
+        3. append the record to history and prune — the same two lines
+           `_dispatch_scheduled` uses. Filing BEFORE the dispatch is what
+           makes `_next_occurrence` count the record (the re-run takes the
+           `-2` id) and what makes this `(irrigation day, kind)` undetectable
+           forever after: the record IS the at-most-once marker;
+        4. report exactly one `MISSED_CYCLE`, controller-level and
+           acknowledge-only — the engine never clears it;
+        5. dispatch the late re-run through the ORDINARY scheduled path, at
+           `now` on the cycle's own configured start, so the snapshot, the
+           quote, the waiver rule and the verified actuation are all code
+           this story never touches.
+
+        The re-run is dispatched only while the machine is IDLE. At most one
+        miss per check is rerunnable (the latest-starting one), so two misses
+        never race; the guard covers the other case — a cycle of the other
+        kind still watering — where installing a run would abandon a live one
+        with its valve open. Such a miss is recorded and nothing else: no
+        run, and no ledger write either, since the live cycle's own
+        settlement would replace it before the next quote ever read it.
+
+        A crash between the record and the debounced save re-detects the miss
+        on the next check — the same bounded window `_dispatch_scheduled`
+        already accepts for the day credit.
+        """
+        if not self._reconciled:
+            return
+        misses = missed_cycles(
+            self.plan,
+            now=now,
+            history=self._history,
+            season_enabled=self._season_enabled,
+            active=self._run,
+            deferred_kinds=self.deferred_kinds,
+            day_credit=self._ledger.day_credit,
+        )
+        if not misses:
+            return
+        for miss in misses:
+            live = self._run is not None
+            rerun = miss.rerunnable and not live
+            record = self._build_run(miss.kind, miss.configured_start)
+            record.status = CycleStatus.MISSED
+            if not rerun and not live:
+                self._ledger.settle(record)
+            self._history.append(history_entry(record, now))
+            self._history = prune_history(self._history, irrigation_day(now))
+            self._report(
+                AnomalyKind.MISSED_CYCLE,
+                {
+                    "cycle_id": record.cycle_id,
+                    "kind": miss.kind.value,
+                    "outcome": "rerun" if rerun else "recorded",
+                },
+            )
+            if rerun:
+                self._dispatch_scheduled(
+                    miss.kind,
+                    miss.configured_start,
+                    dispatch_at=now,
+                    now=now,
+                    late_rerun=True,
+                )
+        await self._save()
+
     def _dispatch_scheduled(
         self,
         kind: CycleKind,
@@ -957,6 +1098,7 @@ class Sequencer:
         *,
         dispatch_at: datetime | None,
         now: datetime,
+        late_rerun: bool = False,
     ) -> None:
         """Decide a SCHEDULED cycle: install it, or file it waived (Story 2.3).
 
@@ -980,8 +1122,16 @@ class Sequencer:
         persistence: a crash inside its window re-seeds the credit on the next
         setup, and the day's other scheduled cycle is waived instead — bounded
         by construction, since the run-now really did water the day.
+
+        `late_rerun` (Story 3.3) marks the run the watchdog dispatched to make
+        up for a missed cycle. It is a MARKER and nothing more — the decision,
+        the quote, the waiver and every command are identical, which is the
+        point: a late re-run is an ordinary scheduled cycle that happens to
+        start after its window. A credited day still waives it.
         """
-        run = self._build_run(kind, reference, dispatch_at=dispatch_at)
+        run = self._build_run(
+            kind, reference, dispatch_at=dispatch_at, late_rerun=late_rerun
+        )
         credit = self._ledger.waive(irrigation_day(run.configured_start))
         if credit is None:
             self._run = run
@@ -1018,6 +1168,7 @@ class Sequencer:
         *,
         dispatch_at: datetime | None = None,
         manual: bool = False,
+        late_rerun: bool = False,
     ) -> CycleRun:
         """Snapshot the plan into a new pending run (AD-8: owned copies).
 
@@ -1032,11 +1183,13 @@ class Sequencer:
         passes `dispatch_at` to start right away instead of waiting for its
         configured start, while still keeping that start for its identity.
 
-        `manual` marks Story 2.1's run-now. It defaults to False so both
-        scheduled callers stay unchanged, and it only ever reaches the run
-        object — the id, the windows and the occurrence counter are derived
-        identically either way, which is what keeps a run-now indistinguishable
-        from a scheduled cycle everywhere except in the accounting.
+        `manual` marks Story 2.1's run-now and `late_rerun` Story 3.3's
+        watchdog make-up cycle. Both default to False so every existing
+        caller stays unchanged, and both only ever reach the run object — the
+        id, the windows and the occurrence counter are derived
+        identically either way, which is what keeps a run-now (or a late
+        re-run) indistinguishable from a scheduled cycle everywhere except in
+        the accounting.
 
         Durations are QUOTED through the ledger (Story 2.2, AD-5), whichever
         caller is creating the run: a scheduled start, a deferred pop and a
@@ -1114,6 +1267,7 @@ class Sequencer:
             manual=manual,
             rain_total_mm=rain_total_mm,
             rain_source=rain_source,
+            late_rerun=late_rerun,
         )
 
     def _rain_total_mm(self) -> float | None:

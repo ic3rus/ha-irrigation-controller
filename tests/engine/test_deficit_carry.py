@@ -68,8 +68,17 @@ def make_sequencer(
 
 
 async def run_to_idle(sequencer: Sequencer, clock: VirtualClock) -> None:
-    """Drive the engine with the exact wake-up loop the runner uses."""
-    while (moment := sequencer.next_wakeup()) is not None:
+    """Drive the ACTIVE cycle with the exact wake-up loop the runner uses.
+
+    Stops the moment the machine goes idle. Since Story 3.3 `next_wakeup`
+    answers the watchdog's next window-end deadline while idle — the runner's
+    loop is the same one and simply never stops — so a test loop that only
+    watched it would walk the calendar for ever.
+    """
+    while sequencer.current_run is not None:
+        moment = sequencer.next_wakeup(clock.now())
+        if moment is None:
+            break
         clock.advance_to(moment)
         await sequencer.advance(clock.now())
 
@@ -129,7 +138,7 @@ async def test_a_failed_open_extends_the_next_run_of_that_kind() -> None:
     )
 
     await sequencer.advance(clock.now())
-    assert sequencer.next_wakeup() == aware(7, 20, day=1, month=8)
+    assert sequencer.next_wakeup(clock.now()) == aware(7, 20, day=1, month=8)
 
     await run_to_idle(sequencer, clock)
 

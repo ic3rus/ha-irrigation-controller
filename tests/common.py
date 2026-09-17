@@ -33,6 +33,7 @@ from custom_components.ha_irrigation_controller.const import (
     DOMAIN,
     SUBENTRY_TYPE_ZONE,
 )
+from custom_components.ha_irrigation_controller.engine.runs import MANUAL_KEY
 from custom_components.ha_irrigation_controller.engine.sequencer import (
     JOURNAL_SCHEMA_VERSION,
 )
@@ -309,6 +310,7 @@ def run_document(
         "rain_total_mm": None,
         "rain_source": None,
         "recovery": None,
+        "late_rerun": False,
         "zones": list(zones),
         **overrides,
     }
@@ -336,6 +338,34 @@ def crashed_during_zone_a() -> dict[str, object]:
         ),
         zone_b_document(),
     )
+
+
+def history_record(
+    kind: str = "morning",
+    *,
+    day: str = "2026-07-31",
+    status: str = "completed",
+    **overrides: object,
+) -> dict[str, object]:
+    """Build one stored history entry as `history_entry` writes it, zones elided.
+
+    Enough for every reader that matters at the storage boundary: the day
+    parsing `prune_history` does, the occurrence count, and Story 3.3's
+    watchdog — which asks only whether a record for `(irrigation_day, kind)`
+    exists at all, whatever its status.
+    """
+    return {
+        "cycle_id": f"{day}-{kind}",
+        "irrigation_day": day,
+        "kind": kind,
+        "status": status,
+        MANUAL_KEY: False,
+        "waived_by": None,
+        "recovery": None,
+        "late_rerun": False,
+        "zones": [],
+        **overrides,
+    }
 
 
 def journal_document(**sections: object) -> dict[str, Any]:

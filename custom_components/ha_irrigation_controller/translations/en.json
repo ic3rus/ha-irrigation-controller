@@ -153,7 +153,8 @@
                     "completed": "Completed",
                     "cancelled": "Cancelled",
                     "waived": "Waived",
-                    "interrupted": "Interrupted"
+                    "interrupted": "Interrupted",
+                    "missed": "Missed"
                 }
             },
             "last_watering_duration": {
@@ -326,6 +327,17 @@
                     "confirm": {
                         "title": "A cycle was recovered at startup",
                         "description": "Cycle `{cycle_id}` was found in progress in the journal when the integration loaded (zone `{zone_id}` is the zone that was watering, `-` when none was). Any valve or pump of that cycle still on was switched off first. Outcome: `{outcome}` — `resumed` means the cycle continued on the same irrigation day with its original durations; `closed` means it was on an earlier day and was filed as interrupted, with each zone's missed watering carried forward as water debt; `discarded` means the journaled cycle could not be read, so every configured valve and the pump were switched off and nothing was booked. Acknowledging clears this issue; it does not clear itself."
+                    }
+                }
+            }
+        },
+        "missed_cycle": {
+            "title": "A scheduled cycle did not run",
+            "fix_flow": {
+                "step": {
+                    "confirm": {
+                        "title": "A scheduled cycle did not run",
+                        "description": "The `{kind}` cycle was scheduled but its watering window closed with no record of it: cycle `{cycle_id}` is filed as missed. Home Assistant was most likely down over the window, or the start fell inside the hour the clocks skip forward. Outcome: `{outcome}` — `rerun` means the cycle is watering right now, on the same irrigation day and on freshly calculated durations, and this happens at most once per missed cycle; `recorded` means the day's later cycle had already run, so nothing is watered on top of it and each zone's missed watering is carried forward as water debt, capped at one base duration. Acknowledging clears this issue; it does not clear itself."
                     }
                 }
             }
