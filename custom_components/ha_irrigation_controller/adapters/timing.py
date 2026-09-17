@@ -11,6 +11,12 @@ Two responsibilities, deliberately split the way AD-3 splits time intents:
   breaks AD-3 and the Epic 3 stories that hang their intents off this
   callback.
 
+Neither is armed before the engine has RECONCILED (Story 3.2, AD-11):
+`async_start` runs `sequencer.async_reconcile` first — at once when Home
+Assistant is already running, otherwise on `EVENT_HOMEASSISTANT_STARTED`, so
+the governed switches have had their chance to report a real state — and
+only then arms the daily starts and the point-in-time re-arm.
+
 No tick loop, no `asyncio.sleep`, no feature-owned timers.
 """
 
@@ -19,7 +25,8 @@ from __future__ import annotations
 from functools import partial
 from typing import TYPE_CHECKING
 
-from homeassistant.core import callback
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+from homeassistant.core import CoreState, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import (
     async_track_point_in_time,
@@ -27,14 +34,14 @@ from homeassistant.helpers.event import (
 )
 from homeassistant.util import dt as dt_util
 
-from ..const import engine_state_signal  # noqa: TID252
+from ..const import LOGGER, engine_state_signal  # noqa: TID252
 from ..engine.plan import CycleKind  # noqa: TID252
 
 if TYPE_CHECKING:
     from datetime import datetime, time
 
     from homeassistant.config_entries import ConfigEntry
-    from homeassistant.core import CALLBACK_TYPE, HomeAssistant
+    from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant
 
     from ..engine.sequencer import Sequencer  # noqa: TID252
 
@@ -69,11 +76,16 @@ class CycleRunner:
     ) -> None:
         """Wire the runner to its sequencer, clock and entry-scoped signal."""
         self._hass = hass
+        self._entry = entry
         self._sequencer = sequencer
         self._clock = clock
         self._entry_id = entry.entry_id
         self._signal = engine_state_signal(entry.entry_id)
         self._unsub_point: CALLBACK_TYPE | None = None
+        # The `EVENT_HOMEASSISTANT_STARTED` listener while reconciliation
+        # waits for boot to finish (Story 3.2); cancelled by `async_shutdown`
+        # so an unload before HA started leaves no dangling listener.
+        self._unsub_started: CALLBACK_TYPE | None = None
         # One daily tracker per enabled cycle kind, with the start it was
         # armed for — `async_replan` only touches the kinds whose start
         # changed (see there for why).
@@ -94,16 +106,85 @@ class CycleRunner:
         return self._reload_pending
 
     async def async_start(self) -> None:
-        """Arm the daily cycle starts from the plan's configured times.
+        """Reconcile the journal against the hardware, THEN arm the timers.
 
-        Read off `plan.morning_start`/`plan.evening_start` (`datetime.time`):
-        `async_track_time_change` re-computes the next occurrence in local
-        time after every fire, which is what survives a DST transition.
-        Edited start times reach these timers through a reload (FR8's
-        restart-free half) or, while a reload is deferred behind a running
-        cycle, through `async_replan`.
+        Reconciliation (Story 3.2, AD-11) runs exactly once per setup and
+        before anything is armed: nothing may step a restored run before it
+        has been resynced. It runs at once when Home Assistant is already
+        RUNNING (a reload, the forced one of Story 1.7 included); during
+        boot — `CoreState.starting`, which `hass.is_running` also reports
+        as running, hence the explicit state check — it waits for
+        `EVENT_HOMEASSISTANT_STARTED`, because the governed switches'
+        integrations may still be loading and would read `unknown` — which
+        the engine would treat as "not OFF" and command off, and as
+        "watering unproven". Until then no daily start and no point-in-time
+        handle exists, so `_async_daily_start`/`_async_fire` cannot run; the
+        engine's own `_reconciled` gate is the belt to that suspender for
+        the services.
+
+        The daily starts are read off `plan.morning_start`/`plan.evening_start`
+        (`datetime.time`): `async_track_time_change` re-computes the next
+        occurrence in local time after every fire, which is what survives a
+        DST transition. Edited start times reach these timers through a
+        reload (FR8's restart-free half) or, while a reload is deferred
+        behind a running cycle, through `async_replan`.
         """
-        self._arm_daily()
+        if self._hass.state is CoreState.running:
+            await self._async_reconcile()
+            return
+        self._unsub_started = self._hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_STARTED,
+            self._async_on_started,
+        )
+
+    @callback
+    def _async_on_started(self, _event: Event) -> None:
+        """Reconcile once Home Assistant has started — the boot-time path.
+
+        Synchronous on purpose: the one-time listener has already removed
+        itself when this runs, so the handle is dropped HERE, in the same
+        loop iteration, before `async_shutdown` could ever call a remove
+        that would log "unknown job listener". The reconciliation itself is
+        an entry-owned task: it awaits verified service calls, and an unload
+        landing meanwhile cancels it with the entry.
+        """
+        self._unsub_started = None
+        if self._shutdown:
+            return
+        self._entry.async_create_task(
+            self._hass,
+            self._async_reconcile(),
+            name=f"{self._entry_id} startup reconciliation",
+        )
+
+    async def _async_reconcile(self) -> None:
+        """Run the engine's reconciliation, then arm and push — the start tail.
+
+        The arming rides a `finally`, like every other tail: a port that
+        raises out of the reconciler must not leave the entry with no daily
+        start at all. `_arm_daily` is skipped after shutdown (an unload can
+        land while a verified close is in flight); `_rearm` and
+        `_async_maybe_reload` carry their own guards. The push is what makes
+        a recovery visible on the sensors at once — a resumed run's status,
+        a closed run's deficits, the health entity's new issue.
+        """
+        if self._shutdown:
+            return
+        try:
+            await self._sequencer.async_reconcile(self._clock.now())
+        except Exception:  # noqa: BLE001 — see below: setup must not fail for this
+            # The engine defends every port call, so this is a defect, not a
+            # hardware fault — and the one outcome AD-4 forbids is the
+            # integration refusing to load over it: the season would end
+            # silently. Logged with its traceback; the arming below still
+            # runs, so the daily starts water.
+            LOGGER.exception("Startup reconciliation failed; scheduling continues")
+        finally:
+            if not self._shutdown:
+                self._arm_daily()
+            self._rearm()
+            self._async_maybe_reload()
+            self._async_push_state()
 
     @callback
     def async_replan(self) -> None:
@@ -300,6 +381,9 @@ class CycleRunner:
         regime runs this constantly.
         """
         self._shutdown = True
+        if self._unsub_started is not None:
+            self._unsub_started()
+            self._unsub_started = None
         if self._unsub_point is not None:
             self._unsub_point()
             self._unsub_point = None

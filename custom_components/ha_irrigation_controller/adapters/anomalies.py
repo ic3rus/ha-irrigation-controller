@@ -6,7 +6,7 @@ Repairs or notify directly) and fans out to exactly four places:
 1. a **Repairs issue**, deduplicated per open anomaly — `issue_id =
    "{kind}:{subject}"`, the subject read from the context by a per-kind
    table (pump kinds → `entity_id`, valve kinds → `zone_id`,
-   `CONFIGURED_ENTITY_MISSING` → `zone_id` if present else `role`, the two
+   `CONFIGURED_ENTITY_MISSING` → `zone_id` if present else `role`, the
    controller-level kinds → no subject);
 2. one **push notification** per NEWLY opened anomaly, through the notify
    port, as a background task (notify once);
@@ -70,12 +70,16 @@ _SUBJECT_KEYS: Final[dict[AnomalyKind, tuple[str, ...]]] = {
     AnomalyKind.VALVE_CLOSE_UNCONFIRMED: ("zone_id",),
     AnomalyKind.CONFIGURED_ENTITY_MISSING: ("zone_id", "role"),
     AnomalyKind.CYCLE_INTERRUPTED: (),
+    # Story 3.2: one issue for the whole controller, like the interruption
+    # it supersedes. Never cleared by the engine — acknowledge only.
+    AnomalyKind.CYCLE_RECOVERED: (),
     AnomalyKind.JOURNAL_SAVE_FAILED: (),
 }
 
 # Every placeholder the issue texts may reference, always provided so a
 # translation can name any of them for any kind; `-` stands for "absent".
-_PLACEHOLDERS: Final = ("entity_id", "zone_id", "cycle_id", "role")
+# `outcome` (Story 3.2) is `CYCLE_RECOVERED`'s resumed/closed/discarded.
+_PLACEHOLDERS: Final = ("entity_id", "zone_id", "cycle_id", "role", "outcome")
 _ABSENT: Final = "-"
 
 # Issue `data` keys — what a rebuilt manager re-seeds from.

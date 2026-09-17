@@ -12,7 +12,14 @@ import asyncio
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
-from homeassistant.const import ATTR_ENTITY_ID, STATE_OFF, STATE_ON
+import pytest
+from homeassistant.const import (
+    ATTR_ENTITY_ID,
+    STATE_OFF,
+    STATE_ON,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+)
 from homeassistant.exceptions import HomeAssistantError
 from pytest_homeassistant_custom_component.common import async_mock_service
 
@@ -295,3 +302,44 @@ async def test_commands_outside_a_cycle_get_fresh_contexts(
     assert await adapter.async_turn_on(VALVE) is True
     assert await adapter.async_turn_on(VALVE) is True
     assert calls[0].context.id != calls[1].context.id
+
+
+# --------------------------------------------------------------------------
+# The resync input (Story 3.2): `async_is_on`
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        (STATE_ON, True),
+        (STATE_OFF, False),
+        (STATE_UNKNOWN, None),
+        (STATE_UNAVAILABLE, None),
+        ("opening", None),
+    ],
+)
+async def test_is_on_reads_the_actual_state_and_doubts_anything_else(
+    hass: HomeAssistant,
+    state: str,
+    expected: bool | None,  # noqa: FBT001 — a parametrized expectation
+) -> None:
+    """`on` → True, `off` → False, everything else → None (fail-wet: "not OFF")."""
+    hass.states.async_set(VALVE, state)
+
+    assert await make_adapter(hass).async_is_on(VALVE) is expected
+
+
+async def test_is_on_of_an_entity_with_no_state_is_none(hass: HomeAssistant) -> None:
+    """A switch whose integration has not loaded yet has no state at all: doubtful."""
+    assert await make_adapter(hass).async_is_on("switch.not_loaded_yet") is None
+
+
+async def test_is_on_follows_a_rename(hass: HomeAssistant) -> None:
+    """The read goes through the alias map the commands use (Story 1.7 + 3.2)."""
+    adapter = make_adapter(hass)
+    adapter.async_rename(VALVE, "switch.front_valve")
+    hass.states.async_set("switch.front_valve", STATE_ON)
+
+    assert await adapter.async_is_on(VALVE) is True
+    assert await adapter.async_is_on("switch.front_valve") is True

@@ -14,6 +14,7 @@ from pytest_homeassistant_custom_component.common import (
     async_fire_time_changed,
 )
 
+from custom_components.ha_irrigation_controller.adapters.journal import STORAGE_KEY
 from custom_components.ha_irrigation_controller.const import (
     CONF_ACTUATION_TIMEOUT,
     CONF_EVENING_DURATION,
@@ -31,6 +32,9 @@ from custom_components.ha_irrigation_controller.const import (
     CONF_VALVE_SWITCH,
     DOMAIN,
     SUBENTRY_TYPE_ZONE,
+)
+from custom_components.ha_irrigation_controller.engine.sequencer import (
+    JOURNAL_SCHEMA_VERSION,
 )
 
 if TYPE_CHECKING:
@@ -246,3 +250,103 @@ async def add_zone(
         for subentry in subentries.values()
         if subentry.data[CONF_VALVE_SWITCH] == valve
     )
+
+
+# --------------------------------------------------------------------------
+# Journal documents (Story 3.2): what a crashed engine leaves in `.storage`
+# --------------------------------------------------------------------------
+
+# 07:00 Europe/Paris on the representative day, as `utc_iso` writes it — the
+# morning start of `CONTROLLER_OPTIONS`; `zone_subentry_data` waters 10 min.
+MORNING_START_UTC = "2026-07-31T05:00:00+00:00"
+ZONE_A_END_UTC = "2026-07-31T05:10:00+00:00"
+ZONE_B_END_UTC = "2026-07-31T05:20:00+00:00"
+
+
+def zone_document(
+    zone_id: str,
+    valve: str,
+    start: str,
+    end: str,
+    **overrides: object,
+) -> dict[str, object]:
+    """Build one zone record exactly as `ZoneRun.as_dict` writes it (10 min slot)."""
+    return {
+        "zone_id": zone_id,
+        "name": zone_id.replace("-", " ").title(),
+        "valve_entity_id": valve,
+        "duration_s": 600,
+        "base_s": 600,
+        "carried_s": 0,
+        "rain_credit_s": 0,
+        "planned_start": start,
+        "planned_end": end,
+        "status": "pending",
+        "actual_start": None,
+        "actual_end": None,
+        "open_confirmed": None,
+        "close_confirmed": None,
+        **overrides,
+    }
+
+
+def run_document(
+    *zones: dict[str, object],
+    status: str = "running",
+    **overrides: object,
+) -> dict[str, object]:
+    """Build a cycle record exactly as `CycleRun.as_dict` writes it (07:00 morning)."""
+    return {
+        "cycle_id": "2026-07-31-morning",
+        "kind": "morning",
+        "configured_start": MORNING_START_UTC,
+        "scheduled_start": MORNING_START_UTC,
+        "pump_entity_id": PUMP,
+        "status": status,
+        "pump_on_confirmed": None if status == "pending" else True,
+        "pump_off_confirmed": None,
+        "manual": False,
+        "rain_total_mm": None,
+        "rain_source": None,
+        "recovery": None,
+        "zones": list(zones),
+        **overrides,
+    }
+
+
+def zone_a_document(**overrides: object) -> dict[str, object]:
+    """Zone A's slot (`zone-a`, VALVE_1, 07:00-07:10)."""
+    return zone_document(
+        "zone-a", VALVE_1, MORNING_START_UTC, ZONE_A_END_UTC, **overrides
+    )
+
+
+def zone_b_document(**overrides: object) -> dict[str, object]:
+    """Zone B's slot (`zone-b`, VALVE_2, 07:10-07:20)."""
+    return zone_document("zone-b", VALVE_2, ZONE_A_END_UTC, ZONE_B_END_UTC, **overrides)
+
+
+def crashed_during_zone_a() -> dict[str, object]:
+    """Build the run a crash leaves at 07:0x: zone A open since 07:00, B pending."""
+    return run_document(
+        zone_a_document(
+            status="running",
+            actual_start=MORNING_START_UTC,
+            open_confirmed=True,
+        ),
+        zone_b_document(),
+    )
+
+
+def journal_document(**sections: object) -> dict[str, Any]:
+    """Build the stored `.storage` document around the given journal sections."""
+    return {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {
+            "schema_version": JOURNAL_SCHEMA_VERSION,
+            "history": [],
+            "season_enabled": True,
+            **sections,
+        },
+    }

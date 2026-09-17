@@ -39,6 +39,18 @@ class SwitchPort(Protocol):
         """Command `entity_id` off; return True iff the actuation confirmed."""
         ...
 
+    async def async_is_on(self, entity_id: str) -> bool | None:
+        """Read `entity_id`'s ACTUAL state: True on, False off, None doubtful.
+
+        The resync input of Story 3.2's reconciler (AD-11): after a restart
+        the journal says what was intended, this says what the hardware is
+        doing. `None` covers an entity that is missing, `unknown` or
+        `unavailable` (governed switches may still be booting when the
+        integration loads) — the engine reads it as "not OFF" for the orphan
+        pass and as "watering unproven" for the credit rule, both fail-wet.
+        """
+        ...
+
 
 class RainPort(Protocol):
     """Read seam for the rain gauge (FR14, FR15) — the rain credit's ONE input.
@@ -118,6 +130,16 @@ class AnomalyKind(StrEnum):
       off but the run itself was NOT completed or cancelled: the journal
       keeps its RUNNING/PENDING intent for Story 3.2's reconciler. Context:
       `cycle_id`, `kind`, `zone_id` (the live zone, None when PENDING).
+    - CYCLE_RECOVERED (Story 3.2) — the reconciler found an in-flight run in
+      the journal at startup and acted on it. Context: `cycle_id`, `kind`,
+      `zone_id` (the zone that was live at the crash, None when none was)
+      and `outcome`: `resumed` (same irrigation day — the cycle continues on
+      its journaled durations), `closed` (a later day, or a PENDING run
+      under season OFF — the run is filed `interrupted` and its shortfalls
+      reach the ledger) or `discarded` (the journaled run was unreadable —
+      every configured switch was commanded off and nothing was booked).
+      Controller-level, like CYCLE_INTERRUPTED, and NEVER cleared by the
+      engine: a recovery is news the operator acknowledges.
     """
 
     PUMP_ON_UNCONFIRMED = "pump_on_unconfirmed"
@@ -127,6 +149,7 @@ class AnomalyKind(StrEnum):
     JOURNAL_SAVE_FAILED = "journal_save_failed"
     CONFIGURED_ENTITY_MISSING = "configured_entity_missing"
     CYCLE_INTERRUPTED = "cycle_interrupted"
+    CYCLE_RECOVERED = "cycle_recovered"
 
 
 class AnomalyPort(Protocol):

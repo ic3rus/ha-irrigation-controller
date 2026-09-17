@@ -11,11 +11,18 @@ The runner is the same loop `tests/engine/` drives on a virtual clock, with
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import time, timedelta
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from homeassistant.const import ATTR_ENTITY_ID, STATE_OFF, STATE_ON
+from homeassistant.const import (
+    ATTR_ENTITY_ID,
+    EVENT_HOMEASSISTANT_STARTED,
+    STATE_OFF,
+    STATE_ON,
+)
+from homeassistant.core import CoreState
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.event import (
     async_track_point_in_time,
@@ -53,6 +60,7 @@ from custom_components.ha_irrigation_controller.engine.plan import (
 )
 from custom_components.ha_irrigation_controller.engine.ports import AnomalyKind
 from custom_components.ha_irrigation_controller.engine.runs import (
+    CycleRun,
     CycleStatus,
     ZoneRunStatus,
 )
@@ -62,6 +70,7 @@ from tests.common import (
     PUMP,
     VALVE_1,
     VALVE_2,
+    crashed_during_zone_a,
     fire_at,
     register_switch_domain,
     zone_subentry_data,
@@ -393,12 +402,14 @@ async def test_each_engine_step_pushes_the_dispatcher_signal(
         nonlocal pushes
         pushes += 1
 
+    # Subscribed AFTER the start: `async_start` reconciles and pushes once
+    # itself (Story 3.2), and these tests count the pushes of the STEPS.
+    await runner.async_start()
     unsubscribe = async_dispatcher_connect(
         hass,
         engine_state_signal(entry.entry_id),
         _on_signal,
     )
-    await runner.async_start()
 
     await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
     assert pushes == 1
@@ -1021,12 +1032,14 @@ async def test_a_command_wrapper_pushes_the_dispatcher_signal(
         nonlocal pushes
         pushes += 1
 
+    # Subscribed AFTER the start: `async_start` reconciles and pushes once
+    # itself (Story 3.2), and these tests count the pushes of the STEPS.
+    await runner.async_start()
     unsubscribe = async_dispatcher_connect(
         hass,
         engine_state_signal(entry.entry_id),
         _on_signal,
     )
-    await runner.async_start()
 
     # `async_dispatcher_send` schedules the non-callback target, so the block
     # is what actually delivers it — not an assertion timing quirk.
@@ -1411,12 +1424,14 @@ async def test_request_reload_while_busy_pushes_the_dispatcher_signal_at_once(
         nonlocal pushes
         pushes += 1
 
+    # Subscribed AFTER the start: `async_start` reconciles and pushes once
+    # itself (Story 3.2), and these tests count the pushes of the STEPS.
+    await runner.async_start()
     unsubscribe = async_dispatcher_connect(
         hass,
         engine_state_signal(entry.entry_id),
         _on_signal,
     )
-    await runner.async_start()
     await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
     assert pushes == 1
 
@@ -1618,3 +1633,314 @@ def test_the_runner_imports_no_second_timer_primitive() -> None:
         "sleep",
     ):
         assert not hasattr(timing, forbidden), forbidden
+
+
+# --------------------------------------------------------------------------
+# Startup reconciliation before anything is armed (Story 3.2)
+# --------------------------------------------------------------------------
+
+
+def make_restored_runner(
+    hass: HomeAssistant,
+) -> tuple[CycleRunner, Sequencer, MockConfigEntry]:
+    """`make_entry_runner` with the crash-during-zone-A run restored from the journal.
+
+    The plan's zone ids are `zone-1`/`zone-2` while the journaled run says
+    `zone-a`/`zone-b` — deliberately: a resumed run is its OWN snapshot
+    (AD-8), the plan is never consulted for it.
+    """
+    entry = MockConfigEntry(domain="ha_irrigation_controller")
+    sequencer = Sequencer(
+        make_plan(),
+        switches=VerifiedSwitchAdapter(
+            hass,
+            timeout_s=5,
+            cycle_id_provider=lambda: (
+                sequencer.current_run.cycle_id if sequencer.current_run else None
+            ),
+        ),
+        journal=JournalAdapter(hass),
+        anomalies=AnomalyManager(hass, entry),
+        run=CycleRun.from_dict(
+            crashed_during_zone_a(),
+            tz=dt_util.get_default_time_zone(),
+        ),
+    )
+    runner = CycleRunner(hass, entry, sequencer=sequencer, clock=HaClock())
+    return runner, sequencer, entry
+
+
+def spy_arming(monkeypatch: pytest.MonkeyPatch, order: list[str]) -> None:
+    """Record every timer registration as "arm" in `order`, pass it through."""
+    for name in ("async_track_point_in_time", "async_track_time_change"):
+        real = getattr(timing, name)
+
+        def _tracked(*args: Any, _real: Any = real, **kwargs: Any) -> Any:
+            order.append("arm")
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(timing, name, _tracked)
+
+
+async def test_start_reconciles_before_arming_any_timer(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    paris: None,
+) -> None:
+    """AC 1: orphans closed and the run resynced BEFORE a daily start or re-arm exists.
+
+    HA is running (a reload): the reconcile is immediate. The order of
+    operations is recorded — the engine's reconcile first, every arming
+    after — and the resumed boundary then fires through the ONE timer.
+    """
+    order: list[str] = []
+    spy_arming(monkeypatch, order)
+    calls = register_switch_domain(hass)
+    hass.states.async_set(PUMP, STATE_ON)
+    hass.states.async_set(VALVE_1, STATE_ON)
+    freezer.move_to("2026-07-31 07:04:00+02:00")
+    runner, sequencer, _ = make_restored_runner(hass)
+    real_reconcile = sequencer.async_reconcile
+
+    async def _spied(now: datetime) -> None:
+        order.append("reconcile")
+        await real_reconcile(now)
+
+    monkeypatch.setattr(sequencer, "async_reconcile", _spied)
+    assert sequencer.reconciled is False
+
+    await runner.async_start()
+
+    assert order[0] == "reconcile"
+    assert set(order[1:]) == {"arm"}
+    assert len(order) >= 3  # daily start(s) + the point-in-time re-arm
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls] == [
+        ("turn_off", VALVE_1),
+        ("turn_off", PUMP),
+        ("turn_on", PUMP),
+        ("turn_on", VALVE_1),
+    ]
+    run = sequencer.current_run
+    assert run is not None
+    assert run.status is CycleStatus.RUNNING
+    assert run.recovery == "resumed"
+    assert sequencer.next_wakeup() == dt_util.parse_datetime(
+        "2026-07-31 07:10:00+02:00"
+    )
+
+    # The re-armed boundary serves the resumed cycle: zone A closes, zone B
+    # (the snapshot's `switch.zone_2_valve`) opens.
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls][4:] == [
+        ("turn_off", VALVE_1),
+        ("turn_on", VALVE_2),
+    ]
+
+    runner.async_shutdown()
+
+
+async def test_start_waits_for_homeassistant_started_during_boot(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """During boot nothing happens until `EVENT_HOMEASSISTANT_STARTED`.
+
+    The governed switches may still read `unknown` while HA starts, and
+    `hass.is_running` is True while STARTING too, so the gate is the explicit
+    RUNNING state. Before the event: no command, no timer, the run untouched
+    and the engine's gate closed. After it: the reconcile, then the arming.
+    """
+    calls = register_switch_domain(hass)
+    hass.states.async_set(PUMP, STATE_ON)
+    hass.states.async_set(VALVE_1, STATE_ON)
+    freezer.move_to("2026-07-31 07:04:00+02:00")
+    hass.set_state(CoreState.starting)
+    runner, sequencer, _ = make_restored_runner(hass)
+
+    await runner.async_start()
+    await hass.async_block_till_done()
+
+    assert calls == []
+    assert sequencer.reconciled is False
+    run = sequencer.current_run
+    assert run is not None
+    assert run.recovery is None
+    # No daily start and no boundary exists yet: a tick serves nothing.
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+    assert calls == []
+
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+
+    assert sequencer.reconciled is True
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls] == [
+        ("turn_off", VALVE_1),
+        ("turn_off", PUMP),
+        ("turn_on", PUMP),
+        ("turn_on", VALVE_1),
+    ]
+    assert sequencer.next_wakeup() == dt_util.parse_datetime(
+        "2026-07-31 07:10:00+02:00"
+    )
+
+    hass.set_state(CoreState.running)
+    runner.async_shutdown()
+
+
+async def test_an_unload_before_homeassistant_started_leaves_no_listener(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Shutdown cancels the started-listener: a later start event reaches nothing."""
+    baseline = hass.bus.async_listeners().get(EVENT_HOMEASSISTANT_STARTED, 0)
+    calls = register_switch_domain(hass)
+    hass.states.async_set(PUMP, STATE_ON)
+    freezer.move_to("2026-07-31 07:04:00+02:00")
+    hass.set_state(CoreState.starting)
+    runner, sequencer, _ = make_restored_runner(hass)
+    await runner.async_start()
+    assert (
+        hass.bus.async_listeners().get(EVENT_HOMEASSISTANT_STARTED, 0) == baseline + 1
+    )
+
+    runner.async_shutdown()
+    runner.async_shutdown()  # idempotent, like every unload hook
+
+    assert hass.bus.async_listeners().get(EVENT_HOMEASSISTANT_STARTED, 0) == baseline
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+    assert calls == []
+    assert sequencer.reconciled is False
+    hass.set_state(CoreState.running)
+
+
+async def test_a_reconcile_that_raises_is_logged_and_the_timers_are_still_armed(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    paris: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A defect in the reconciler must not fail the setup (AD-4): log, arm, water.
+
+    The engine defends every port call, so an escaping exception is a bug;
+    the one thing it may not do is stop the integration from loading.
+    """
+    order: list[str] = []
+    spy_arming(monkeypatch, order)
+    register_switch_domain(hass)
+    freezer.move_to("2026-07-31 07:04:00+02:00")
+    runner, sequencer, _ = make_restored_runner(hass)
+
+    async def _boom(now: datetime) -> None:
+        msg = f"reconciler blew up at {now}"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(sequencer, "async_reconcile", _boom)
+
+    await runner.async_start()
+
+    # Both daily starts armed (morning and evening); no point-in-time handle,
+    # since the engine reports no wake-up while the gate still holds the run.
+    assert order == ["arm", "arm"]
+    assert sequencer.next_wakeup() is None
+    errors = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.ERROR
+        and "Startup reconciliation failed" in record.getMessage()
+    ]
+    assert len(errors) == 1
+    assert errors[0].exc_info is not None
+    assert "reconciler blew up" in caplog.text
+
+    runner.async_shutdown()
+
+
+async def test_shutdown_during_an_in_flight_reconcile_arms_nothing(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """An unload landing mid-reconcile must not let its tail arm a daily start.
+
+    Modelled on the in-flight `advance` test: the first verified close of
+    the orphan pass is where the unload lands. The reconcile runs to its
+    end (the hardware is made safe), but the `finally` tail arms nothing,
+    so the plan's next daily start commands nothing.
+    """
+    freezer.move_to("2026-07-31 07:04:00+02:00")
+    hass.set_state(CoreState.starting)
+    runner, sequencer, _ = make_restored_runner(hass)
+    calls: list[ServiceCall] = []
+
+    async def _handle(call: ServiceCall) -> None:
+        calls.append(call)
+        if call.service == "turn_off" and len(calls) == 1:
+            runner.async_shutdown()
+        state = STATE_ON if call.service == "turn_on" else STATE_OFF
+        hass.states.async_set(call.data[ATTR_ENTITY_ID], state, context=call.context)
+
+    hass.services.async_register("switch", "turn_on", _handle)
+    hass.services.async_register("switch", "turn_off", _handle)
+    hass.states.async_set(PUMP, STATE_ON)
+    hass.states.async_set(VALVE_1, STATE_ON)
+    hass.states.async_set(VALVE_2, STATE_OFF)
+    await runner.async_start()
+
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    # The reconcile ran to completion behind the shutdown...
+    assert sequencer.reconciled is True
+    assert calls[0].service == "turn_off"
+    commanded = len(calls)
+    assert commanded >= 2
+
+    # ...but nothing was armed: the evening start fires into nothing.
+    await fire_at(hass, freezer, "2026-07-31 20:00:00+02:00")
+    assert len(calls) == commanded
+    assert sequencer.deferred_kinds == ()
+
+    hass.set_state(CoreState.running)
+
+
+async def test_start_pushes_the_dispatcher_signal_once_after_recovery(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """The recovery is visible on the entities at once: the start tail pushes.
+
+    Two signals for a recovery: the anomaly manager's own on the
+    `cycle_recovered` report, and the runner's in the start tail — the one
+    that carries the resumed run's status to the cycle sensor.
+    """
+    register_switch_domain(hass)
+    hass.states.async_set(PUMP, STATE_ON)
+    hass.states.async_set(VALVE_1, STATE_ON)
+    freezer.move_to("2026-07-31 07:04:00+02:00")
+    runner, _, entry = make_restored_runner(hass)
+    pushes = 0
+
+    def _on_signal() -> None:
+        nonlocal pushes
+        pushes += 1
+
+    unsubscribe = async_dispatcher_connect(
+        hass,
+        engine_state_signal(entry.entry_id),
+        _on_signal,
+    )
+
+    await runner.async_start()
+    await hass.async_block_till_done()
+
+    assert pushes == 2
+
+    unsubscribe()
+    runner.async_shutdown()

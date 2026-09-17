@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import UTC, timedelta
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -23,14 +23,20 @@ from custom_components.ha_irrigation_controller.const import (
     SERVICE_CANCEL_CYCLE,
     SERVICE_RUN_NOW,
 )
+from custom_components.ha_irrigation_controller.engine.plan import CycleKind
+from custom_components.ha_irrigation_controller.engine.runs import CycleStatus
 from custom_components.ha_irrigation_controller.engine.sequencer import (
     JOURNAL_SCHEMA_VERSION,
 )
 from tests.common import (
     CONTROLLER_OPTIONS,
     controller_entry,
+    crashed_during_zone_a,
     fire_at,
+    journal_document,
     register_switch_domain,
+    run_document,
+    zone_a_document,
     zone_subentry_data,
 )
 
@@ -1022,7 +1028,10 @@ async def test_a_day_credit_round_trips_through_a_reload_and_waives_the_cycle(
     await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
 
     assert sequencer.current_run is None
-    assert sequencer.last_run is None
+    # The run-now itself was restored as `last_run` (Story 3.2) — the waived
+    # cycle is never `last_run`, so the sensors keep showing the real watering.
+    assert sequencer.last_run is not None
+    assert sequencer.last_run.cycle_id == "2026-07-31-morning"
     assert sequencer.ledger.day_credit is None
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
@@ -1276,6 +1285,346 @@ async def test_rain_baselines_round_trip_through_a_reload_and_reduce_the_next_cy
     assert (run.rain_total_mm, run.rain_source) == (15.5, GAUGE)
     zone = run.zone_runs[0]
     assert (zone.duration_s, zone.base_s, zone.rain_credit_s) == (690, 900, 210)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+# --------------------------------------------------------------------------
+# The machine state (Story 3.2): run, last_run, deferred — the trust boundary
+# --------------------------------------------------------------------------
+
+
+def domain_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return this domain's WARNING messages."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and DOMAIN in record.name
+    ]
+
+
+async def test_load_seed_restores_the_machine_state_ha_local(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    paris: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`run`, `last_run` and `deferred` come back as written, in HA's timezone.
+
+    The instants are stored in UTC and rebuilt in Europe/Paris: the engine's
+    contract is HA-local aware datetimes, and the irrigation day is the LOCAL
+    calendar date. A clean read logs nothing.
+    """
+    running = crashed_during_zone_a()
+    completed = run_document(
+        zone_a_document(
+            status="completed",
+            actual_start="2026-07-30T17:00:00+00:00",
+            actual_end="2026-07-30T17:10:00+00:00",
+            open_confirmed=True,
+            close_confirmed=True,
+        ),
+        status="completed",
+        cycle_id="2026-07-30-evening",
+        kind="evening",
+        configured_start="2026-07-30T17:00:00+00:00",
+        scheduled_start="2026-07-30T17:00:00+00:00",
+        pump_off_confirmed=True,
+    )
+    hass_storage[STORAGE_KEY] = journal_document(
+        run=running,
+        zone_index=0,
+        last_run=completed,
+        deferred=[{"kind": "evening", "reference": "2026-07-31T17:59:00+00:00"}],
+    )
+
+    seed = await JournalAdapter(hass).async_load_seed()
+
+    assert seed.run is not None
+    assert seed.run.as_dict() == running
+    assert seed.run.status is CycleStatus.RUNNING
+    assert seed.run.configured_start.isoformat() == "2026-07-31T07:00:00+02:00"
+    assert str(seed.run.configured_start.tzinfo) == "Europe/Paris"
+    assert seed.run.zone_runs[0].actual_start is not None
+    assert seed.run.zone_runs[0].actual_start.isoformat() == "2026-07-31T07:00:00+02:00"
+    assert seed.last_run is not None
+    assert seed.last_run.as_dict() == completed
+    assert seed.last_run.status is CycleStatus.COMPLETED
+    assert [(kind, at.isoformat()) for kind, at in seed.deferred] == [
+        (CycleKind.EVENING, "2026-07-31T19:59:00+02:00"),
+    ]
+    assert seed.run_unreadable is None
+    assert domain_warnings(caplog) == []
+
+
+async def test_a_journal_written_before_3_2_seeds_no_machine_state(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No `run`/`last_run`/`deferred` keys at all: idle, nothing unreadable, no log."""
+    hass_storage[STORAGE_KEY] = {
+        "version": JOURNAL_SCHEMA_VERSION,
+        "key": STORAGE_KEY,
+        "data": {"schema_version": JOURNAL_SCHEMA_VERSION, "history": []},
+    }
+
+    seed = await JournalAdapter(hass).async_load_seed()
+
+    assert seed.run is None
+    assert seed.last_run is None
+    assert seed.deferred == []
+    assert seed.run_unreadable is None
+    assert domain_warnings(caplog) == []
+
+
+async def test_an_idle_journal_seeds_no_run(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+) -> None:
+    """`run: None` — the document every completed cycle leaves — is not a recovery."""
+    hass_storage[STORAGE_KEY] = journal_document(run=None, last_run=None, deferred=[])
+
+    seed = await JournalAdapter(hass).async_load_seed()
+
+    assert (seed.run, seed.last_run, seed.deferred, seed.run_unreadable) == (
+        None,
+        None,
+        [],
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    "raw", ["running", 7, ["run"], True], ids=["str", "int", "list", "bool"]
+)
+async def test_a_run_that_is_not_a_mapping_is_unreadable(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+    raw: object,
+) -> None:
+    """Matrix "unreadable run": not a mapping → `{}` handed over, one WARNING."""
+    hass_storage[STORAGE_KEY] = journal_document(run=raw)
+
+    seed = await JournalAdapter(hass).async_load_seed()
+
+    assert seed.run is None
+    assert seed.run_unreadable == {}
+    warnings = domain_warnings(caplog)
+    assert len(warnings) == 1
+    assert "not a mapping" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "key"),
+    [
+        ({"status": "paused"}, "status"),
+        ({"kind": "noon"}, "kind"),
+        ({"configured_start": "yesterday"}, "configured_start"),
+        ({"scheduled_start": "2026-07-31T05:00:00"}, "scheduled_start"),
+        ({"pump_entity_id": None}, "pump_entity_id"),
+        ({"zones": {}}, "zones"),
+        ({"zones": [zone_a_document(duration_s="600")]}, "zones[0].duration_s"),
+        ({"rain_total_mm": "12"}, "rain_total_mm"),
+        ({"recovery": False}, "recovery"),
+    ],
+    ids=[
+        "status",
+        "kind",
+        "start-unparsable",
+        "start-naive",
+        "pump-none",
+        "zones-mapping",
+        "zone-duration-str",
+        "rain-str",
+        "recovery-bool",
+    ],
+)
+async def test_a_drifted_run_is_unreadable_and_names_the_offending_key(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+    mutation: dict[str, object],
+    key: str,
+) -> None:
+    """Matrix "unreadable run": raw document handed over, the WARNING names the key."""
+    raw = {**crashed_during_zone_a(), **mutation}
+    hass_storage[STORAGE_KEY] = journal_document(run=raw)
+
+    seed = await JournalAdapter(hass).async_load_seed()
+
+    assert seed.run is None
+    assert seed.run_unreadable == raw
+    warnings = domain_warnings(caplog)
+    assert len(warnings) == 1
+    assert "unreadable" in warnings[0]
+    assert key in warnings[0]
+
+
+async def test_an_instant_that_cannot_be_converted_is_refused_not_raised(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An instant at `datetime`'s edge overflows `astimezone`: setup must still load.
+
+    In `run` the document is refused and handed over raw; in `deferred` the
+    entry is dropped alone. Neither raises out of `async_load_seed`.
+    """
+    edge = "9999-12-31T23:00:00-02:00"
+    raw = {**crashed_during_zone_a(), "configured_start": edge}
+    hass_storage[STORAGE_KEY] = journal_document(
+        run=raw,
+        deferred=[
+            {"kind": "evening", "reference": edge},
+            {"kind": "morning", "reference": "2026-07-31T05:00:00+00:00"},
+        ],
+    )
+
+    seed = await JournalAdapter(hass).async_load_seed()
+
+    assert seed.run is None
+    assert seed.run_unreadable == raw
+    assert [kind for kind, _ in seed.deferred] == [CycleKind.MORNING]
+    warnings = domain_warnings(caplog)
+    assert len(warnings) == 1
+    assert "configured_start" in warnings[0]
+    assert "out of range" in warnings[0]
+
+
+async def test_a_missing_run_key_is_unreadable(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+) -> None:
+    """A key `as_dict` always writes is required on read — strict, not defaulted."""
+    raw = crashed_during_zone_a()
+    del raw["pump_on_confirmed"]
+    hass_storage[STORAGE_KEY] = journal_document(run=raw)
+
+    seed = await JournalAdapter(hass).async_load_seed()
+
+    # `pump_on_confirmed` absent reads as `None` through `.get` — a legal
+    # confirmation value — so the strictness is on the TYPE, not the key's
+    # presence, for the three-valued confirmations. `cycle_id` has no such
+    # legal absence.
+    assert seed.run is not None
+    del raw["cycle_id"]
+    hass_storage[STORAGE_KEY] = journal_document(run=raw)
+    seed = await JournalAdapter(hass).async_load_seed()
+    assert seed.run is None
+    assert seed.run_unreadable == raw
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["done", 3, {**crashed_during_zone_a(), "kind": 3}, {"cycle_id": "x"}],
+    ids=["str", "int", "kind-int", "missing-keys"],
+)
+async def test_a_malformed_last_run_reads_as_none_with_one_warning(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+    raw: object,
+) -> None:
+    """Matrix "last_run malformed": None (sensors `unknown` as before), WARNING once."""
+    hass_storage[STORAGE_KEY] = journal_document(run=None, last_run=raw)
+
+    seed = await JournalAdapter(hass).async_load_seed()
+
+    assert seed.last_run is None
+    assert seed.run_unreadable is None
+    assert len(domain_warnings(caplog)) == 1
+
+
+async def test_load_seed_keeps_only_the_deferred_entries_it_can_read(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Entries are filtered ONE BY ONE, silently: a bad one must not lose the others."""
+    hass_storage[STORAGE_KEY] = journal_document(
+        deferred=[
+            {"kind": "evening", "reference": "2026-07-31T17:59:00+00:00"},
+            "evening",
+            {"kind": "noon", "reference": "2026-07-31T17:59:00+00:00"},
+            {"kind": "morning"},
+            {"kind": "morning", "reference": "2026-07-31T05:00:00"},
+            {"kind": "morning", "reference": 5},
+            {"kind": 7, "reference": "2026-07-31T05:00:00+00:00"},
+            {"kind": "morning", "reference": "tomorrow"},
+            {"kind": "morning", "reference": "2026-08-01T05:00:00+00:00"},
+        ],
+    )
+
+    seed = await JournalAdapter(hass).async_load_seed()
+
+    # Compared as instants: this test runs in PHCC's default timezone, and
+    # the engine receives the references converted into it.
+    assert [(kind, at.astimezone(UTC).isoformat()) for kind, at in seed.deferred] == [
+        (CycleKind.EVENING, "2026-07-31T17:59:00+00:00"),
+        (CycleKind.MORNING, "2026-08-01T05:00:00+00:00"),
+    ]
+    assert domain_warnings(caplog) == []
+
+
+@pytest.mark.parametrize("raw", ["evening", {"kind": "evening"}, None, 3])
+async def test_a_deferred_section_that_is_not_a_list_reads_as_empty(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    raw: object,
+) -> None:
+    """A lost deferral is the watchdog's to notice (Story 3.3), never a setup crash."""
+    hass_storage[STORAGE_KEY] = journal_document(deferred=raw)
+
+    assert (await JournalAdapter(hass).async_load_seed()).deferred == []
+
+
+async def test_the_last_run_round_trips_through_a_reload(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Written by the one writer at completion, read back by the one reader at setup.
+
+    The completion write files the finished run under `run`; the rebuilt
+    engine recognises a terminal run as `last_run`, not as a cycle to
+    recover: nothing is commanded, nothing is reported, and the sensors have
+    their figure back.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Irrigation Controller",
+        data={},
+        options=dict(CONTROLLER_OPTIONS),
+        subentries_data=[zone_subentry_data("Zone A", "switch.zone_1_valve")],
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    calls = register_switch_domain(hass)
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass_storage[STORAGE_KEY]["data"]["run"]["status"] == "completed"
+    commanded = len(calls)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    sequencer = entry.runtime_data.sequencer
+    assert sequencer.current_run is None
+    last = sequencer.last_run
+    assert last is not None
+    assert last.cycle_id == "2026-07-31-morning"
+    assert last.status is CycleStatus.COMPLETED
+    assert len(calls) == commanded
+    assert entry.runtime_data.anomalies.open_anomalies == ()
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

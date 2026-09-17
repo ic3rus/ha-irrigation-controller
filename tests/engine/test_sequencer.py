@@ -830,6 +830,10 @@ async def test_journal_snapshot_carries_what_a_restore_needs() -> None:
     active = final["run"]
     assert isinstance(active, dict)
     assert active["cycle_id"] == "2026-07-31-evening"
+    # Story 3.2's marker is part of the written shape: None for a run that
+    # was never recovered, so `CycleRun.from_dict` finds the key it expects.
+    assert active["recovery"] is None
+    assert last_run["recovery"] is None
 
 
 # --------------------------------------------------------------------------

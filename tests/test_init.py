@@ -666,50 +666,90 @@ async def test_an_invalid_mid_cycle_edit_keeps_the_old_plan_until_the_reload_fai
     assert "morning_duration" in entry.reason
 
 
-async def test_a_forced_reload_mid_cycle_closes_the_valve_and_the_pump(
+async def test_a_forced_reload_mid_cycle_suspends_then_resumes_the_cycle(
     hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
     running_entry: MockConfigEntry,
 ) -> None:
-    """Decision 1 end to end: `async_reload` while RUNNING suspends, then reloads.
+    """Decision 1 end to end: `async_reload` while RUNNING suspends, then RESUMES.
 
     The live valve and the pump are commanded off through the real services
-    before the engine is torn down, the OLD manager holds `cycle_interrupted`,
-    and the entry comes back LOADED — idle, because nothing restores the run
-    before Story 3.2.
+    before the engine is torn down and the OLD manager holds
+    `cycle_interrupted`. The rebuilt entry (Story 3.2) reads the RUNNING
+    intent back from the journal and reconciles: the orphan pass finds
+    everything already OFF, and a live zone whose valve is OFF cannot prove
+    what it watered — so it is re-run IN FULL from `now` (fail-wet, bounded
+    by one zone duration; the 1.7 suspend keeps its semantics), the pump
+    goes back on, `cycle_recovered{outcome: resumed}` is reported and
+    `cycle_interrupted` cleared as superseded. Zone B follows on its
+    journaled duration, re-timed back-to-back.
     """
     entry = running_entry
     anomalies_before = entry.runtime_data.anomalies
+    run_before = entry.runtime_data.sequencer.current_run
+    assert run_before is not None
+    zone_a = next(
+        subentry.subentry_id
+        for subentry in entry.subentries.values()
+        if subentry.title == "Zone A"
+    )
     # The fake was registered by the fixture; its calls are what `switch.*`
     # now resolve to, so a fresh recorder is not needed — read the states.
     assert hass.states.is_state(PUMP, "on")
     assert hass.states.is_state(VALVE_1, "on")
 
+    freezer.move_to("2026-07-31 07:04:00+02:00")
     assert await hass.config_entries.async_reload(entry.entry_id)
     await hass.async_block_till_done()
 
-    assert hass.states.is_state(VALVE_1, "off")
-    assert hass.states.is_state(PUMP, "off")
+    # The suspend's anomaly is on the OLD manager...
     assert AnomalyKind.CYCLE_INTERRUPTED in {
         record.kind for record in anomalies_before.open_anomalies
     }
-    last = anomalies_before.last_anomaly
-    assert last is not None
-    assert last.context["zone_id"] == next(
-        subentry.subentry_id
-        for subentry in entry.subentries.values()
-        if subentry.title == "Zone A"
-    )
     assert entry.state is ConfigEntryState.LOADED
     assert entry.runtime_data.anomalies is not anomalies_before
-    assert entry.runtime_data.sequencer.current_run is None
-    # The rebuilt manager re-seeded the interruption from its Repairs issue
-    # (Story 3.1): health survives the reload, and the issue is still there.
+    # ...and the rebuilt entry resumed the cycle: valve and pump back on, the
+    # SAME run (id, actual_start, planned windows) RUNNING on zone A.
+    run = entry.runtime_data.sequencer.current_run
+    assert run is not None
+    assert run.cycle_id == run_before.cycle_id
+    assert run.status is CycleStatus.RUNNING
+    assert run.recovery == "resumed"
+    zone_run_a, zone_run_b = run.zone_runs
+    assert zone_run_a.actual_start is not None
+    assert zone_run_a.actual_start.isoformat() == "2026-07-31T07:04:00+02:00"
+    assert zone_run_a.planned_end.isoformat() == "2026-07-31T07:14:00+02:00"
+    assert zone_run_b.planned_start.isoformat() == "2026-07-31T07:14:00+02:00"
+    assert zone_run_b.planned_end.isoformat() == "2026-07-31T07:24:00+02:00"
+    assert [zone.duration_s for zone in run.zone_runs] == [600, 600]
+    assert hass.states.is_state(PUMP, "on")
+    assert hass.states.is_state(VALVE_1, "on")
+    # One `cycle_recovered` issue, `cycle_interrupted` cleared as superseded.
     assert [
         record.issue_id for record in entry.runtime_data.anomalies.open_anomalies
-    ] == [
-        "cycle_interrupted",
-    ]
-    assert ir.async_get(hass).async_get_issue(DOMAIN, "cycle_interrupted") is not None
+    ] == ["cycle_recovered"]
+    last = entry.runtime_data.anomalies.last_anomaly
+    assert last is not None
+    assert last.context["outcome"] == "resumed"
+    assert last.context["zone_id"] == zone_a
+    registry = ir.async_get(hass)
+    assert registry.async_get_issue(DOMAIN, "cycle_recovered") is not None
+    assert registry.async_get_issue(DOMAIN, "cycle_interrupted") is None
+
+    # The resumed cycle runs out on its re-timed windows, never re-quoted.
+    await fire_at(hass, freezer, "2026-07-31 07:13:59+02:00")
+    assert hass.states.is_state(VALVE_1, "on")
+    await fire_at(hass, freezer, "2026-07-31 07:14:00+02:00")
+    assert hass.states.is_state(VALVE_1, "off")
+    assert hass.states.is_state(VALVE_2, "on")
+    await fire_at(hass, freezer, "2026-07-31 07:24:00+02:00")
+    assert hass.states.is_state(VALVE_2, "off")
+    assert hass.states.is_state(PUMP, "off")
+    finished = entry.runtime_data.sequencer.last_run
+    assert finished is not None
+    assert finished.status is CycleStatus.COMPLETED
+    assert finished.recovery == "resumed"
+    assert entry.runtime_data.sequencer.ledger.deficit_s(zone_a) == 0
 
 
 async def test_the_cycle_interrupted_push_survives_the_unload_that_raised_it(
@@ -723,7 +763,8 @@ async def test_the_cycle_interrupted_push_survives_the_unload_that_raised_it(
     the on-unload hooks, before a real notify target (which awaits network)
     ever delivered. The handler here parks on an event until the reload has
     fully completed, then records — a cancelled task never reaches the
-    record.
+    record. The rebuilt entry's resume (Story 3.2) pushes `cycle_recovered`
+    as well: two anomalies, two pushes.
     """
     entry = running_entry
     delivered: list[dict[str, Any]] = []
@@ -743,8 +784,12 @@ async def test_the_cycle_interrupted_push_survives_the_unload_that_raised_it(
     release.set()
     await hass.async_block_till_done(wait_background_tasks=True)
 
-    assert [call[ATTR_ENTITY_ID] for call in delivered] == ["notify.mobile_app_phone"]
+    assert [call[ATTR_ENTITY_ID] for call in delivered] == [
+        "notify.mobile_app_phone",
+        "notify.mobile_app_phone",
+    ]
     assert "cycle interrupted" in delivered[0]["title"]
+    assert "cycle recovered" in delivered[1]["title"]
 
 
 async def test_the_listener_reloads_at_once_when_the_entry_has_no_runtime(

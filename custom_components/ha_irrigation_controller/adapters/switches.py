@@ -80,6 +80,29 @@ class VerifiedSwitchAdapter:
         """Command `entity_id` off; return True iff the actuation confirmed."""
         return await self._command(entity_id, target_state=STATE_OFF)
 
+    async def async_is_on(self, entity_id: str) -> bool | None:
+        """Read the ACTUAL state of `entity_id`: True on, False off, else None.
+
+        The reconciler's resync input (Story 3.2). Read through the same
+        alias map the commands use, so a valve renamed while its cycle ran
+        is read under the id the registry knows now. Anything that is not a
+        plain `on`/`off` — no state at all, `unknown`, `unavailable` (the
+        switch's integration may still be booting) — is `None`: the engine
+        reads doubt as "not OFF, watering unproven", the fail-wet direction.
+
+        A coroutine for the port's sake only (the engine awaits every switch
+        read the way it awaits every command); the read itself is the
+        synchronous state-machine lookup.
+        """
+        state = self._hass.states.get(self._aliases.get(entity_id, entity_id))
+        if state is None:
+            return None
+        if state.state == STATE_ON:
+            return True
+        if state.state == STATE_OFF:
+            return False
+        return None
+
     @callback
     def async_rename(self, old_entity_id: str, new_entity_id: str) -> None:
         """Route every future command for `old_entity_id` to `new_entity_id`.

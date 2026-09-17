@@ -152,7 +152,8 @@
                     "running": "Running",
                     "completed": "Completed",
                     "cancelled": "Cancelled",
-                    "waived": "Waived"
+                    "waived": "Waived",
+                    "interrupted": "Interrupted"
                 }
             },
             "last_watering_duration": {
@@ -313,7 +314,18 @@
                 "step": {
                     "confirm": {
                         "title": "A cycle was interrupted",
-                        "description": "Cycle `{cycle_id}` was interrupted while it was running (zone `{zone_id}`) because the integration was reloaded, disabled or removed. The open valve and the pump were closed; the cycle was not resumed and the missed watering is carried forward as water debt. Acknowledging clears this issue; it also clears itself when the next cycle completes or is cancelled."
+                        "description": "Cycle `{cycle_id}` was interrupted while it was running (zone `{zone_id}`) because the integration was reloaded, disabled or removed. The open valve and the pump were closed. When the integration loads again the cycle is recovered: resumed on the same irrigation day, otherwise closed with the missed watering carried forward as water debt. Acknowledging clears this issue; it also clears itself when the cycle is recovered, or when the next cycle completes or is cancelled."
+                    }
+                }
+            }
+        },
+        "cycle_recovered": {
+            "title": "A cycle was recovered at startup",
+            "fix_flow": {
+                "step": {
+                    "confirm": {
+                        "title": "A cycle was recovered at startup",
+                        "description": "Cycle `{cycle_id}` was found in progress in the journal when the integration loaded (zone `{zone_id}` is the zone that was watering, `-` when none was). Any valve or pump of that cycle still on was switched off first. Outcome: `{outcome}` — `resumed` means the cycle continued on the same irrigation day with its original durations; `closed` means it was on an earlier day and was filed as interrupted, with each zone's missed watering carried forward as water debt; `discarded` means the journaled cycle could not be read, so every configured valve and the pump were switched off and nothing was booked. Acknowledging clears this issue; it does not clear itself."
                     }
                 }
             }

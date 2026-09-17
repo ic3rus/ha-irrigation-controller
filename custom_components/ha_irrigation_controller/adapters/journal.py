@@ -4,32 +4,44 @@ AD-2: the engine journals its state on every transition through this adapter
 into the single versioned `Store`.
 
 Writes are the whole snapshot; what is read back is the SEED
-(`async_load_seed`): the `history` section, the `season_enabled` mode flag and
-the water-debt `ledger` section, in ONE read. Machine state — `run`,
-`last_run`, `zone_index`, `deferred` — is deliberately never loaded here:
-restoring it to resume an in-flight cycle is AD-11's recovery path and it
-belongs to Story 3.2, which extends this seam rather than replacing it.
+(`async_load_seed`), in ONE read: the `history` section, the `season_enabled`
+mode flag, the water-debt `ledger` section and — since Story 3.2, AD-11's
+recovery path — the machine state: the in-flight `run`, the `last_run` and
+the `deferred` queue. `zone_index` is written but never read: the engine
+derives the live slot from the zone statuses.
+
+Every restored field crosses a TRUST BOUNDARY here (a restored backup, a hand
+edit, schema drift): the `run` is rebuilt through `CycleRun.from_dict`, which
+refuses any key `as_dict` writes with a non-None value that is absent or of
+another type (the None-legal keys read as None when absent) — a refused run is
+handed to
+the engine as `run_unreadable` so the reconciler can close every configured
+switch without trusting it; a malformed `last_run` reads as None; malformed
+`deferred` entries are dropped one by one.
 
 One reader method rather than one per key, deliberately: `Store.async_load`
 clears its `_load_future` in a `finally`, so two calls are two reads of the
-same document. Story 3.2 grows `JournalSeed` instead of adding a fourth
-method.
+same document.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from datetime import date
+from dataclasses import dataclass, field
+from datetime import date, datetime
 from typing import TYPE_CHECKING, Final
 
 from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 
 from ..const import DOMAIN, LOGGER  # noqa: TID252
-from ..engine.runs import MANUAL_KEY, is_manual  # noqa: TID252
+from ..engine.plan import CycleKind  # noqa: TID252
+from ..engine.runs import MANUAL_KEY, CycleRun, is_manual  # noqa: TID252
 from ..engine.sequencer import JOURNAL_SCHEMA_VERSION  # noqa: TID252
 
 if TYPE_CHECKING:
+    from datetime import tzinfo
+
     from homeassistant.core import HomeAssistant
 
 # NFR2 wants a SHORT debounce — coalesce the write bursts of a zone boundary
@@ -46,11 +58,16 @@ STORAGE_KEY: Final = f"{DOMAIN}.journal"
 class JournalSeed:
     """What a freshly built `Sequencer` is seeded with after a load.
 
-    Explicitly NOT machine state: outcome records are history, the season is
-    a runtime MODE, and the ledger is accounting BETWEEN cycles (Story 2.2).
-    None of them resumes an in-flight cycle, so reading them back does not
-    make this the AD-11 recovery path — Story 3.2 owns that and extends this
-    dataclass.
+    Three fields are NOT machine state: outcome records are history, the
+    season is a runtime MODE, and the ledger is accounting BETWEEN cycles
+    (Story 2.2). Four are (Story 3.2, AD-11): `run` is the in-flight cycle
+    exactly as the last transition journaled it (or the completion write's
+    terminal run, which the engine files as `last_run`), `last_run` the
+    completed cycle the zone sensors keep showing across a reload,
+    `deferred` the `(kind, reference)` queue, and `run_unreadable` the raw
+    `run` document when it was present but could not be validated (`{}`
+    when it was not even a mapping) — None otherwise. Seeding is not
+    resuming: the engine acts on none of them before `async_reconcile`.
 
     `ledger` is the section in the shape `Ledger.as_dict` writes —
     `{"settled_cycle_id": str | None, "deficits": {zone_id: int},
@@ -74,6 +91,10 @@ class JournalSeed:
     history: list[dict[str, object]]
     season_enabled: bool
     ledger: dict[str, object]
+    run: CycleRun | None = None
+    last_run: CycleRun | None = None
+    deferred: list[tuple[CycleKind, datetime]] = field(default_factory=list)
+    run_unreadable: dict[str, object] | None = None
 
 
 class JournalAdapter:
@@ -128,12 +149,29 @@ class JournalAdapter:
         quotes the next cycle on base durations. Fail-wet (AD-4): the worst a
         corrupt ledger can do is forget a debt, never invent one or crash the
         setup, and nothing is logged for it.
+
+        The machine state (Story 3.2) is where the boundary bites hardest,
+        because the reconciler COMMANDS from it. `run` goes through
+        `CycleRun.from_dict`, strict: a document that is present but not
+        exactly the written shape is never trusted — it is logged at WARNING
+        with the offending key and handed over raw as `run_unreadable`, so
+        the reconciler closes every configured switch and books nothing.
+        `last_run` is read the same way but a malformed one is simply None
+        (one WARNING; the zone sensors read `unknown` as they did before
+        this story). `deferred` entries are kept one by one when they are a
+        mapping with a known `kind` and an aware `reference`; the engine
+        drops the ones on another irrigation day itself, since that needs
+        the clock. Instants are converted into Home Assistant's configured
+        timezone: the engine's contract is HA-local aware datetimes, and
+        the irrigation day is the LOCAL calendar date.
         """
         stored = await self._store.async_load()
         if not isinstance(stored, dict):
             return JournalSeed(history=[], season_enabled=True, ledger=_empty_ledger())
         history = stored.get("history")
         season = stored.get("season_enabled")
+        tz = dt_util.get_default_time_zone()
+        run, unreadable = _seed_run(stored.get("run"), tz)
         return JournalSeed(
             history=(
                 [
@@ -146,6 +184,10 @@ class JournalAdapter:
             ),
             season_enabled=season if isinstance(season, bool) else True,
             ledger=_seed_ledger(stored.get("ledger")),
+            run=run,
+            last_run=_seed_last_run(stored.get("last_run"), tz),
+            deferred=_seed_deferred(stored.get("deferred"), tz),
+            run_unreadable=unreadable,
         )
 
     async def async_save(self, snapshot: dict[str, object]) -> None:
@@ -232,6 +274,91 @@ def _seed_entry(entry: object) -> dict[str, object] | None:
         MANUAL_KEY: is_manual(entry),
         "waived_by": waived_by if isinstance(waived_by, str) else None,
     }
+
+
+def _seed_run(
+    raw: object,
+    tz: tzinfo,
+) -> tuple[CycleRun | None, dict[str, object] | None]:
+    """Return `(run, None)`, `(None, None)` for no run, or `(None, raw)` when refused.
+
+    The in-flight half of the Story 3.2 trust boundary. `None` (the idle
+    journal every completed cycle eventually leaves... or one written by the
+    engine with nothing active) is the nominal case. Anything else must
+    rebuild through `CycleRun.from_dict` exactly; a refusal is logged at
+    WARNING naming the offending key and the raw document — `{}` when it is
+    not even a mapping — travels to the engine as `run_unreadable`, whose
+    reconciler then commands every configured switch off. The document is
+    never trusted, but its `cycle_id` is worth naming in the anomaly, so it
+    is handed over rather than dropped here.
+    """
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict):
+        LOGGER.warning(
+            "Journaled run is not a mapping (%s); discarding it at startup",
+            type(raw).__name__,
+        )
+        return None, {}
+    try:
+        return CycleRun.from_dict(raw, tz=tz), None
+    except (ValueError, TypeError) as err:
+        LOGGER.warning(
+            "Journaled run is unreadable (%s); discarding it at startup", err
+        )
+        return None, raw
+
+
+def _seed_last_run(raw: object, tz: tzinfo) -> CycleRun | None:
+    """Return the completed run the sensors keep showing, or None when unreadable.
+
+    The same strict rebuild as `_seed_run`, but nothing is commanded from a
+    `last_run`, so a refusal costs only the sensors' continuity: they read
+    `unknown` until the next cycle, exactly as before Story 3.2. One WARNING.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        LOGGER.warning("Journaled last run is not a mapping; ignoring it")
+        return None
+    try:
+        return CycleRun.from_dict(raw, tz=tz)
+    except (ValueError, TypeError) as err:
+        LOGGER.warning("Journaled last run is unreadable (%s); ignoring it", err)
+        return None
+
+
+def _seed_deferred(raw: object, tz: tzinfo) -> list[tuple[CycleKind, datetime]]:
+    """Return the deferred queue fit for the engine — bad entries dropped one by one.
+
+    Each entry the engine wrote is `{"kind": <CycleKind value>, "reference":
+    <utc_iso instant>}`; an entry is kept only in exactly that shape, with
+    the reference converted to HA-local. Whether an entry is STALE (on
+    another irrigation day) is the engine's call, since it needs `now`.
+    Anything that is not a list reads as an empty queue: a lost deferral is
+    a cycle the watchdog (Story 3.3) will notice, never a crash at setup.
+    """
+    if not isinstance(raw, list):
+        return []
+    kept: list[tuple[CycleKind, datetime]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        kind = entry.get("kind")
+        reference = entry.get("reference")
+        if not isinstance(kind, str) or not isinstance(reference, str):
+            continue
+        try:
+            parsed_kind = CycleKind(kind)
+            instant = datetime.fromisoformat(reference)
+            if instant.tzinfo is None:
+                continue
+            kept.append((parsed_kind, instant.astimezone(tz)))
+        except ValueError, OverflowError:
+            # An unknown kind, an unparsable instant, or one at the edge of
+            # `datetime`'s range that cannot be converted — dropped alone.
+            continue
+    return kept
 
 
 def _empty_ledger() -> dict[str, object]:

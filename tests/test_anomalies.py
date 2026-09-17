@@ -168,6 +168,7 @@ async def test_first_report_opens_an_issue_pushes_once_and_fires_the_event(
         "zone_id": "zone-1",
         "cycle_id": "2026-07-31-morning",
         "role": "-",
+        "outcome": "-",
     }
     assert issue.data is not None
     assert issue.data["kind"] == "valve_open_unconfirmed"
@@ -262,6 +263,16 @@ async def test_a_repeat_report_refreshes_the_issue_and_never_pushes_again(
             "cycle_interrupted",
         ),
         (
+            AnomalyKind.CYCLE_RECOVERED,
+            {
+                "cycle_id": "2026-07-31-morning",
+                "kind": "morning",
+                "zone_id": "zone-1",
+                "outcome": "resumed",
+            },
+            "cycle_recovered",
+        ),
+        (
             AnomalyKind.JOURNAL_SAVE_FAILED,
             {"error": "OSError()"},
             "journal_save_failed",
@@ -305,7 +316,64 @@ async def test_absent_placeholders_read_as_a_dash(
         "zone_id": "-",
         "cycle_id": "2026-07-31-morning",
         "role": "-",
+        "outcome": "-",
     }
+
+
+async def test_cycle_recovered_carries_its_outcome_and_is_never_auto_cleared(
+    hass: HomeAssistant,
+    manager: AnomalyManager,
+    notify: RecordingNotify,
+) -> None:
+    """Story 3.2 AC 4: one issue, one push, an `outcome` placeholder — acknowledge only.
+
+    The engine never calls `clear` for this kind, so the only way the issue
+    goes is the operator's; a second recovery on a later restart refreshes
+    the same controller-level issue with the new outcome and pushes nothing.
+    """
+    manager.report(
+        AnomalyKind.CYCLE_RECOVERED,
+        {
+            "cycle_id": "2026-07-31-morning",
+            "kind": "morning",
+            "zone_id": "zone-1",
+            "outcome": "resumed",
+        },
+    )
+    await hass.async_block_till_done()
+
+    issue = issue_of(hass, "cycle_recovered")
+    assert issue is not None
+    assert issue.translation_placeholders == {
+        "entity_id": "-",
+        "zone_id": "zone-1",
+        "cycle_id": "2026-07-31-morning",
+        "role": "-",
+        "outcome": "resumed",
+    }
+    assert len(notify.sent) == 1
+    assert "cycle recovered" in notify.sent[0][0]
+    assert "outcome resumed" in notify.sent[0][1]
+
+    manager.report(
+        AnomalyKind.CYCLE_RECOVERED,
+        {
+            "cycle_id": "2026-08-01-morning",
+            "kind": "morning",
+            "zone_id": None,
+            "outcome": "closed",
+        },
+    )
+    await hass.async_block_till_done()
+    issue = issue_of(hass, "cycle_recovered")
+    assert issue is not None
+    assert issue.translation_placeholders is not None
+    assert issue.translation_placeholders["outcome"] == "closed"
+    assert len(notify.sent) == 1
+
+    ir.async_delete_issue(hass, DOMAIN, "cycle_recovered")
+    await hass.async_block_till_done()
+    assert manager.open_anomalies == ()
 
 
 async def test_three_anomalies_make_three_issues_three_pushes_three_health_entries(

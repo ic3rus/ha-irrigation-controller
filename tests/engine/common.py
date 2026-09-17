@@ -59,18 +59,27 @@ class PortError(Exception):
 
 
 class FakeSwitchPort:
-    """Records every command.
+    """Records every command; answers state reads from `states`.
 
     Commands listed in `failing` report not-confirmed; commands listed in
     `raising` leak a `PortError` instead — a real adapter is supposed to
     translate its own failures, and the engine must survive one that does not.
+
+    `states` (Story 3.2) is what `async_is_on` answers per entity id: True
+    on, False off, None doubtful — and an entity with no entry at all reads
+    None too, the way a switch with no state does. A CONFIRMED command flips
+    the entry like real hardware would; an unconfirmed one leaves it. Ids in
+    `reads_raising` make the read leak a `PortError`.
     """
 
     def __init__(self) -> None:
-        """Start with an empty command log and nothing failing."""
+        """Start with an empty command log, nothing failing, no states known."""
         self.commands: list[tuple[str, str]] = []
         self.failing: set[tuple[str, str]] = set()
         self.raising: set[tuple[str, str]] = set()
+        self.states: dict[str, bool | None] = {}
+        self.reads: list[str] = []
+        self.reads_raising: set[str] = set()
 
     async def async_turn_on(self, entity_id: str) -> bool:
         """Record the on command and report its confirmation outcome."""
@@ -80,12 +89,23 @@ class FakeSwitchPort:
         """Record the off command and report its confirmation outcome."""
         return self._command("off", entity_id)
 
+    async def async_is_on(self, entity_id: str) -> bool | None:
+        """Answer the entity's state from `states`, or leak when told to."""
+        self.reads.append(entity_id)
+        if entity_id in self.reads_raising:
+            msg = f"adapter blew up reading {entity_id}"
+            raise PortError(msg)
+        return self.states.get(entity_id)
+
     def _command(self, action: str, entity_id: str) -> bool:
         self.commands.append((action, entity_id))
         if (action, entity_id) in self.raising:
             msg = f"adapter blew up commanding {action} {entity_id}"
             raise PortError(msg)
-        return (action, entity_id) not in self.failing
+        confirmed = (action, entity_id) not in self.failing
+        if confirmed:
+            self.states[entity_id] = action == "on"
+        return confirmed
 
 
 class FakeJournalPort:
