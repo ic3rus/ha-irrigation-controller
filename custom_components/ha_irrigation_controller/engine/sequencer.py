@@ -91,6 +91,7 @@ class Sequencer:
         last_run: CycleRun | None = None,
         deferred: Sequence[tuple[CycleKind, datetime]] | None = None,
         run_unreadable: Mapping[str, object] | None = None,
+        watchdog_since: datetime | None = None,
     ) -> None:
         """Wire the sequencer to its plan, its ports and any prior state.
 
@@ -121,6 +122,13 @@ class Sequencer:
         mapping): the reconciler then closes every configured switch and
         reports the discard without ever trusting it.
 
+        `watchdog_since` (Story 3.3) is the instant this controller first
+        became observable — the journal's stamp, `None` on a first install or
+        when it could not be read. It is the watchdog's FLOOR: a cycle window
+        that closed at or before it was never ours to run. `async_reconcile`
+        is the one place it is ever set, so a machine driven directly (every
+        virtual-clock suite) keeps `None` and no floor at all.
+
         `season_enabled` defaults to True — fail-wet (AD-4): doubt about the
         stored value resolves toward watering, so an absent or unreadable key
         waters rather than silently ending the season. `ledger` is the
@@ -146,6 +154,11 @@ class Sequencer:
                 self._last_run = run
             else:
                 self._run = run
+        # Story 3.3's watchdog floor, journalled with the rest of the state
+        # and stamped by the first reconcile that finds it unset. Windows
+        # that closed at or before it belong to a controller that did not
+        # exist yet.
+        self._watchdog_since = watchdog_since
         # The raw run document the adapter could not validate — see
         # `async_reconcile`. Consumed there, never trusted.
         self._unreadable_run = run_unreadable
@@ -578,7 +591,12 @@ class Sequencer:
            deferred entry whose reference is on another irrigation day is
            dropped (the watchdog owns missed cycles — Story 3.3) — a save
            follows only if either changed, so a nominal restart with fresh
-           history writes nothing;
+           history writes nothing; and the watchdog's floor is stamped with
+           `now` if the journal carried none (Story 3.3). THE one place it is
+           ever set: the adapter reconciles before it arms anything, so by
+           the time `_check_missed` can run the machine always knows the
+           instant it became observable — and every window that closed
+           before it is one nobody was there to run;
         2. an UNREADABLE run closes EVERY configured valve, then the pump,
            reports `CYCLE_RECOVERED{outcome: "discarded"}` and is dropped
            from the journal — nothing is booked, the ledger is untouched;
@@ -614,6 +632,9 @@ class Sequencer:
                 )
                 self._history = pruned
                 self._deferred = kept
+                if self._watchdog_since is None:
+                    self._watchdog_since = now
+                    changed = True
                 if self._unreadable_run is not None:
                     await self._discard_unreadable(self._unreadable_run)
                 elif (run := self._run) is not None:
@@ -1003,6 +1024,11 @@ class Sequencer:
         lifts and before the drain. `watchdog.missed_cycles` makes the whole
         decision (pure, on the virtual clock); this method is the effects.
 
+        A window that closed at or before the watchdog's floor
+        (`watchdog_since`) is never a miss: the controller did not exist yet,
+        so nobody skipped anything. That is what keeps a first install at
+        16:00 from watering the morning cycle it was never configured for.
+
         A nominal restart and a nominal window end reach here, find nothing
         and return at once: no record, no anomaly, no command, and — the
         counter-metric — NO journal write. The single `_save` at the end runs
@@ -1061,6 +1087,7 @@ class Sequencer:
             active=self._run,
             deferred_kinds=self.deferred_kinds,
             day_credit=self._ledger.day_credit,
+            since=self._watchdog_since,
         )
         if not misses:
             return
@@ -1435,7 +1462,9 @@ class Sequencer:
         which is how a deficit survives a restart. `zone_index` is written
         for the record but NOT read back (Story 3.2): the reconciler derives
         the live slot from the zone statuses and instants, which a hand edit
-        cannot desynchronize from the index.
+        cannot desynchronize from the index. `watchdog_since` (Story 3.3) is
+        the floor below which no window is ours to make up — the one field
+        whose absence on read means LESS watering, not more.
         """
         last_run = self._last_run
         snapshot: dict[str, object] = {
@@ -1450,6 +1479,7 @@ class Sequencer:
             "history": list(self._history),
             "season_enabled": self._season_enabled,
             "ledger": self._ledger.as_dict(),
+            "watchdog_since": utc_iso(self._watchdog_since),
         }
         try:
             await self._journal.async_save(snapshot)

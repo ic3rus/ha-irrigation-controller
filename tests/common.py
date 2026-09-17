@@ -368,6 +368,14 @@ def history_record(
     }
 
 
+# Midnight on the representative day, as `utc_iso` writes it: the watchdog
+# floor (Story 3.3) any journal written by a controller that was already
+# running the day before carries. Without it, every restore-matrix document
+# would look like a FIRST install and the watchdog would treat the day's
+# closed windows as never its own.
+WATCHDOG_SINCE_UTC = "2026-07-30T22:00:00+00:00"
+
+
 def journal_document(**sections: object) -> dict[str, Any]:
     """Build the stored `.storage` document around the given journal sections."""
     return {
@@ -377,6 +385,7 @@ def journal_document(**sections: object) -> dict[str, Any]:
             "schema_version": JOURNAL_SCHEMA_VERSION,
             "history": [],
             "season_enabled": True,
+            "watchdog_since": WATCHDOG_SINCE_UTC,
             **sections,
         },
     }

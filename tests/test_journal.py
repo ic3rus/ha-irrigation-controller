@@ -148,7 +148,8 @@ async def test_unloading_an_entry_flushes_the_last_transition(
     """A reload must never drop the last transition (the regime runs constantly).
 
     Drives a real cycle to a zone boundary, then unloads: the debounced write
-    is still pending, and only the `async_on_unload` flush persists it.
+    is still pending, and only the `async_on_unload` flush persists it — the
+    document on disk until then is the one setup itself left.
     """
     freezer.move_to("2026-07-31 06:59:00+02:00")
     entry = MockConfigEntry(
@@ -166,7 +167,11 @@ async def test_unloading_an_entry_flushes_the_last_transition(
     register_switch_domain(hass)
 
     await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
-    assert STORAGE_KEY not in hass_storage  # still inside the debounce
+    # Setup itself wrote once — Story 3.3's reconcile stamps the watchdog
+    # floor — but the cycle that has just started is still inside the
+    # debounce, so the document on disk knows nothing about it yet.
+    assert hass_storage[STORAGE_KEY]["data"]["run"] is None
+    assert hass_storage[STORAGE_KEY]["data"]["watchdog_since"] is not None
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
@@ -1358,6 +1363,64 @@ async def test_load_seed_restores_the_machine_state_ha_local(
     assert domain_warnings(caplog) == []
 
 
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        ("2026-07-31T04:00:00+00:00", "2026-07-31T06:00:00+02:00"),
+        ("2026-07-31T06:00:00+02:00", "2026-07-31T06:00:00+02:00"),
+    ],
+    ids=["utc", "offset"],
+)
+async def test_the_watchdog_floor_round_trips_ha_local(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    paris: None,
+    stored: str,
+    expected: str,
+) -> None:
+    """Story 3.3: `watchdog_since` comes back as the instant, in HA's timezone."""
+    hass_storage[STORAGE_KEY] = journal_document(watchdog_since=stored)
+
+    seed = await JournalAdapter(hass).async_load_seed()
+
+    assert seed.watchdog_since is not None
+    assert seed.watchdog_since.isoformat() == expected
+    assert str(seed.watchdog_since.tzinfo) == "Europe/Paris"
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [None, "", "yesterday", "2026-07-31T06:00:00", 1785474000, {"at": "07:00"}, True],
+    ids=[
+        "null",
+        "empty",
+        "unparsable",
+        "naive",
+        "int",
+        "mapping",
+        "bool",
+    ],
+)
+async def test_an_unusable_watchdog_floor_reads_as_none(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    paris: None,
+    stored: object,
+) -> None:
+    """The one field whose doubt resolves AWAY from watering (Story 3.3).
+
+    `None` is not "no floor for ever": the next reconcile stamps the floor
+    with its own `now`, so the day's already-closed windows are treated as
+    never ours. An unreadable stamp that meant "watch everything" would have
+    a restored backup water every window of the day at once.
+    """
+    hass_storage[STORAGE_KEY] = journal_document(watchdog_since=stored)
+
+    seed = await JournalAdapter(hass).async_load_seed()
+
+    assert seed.watchdog_since is None
+
+
 async def test_a_journal_written_before_3_2_seeds_no_machine_state(
     hass: HomeAssistant,
     hass_storage: dict[str, Any],
@@ -1376,6 +1439,9 @@ async def test_a_journal_written_before_3_2_seeds_no_machine_state(
     assert seed.last_run is None
     assert seed.deferred == []
     assert seed.run_unreadable is None
+    # Story 3.3's floor is absent too, and silently: the next reconcile
+    # stamps it, so an upgrade never makes up the day it upgraded on.
+    assert seed.watchdog_since is None
     assert domain_warnings(caplog) == []
 
 

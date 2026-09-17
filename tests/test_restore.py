@@ -908,3 +908,70 @@ async def test_a_miss_after_the_days_later_cycle_is_recorded_not_re_run(
     assert sequencer.ledger.deficit_s("zone-b") == 600
 
     await unload(hass, entry)
+
+
+async def test_a_fresh_entry_set_up_past_a_window_end_makes_nothing_up(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 3.3's floor, end to end: a first install is never late for anything.
+
+    No journal at all — a controller configured for the first time at 16:00,
+    long past the morning window. There is nothing to recover and, crucially,
+    nothing to make up: the cycle closed before this controller existed, so
+    nobody skipped it. The reconcile stamps that instant as the floor and
+    everything after it is watched normally.
+
+    This is the case that made the config-flow suite time-of-day dependent:
+    without the floor, any real-clock test setting an entry up after 07:20
+    would file a miss and start watering.
+    """
+    hass_storage.clear()
+    freezer.move_to("2026-07-31 16:00:00+02:00")
+    assert await async_setup_component(hass, "switch", {})
+    calls = register_switch_domain(hass, seed_states=False)
+    for entity_id, state in ALL_OFF.items():
+        hass.states.async_set(entity_id, state)
+    pushes = register_notify_domain(hass)
+    events = record_events(hass)
+    entry = two_zone_entry()
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    sequencer = entry.runtime_data.sequencer
+    assert sequencer.current_run is None
+    assert calls == []
+    assert events == []
+    assert pushes == []
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "missed_cycle") is None
+    assert health_of(hass, entry) == STATE_OFF
+
+    # The one thing the reconcile DID write is the floor itself (the debounced
+    # write lands a few seconds later, which commands nothing).
+    await fire_at(hass, freezer, "2026-07-31 16:00:05+02:00")
+    stored = hass_storage[STORAGE_KEY]["data"]
+    assert stored["history"] == []
+    assert stored["run"] is None
+    assert stored["watchdog_since"] == "2026-07-31T14:00:00+00:00"
+    assert calls == []
+
+    # The evening it WILL be there for runs from its own daily start, and the
+    # window end that follows finds it recorded: still nothing made up, and
+    # still not one anomaly on a controller installed hours after a window.
+    await fire_at(hass, freezer, "2026-07-31 20:00:00+02:00")
+    run = sequencer.current_run
+    assert run is not None
+    assert run.cycle_id == "2026-07-31-evening"
+    assert run.late_rerun is False
+    await fire_at(hass, freezer, "2026-07-31 20:15:00+02:00")
+    await fire_at(hass, freezer, "2026-07-31 20:30:00+02:00")
+
+    assert sequencer.current_run is None
+    assert events == []
+    assert pushes == []
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "missed_cycle") is None
+
+    await unload(hass, entry)

@@ -113,6 +113,7 @@ def missed_cycles(  # noqa: PLR0913 — every input is a separate permitted caus
     active: CycleRun | None,
     deferred_kinds: Sequence[CycleKind],
     day_credit: str | None,
+    since: datetime | None,
 ) -> tuple[Miss, ...]:
     """Return the cycles of `now`'s irrigation day that were never performed.
 
@@ -133,6 +134,17 @@ def missed_cycles(  # noqa: PLR0913 — every input is a separate permitted caus
       late, not lost (AD-4 delays, never skips);
     - an unconsumed day credit for that day: a completed run-now already
       watered it and the scheduled cycle is about to be waived.
+
+    `since` is the FLOOR: a cycle whose window had already closed at or
+    before it was never this controller's to run, and is not a miss. It is
+    the instant the controller first became observable — the journal's
+    `watchdog_since`, stamped by the first reconcile — so a first install at
+    16:00 does not water the morning cycle it was never configured for, and a
+    fresh checkout of the test suite does not behave differently at 16:05
+    than at 06:05. `None` means NO floor, and it is deliberately not a
+    default the engine invents: like `now`, it is a fact the adapter
+    provides, and the virtual-clock suites that drive `advance` without ever
+    reconciling rely on its absence.
 
     The lookback is the CURRENT irrigation day only (Decision 1): an outage
     spanning several days produces misses for the day Home Assistant came
@@ -160,6 +172,7 @@ def missed_cycles(  # noqa: PLR0913 — every input is a separate permitted caus
         kind
         for kind in enabled_kinds(plan)
         if now >= derive_schedule(plan, kind, now).end
+        and (since is None or derive_schedule(plan, kind, now).end > since)
         and kind.value not in performed
         and kind not in deferred_kinds
         and not _is_active(active, kind, today)

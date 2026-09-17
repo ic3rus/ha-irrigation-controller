@@ -1245,10 +1245,16 @@ async def test_an_unreadable_run_without_a_cycle_id_reports_none() -> None:
 
 
 async def test_an_idle_restart_with_fresh_history_does_nothing_at_all() -> None:
-    """Matrix row 1 / AC 5: no command, no anomaly, no clear, no journal write."""
+    """Matrix row 1 / AC 5: no command, no anomaly, no clear, no journal write.
+
+    `watchdog_since` is seeded because the journal of a controller that has
+    run before carries one (Story 3.3): the FIRST reconcile that finds it
+    unset stamps it and saves, which is a different matrix row.
+    """
     sequencer, switches, journal, anomalies = make_sequencer(
         history=[{"irrigation_day": "2026-07-30", "cycle_id": "2026-07-30-evening"}],
         deferred=[(CycleKind.EVENING, aware(6, 59))],
+        watchdog_since=aware(6),
     )
     assert sequencer.reconciled is True
 
@@ -1338,6 +1344,7 @@ async def test_a_terminal_journaled_run_is_the_last_run_not_a_recovery() -> None
         run=CycleRun.from_dict(completed, tz=TZ),
         last_run=run_of(await crash_snapshot("done")),
         history=stored_history,
+        watchdog_since=aware(6),
     )
     switches.states = dict(ALL_OFF)
 

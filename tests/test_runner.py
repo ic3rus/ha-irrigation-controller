@@ -121,17 +121,6 @@ def missed_issue(hass: HomeAssistant) -> ir.IssueEntry | None:
     return ir.async_get(hass).async_get_issue(DOMAIN, "missed_cycle")
 
 
-def day_done(day: str) -> list[dict[str, object]]:
-    """Return the history a fully-watered `day` leaves behind (both cycles).
-
-    Story 3.3's watchdog reads an empty history as "this day's windows closed
-    with nothing to show for them" and rightly makes the cycles up. A test
-    whose clock starts AFTER a window end therefore seeds the day as done
-    unless the miss is what it is about.
-    """
-    return [history_record(kind, day=day) for kind in ("morning", "evening")]
-
-
 def make_runner(
     hass: HomeAssistant,
     plan: ControllerPlan,
@@ -384,9 +373,7 @@ async def test_daily_start_holds_its_wall_clock_time_across_a_dst_change(
     """
     calls = register_switch_domain(hass)
     freezer.move_to("2027-03-27 20:30:00+01:00")
-    # The 27th is already watered, so the watchdog has nothing to make up for
-    # and the only commands below are the 28th's own daily start (Story 3.3).
-    runner, sequencer = make_runner(hass, make_plan(), history=day_done("2027-03-27"))
+    runner, sequencer = make_runner(hass, make_plan())
     await runner.async_start()
 
     await fire_at(hass, freezer, "2027-03-28 07:00:00+02:00")
@@ -973,9 +960,7 @@ async def test_run_now_starts_in_the_same_tick_and_arms_the_next_boundary(
     """
     calls = register_switch_domain(hass)
     freezer.move_to("2026-07-31 09:30:00+02:00")
-    # 09:30 is past the morning window, so the day is seeded as watered: the
-    # operator's run-now is what this test is about, not a watchdog make-up.
-    runner, sequencer = make_runner(hass, make_plan(), history=day_done("2026-07-31"))
+    runner, sequencer = make_runner(hass, make_plan())
     await runner.async_start()
 
     assert await runner.async_run_now(CycleKind.MORNING) is True

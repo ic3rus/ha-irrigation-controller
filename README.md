@@ -416,13 +416,22 @@ of that kind is ever re-run:
 A nominal day is therefore completely silent: both window ends come and go
 with no record, no notification and not even a journal write.
 
-One consequence worth knowing: the watchdog can only read the journal, so a
-controller configured for the first time *after* a window has passed looks
-exactly like one that slept through it — it will water that cycle once,
-straight away. Turning the season back on part-way through a day has the same
-effect on the cycles that day has already passed, but not immediately: nothing
-is checked at the moment you flip the switch, only at the next window end. Turn
-the season on after the day's last window and nothing is made up at all.
+The watchdog only ever makes up a window that closed **while the controller
+existed**. The first time it is set up, the moment of setup is recorded, and
+every window that had already closed by then is simply not its business — so
+configuring the controller at 16:00 never starts a surprise watering for the
+07:00 cycle it was never there for. The same stamp is recorded once when you
+upgrade to this version, so upgrading mid-afternoon makes nothing up either.
+From the next window end onwards everything is watched normally.
+
+Two things that do still get made up, because the journal records neither
+change: **enabling the morning cycle** part-way through a day, and **turning
+the season back on** part-way through a day. In both cases that day's already
+passed windows have no record and count as missed. It does not happen the
+instant you flip the switch — nothing is checked until the next window end —
+so turning the season on after the day's last window makes nothing up at all,
+while turning it on at noon makes the morning up when the evening window
+closes.
 
 ## Anomalies
 

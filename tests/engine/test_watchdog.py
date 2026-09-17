@@ -107,6 +107,7 @@ def detect(
         "active": None,
         "deferred_kinds": (),
         "day_credit": None,
+        "since": None,
         **overrides,
     }
     return tuple(
@@ -156,6 +157,7 @@ async def test_the_configured_start_is_the_plans_not_the_detection_instant() -> 
         active=None,
         deferred_kinds=(),
         day_credit=None,
+        since=None,
     )
 
     assert miss.kind is CycleKind.MORNING
@@ -215,6 +217,7 @@ async def test_only_the_current_irrigation_day_is_ever_scanned() -> None:
         active=None,
         deferred_kinds=(),
         day_credit=None,
+        since=None,
     )
 
     assert [miss.configured_start.date().isoformat() for miss in misses] == [
@@ -303,6 +306,82 @@ async def test_rerunnability_compares_starts_not_kinds() -> None:
         (CycleKind.MORNING, True),
         (CycleKind.EVENING, False),
     )
+
+
+async def test_a_window_that_closed_before_we_existed_is_not_a_miss() -> None:
+    """The floor: nobody skipped a cycle on a controller that did not exist.
+
+    `since` is the instant this controller first became observable. A first
+    install at 09:00 must not water the 07:00 morning it was never configured
+    for — but the evening it WILL be there for stays fully watched.
+    """
+    plan = two_zone_plan()
+
+    # Installed at 09:00: this morning is not ours, and nothing is due yet.
+    assert detect(plan, aware(9), since=aware(9)) == ()
+    # The very end instant counts as "before us": at-or-before, not before.
+    assert detect(plan, aware(9), since=MORNING_END) == ()
+    # ...and that same day's evening still is ours, once its window closes.
+    assert detect(plan, EVENING_END, since=aware(9)) == ((CycleKind.EVENING, True),)
+
+
+async def test_a_floor_earlier_than_the_window_leaves_the_miss_alone() -> None:
+    """A controller that existed across the window owns the cycle it lost."""
+    plan = two_zone_plan()
+
+    assert detect(plan, aware(9), since=aware(6, 59, 59)) == (
+        (CycleKind.MORNING, True),
+    )
+
+
+async def test_no_floor_at_all_watches_the_whole_day() -> None:
+    """`None` is the absence of a fact, not a default the engine invents.
+
+    Every virtual-clock suite drives `advance` without ever reconciling, so
+    it never has a floor — and must keep seeing the day it describes.
+    """
+    assert detect(two_zone_plan(), aware(9), since=None) == ((CycleKind.MORNING, True),)
+
+
+async def test_the_first_reconcile_stamps_the_floor_and_saves_once() -> None:
+    """`async_reconcile` is the ONE place the floor is ever set (Story 3.3).
+
+    A journal written before this story carries no stamp, so the first
+    reconcile records the instant the controller became observable — and the
+    windows it slept through before that are nobody's to make up. A second
+    reconcile finds the stamp and changes nothing.
+    """
+    sequencer, switches, journal, anomalies = make_sequencer()
+
+    await sequencer.async_reconcile(aware(9))
+
+    assert journal.snapshots[-1]["watchdog_since"] == "2026-07-31T07:00:00+00:00"
+    assert len(journal.snapshots) == 1
+    # The morning window closed before the stamp, so nothing was made up.
+    assert sequencer.current_run is None
+    assert switches.commands == []
+    assert anomalies.reports == []
+
+    await sequencer.async_reconcile(aware(9, 30))
+
+    assert len(journal.snapshots) == 1
+    assert journal.snapshots[-1]["watchdog_since"] == "2026-07-31T07:00:00+00:00"
+
+
+async def test_a_seeded_floor_is_never_restamped() -> None:
+    """A controller that already existed keeps the instant it first did."""
+    sequencer, _, journal, _ = make_sequencer(watchdog_since=aware(6))
+
+    await sequencer.async_reconcile(aware(9))
+
+    # Every write of this restart carries the floor it was seeded with...
+    assert {snapshot["watchdog_since"] for snapshot in journal.snapshots} == {
+        "2026-07-31T04:00:00+00:00",
+    }
+    # ...and the morning it really did sleep through is still made up.
+    run = sequencer.current_run
+    assert run is not None
+    assert run.late_rerun is True
 
 
 # --------------------------------------------------------------------------
@@ -544,6 +623,7 @@ async def test_a_miss_is_never_detected_twice() -> None:
     # ...and after a restart that seeds exactly what the journal holds.
     restarted, switches, restarted_journal, restarted_anomalies = make_sequencer(
         history=stored,
+        watchdog_since=aware(6),
     )
     await restarted.async_reconcile(aware(9))
 
@@ -573,6 +653,7 @@ async def test_an_unreadable_run_discarded_past_its_window_is_made_up() -> None:
     """
     sequencer, switches, journal, anomalies = make_sequencer(
         run_unreadable={"cycle_id": "2026-07-31-morning", "kind": "morning"},
+        watchdog_since=aware(6),
     )
     assert sequencer.reconciled is False
 
@@ -605,8 +686,15 @@ async def test_an_unreadable_run_discarded_past_its_window_is_made_up() -> None:
 
 
 async def test_a_restart_after_a_slept_through_window_re_runs_the_cycle() -> None:
-    """Matrix "miss detected at startup": inside `async_reconcile`, after the gate."""
-    sequencer, switches, journal, anomalies = make_sequencer()
+    """Matrix "miss detected at startup": inside `async_reconcile`, after the gate.
+
+    `watchdog_since` is the journal's, from before the window: this
+    controller existed across the outage, which is what makes the cycle its
+    to make up (a FIRST install past that window is the opposite case).
+    """
+    sequencer, switches, journal, anomalies = make_sequencer(
+        watchdog_since=aware(6),
+    )
 
     await sequencer.async_reconcile(aware(9))
 

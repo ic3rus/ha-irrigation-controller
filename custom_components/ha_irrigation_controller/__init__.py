@@ -273,6 +273,7 @@ async def async_setup_entry(
         last_run=seed.last_run,
         deferred=seed.deferred,
         run_unreadable=seed.run_unreadable,
+        watchdog_since=seed.watchdog_since,
     )
     runner = CycleRunner(hass, entry, sequencer=sequencer, clock=clock)
     # Follows the configured entities through the registry: renames rewrite

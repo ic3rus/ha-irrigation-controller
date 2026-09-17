@@ -23,7 +23,7 @@ What is pinned here:
 
 from __future__ import annotations
 
-from datetime import time, timedelta
+from datetime import time
 from typing import TYPE_CHECKING
 
 from homeassistant.const import ATTR_ENTITY_ID
@@ -52,7 +52,6 @@ from tests.common import (
     VALVE_1,
     VALVE_2,
     fire_at,
-    history_record,
     register_switch_domain,
 )
 
@@ -129,22 +128,6 @@ def commands(calls: list[ServiceCall]) -> list[tuple[str, str]]:
     return [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls]
 
 
-def day_before(day: str) -> list[dict[str, object]]:
-    """Return the history that makes the day before `day` fully watered.
-
-    Without it the watchdog would (rightly) read the untouched evening of the
-    previous day as missed, and make it up before the transition even starts.
-
-    A `timedelta`, never `replace(day=day - 1)`: the latter raises on the
-    first of a month, and the only reason it has not is that both pinned
-    dates happen to fall late in theirs.
-    """
-    parsed = dt_util.parse_date(day)
-    assert parsed is not None
-    stamp = (parsed - timedelta(days=1)).isoformat()
-    return [history_record(kind, day=stamp) for kind in ("morning", "evening")]
-
-
 # --------------------------------------------------------------------------
 # Spring forward: 2027-03-28 is 23 hours long
 # --------------------------------------------------------------------------
@@ -158,9 +141,7 @@ async def test_a_start_outside_the_gap_holds_its_wall_clock_time(
     """NFR3: a 07:00 cycle fires at 07:00 local on the short day too."""
     calls = register_switch_domain(hass)
     freezer.move_to("2027-03-27 21:00:00+01:00")
-    runner, sequencer, _ = make_runner(
-        hass, dst_plan(time(7, 0)), history=day_before(SPRING_FORWARD)
-    )
+    runner, sequencer, _ = make_runner(hass, dst_plan(time(7, 0)))
     await runner.async_start()
 
     await fire_at(hass, freezer, f"{SPRING_FORWARD} 07:00:00+02:00")
@@ -194,9 +175,7 @@ async def test_a_start_inside_the_gap_is_skipped_and_the_watchdog_waters_it(
     """
     calls = register_switch_domain(hass)
     freezer.move_to(f"{SPRING_FORWARD} 00:30:00+01:00")
-    runner, sequencer, _ = make_runner(
-        hass, dst_plan(time(2, 30)), history=day_before(SPRING_FORWARD)
-    )
+    runner, sequencer, _ = make_runner(hass, dst_plan(time(2, 30)))
     await runner.async_start()
 
     # The watchdog owns the idle timer, and its deadline is the window end.
@@ -246,9 +225,7 @@ async def test_a_start_outside_the_repeated_hour_holds_its_wall_clock_time(
     """NFR3, the other direction: 07:00 is 07:00 on the long day as well."""
     calls = register_switch_domain(hass)
     freezer.move_to("2027-10-30 21:00:00+02:00")
-    runner, sequencer, _ = make_runner(
-        hass, dst_plan(time(7, 0)), history=day_before(FALL_BACK)
-    )
+    runner, sequencer, _ = make_runner(hass, dst_plan(time(7, 0)))
     await runner.async_start()
 
     await fire_at(hass, freezer, f"{FALL_BACK} 07:00:00+01:00")
@@ -272,9 +249,7 @@ async def test_the_watchdog_deadlines_of_the_twenty_five_hour_day_are_the_plans(
     """
     register_switch_domain(hass)
     freezer.move_to("2027-10-30 21:00:00+02:00")
-    runner, sequencer, _ = make_runner(
-        hass, dst_plan(time(7, 0)), history=day_before(FALL_BACK)
-    )
+    runner, sequencer, _ = make_runner(hass, dst_plan(time(7, 0)))
     await runner.async_start()
 
     # Tomorrow's morning window end, across the transition.
@@ -310,9 +285,7 @@ async def test_a_start_inside_the_repeated_hour_fires_twice_and_raises_nothing(
     """
     calls = register_switch_domain(hass)
     freezer.move_to(f"{FALL_BACK} 01:30:00+02:00")
-    runner, sequencer, _ = make_runner(
-        hass, dst_plan(time(2, 30)), history=day_before(FALL_BACK)
-    )
+    runner, sequencer, _ = make_runner(hass, dst_plan(time(2, 30)))
     await runner.async_start()
 
     # First pass through 02:30 (+02:00), run to completion.

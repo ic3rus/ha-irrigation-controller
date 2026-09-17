@@ -86,6 +86,18 @@ class JournalSeed:
     reads as `None` — baselines with no source credit nothing until the next
     settlement re-banks them under the current gauge, so an upgrade costs
     one unmodulated cycle and never a skipped one.
+
+    `watchdog_since` (Story 3.3) is the instant this controller first became
+    observable, and the floor below which no cycle window is the watchdog's
+    to make up. It is the ONE field whose doubt resolves AWAY from watering:
+    a document written before this story has none, and a malformed one is
+    refused, and both read as `None` — whereupon the next reconcile stamps it
+    with that instant, so the day's already-closed windows are treated as
+    never ours. The alternative is worse in exactly the direction this
+    project cares about: an unreadable stamp that meant "no floor" would have
+    a first install, a restored backup or a hand edit water every window of
+    the day at once, on a controller that has been running for ten seconds.
+    A missed stamp costs at most the current day's make-ups, once.
     """
 
     history: list[dict[str, object]]
@@ -95,6 +107,7 @@ class JournalSeed:
     last_run: CycleRun | None = None
     deferred: list[tuple[CycleKind, datetime]] = field(default_factory=list)
     run_unreadable: dict[str, object] | None = None
+    watchdog_since: datetime | None = None
 
 
 class JournalAdapter:
@@ -164,6 +177,10 @@ class JournalAdapter:
         the clock. Instants are converted into Home Assistant's configured
         timezone: the engine's contract is HA-local aware datetimes, and
         the irrigation day is the LOCAL calendar date.
+
+        `watchdog_since` (Story 3.3) crosses the same boundary through the
+        same instant validator, and is the one field whose refusal means
+        LESS watering rather than more — see `JournalSeed`.
         """
         stored = await self._store.async_load()
         if not isinstance(stored, dict):
@@ -188,6 +205,7 @@ class JournalAdapter:
             last_run=_seed_last_run(stored.get("last_run"), tz),
             deferred=_seed_deferred(stored.get("deferred"), tz),
             run_unreadable=unreadable,
+            watchdog_since=_seed_instant(stored.get("watchdog_since"), tz),
         )
 
     async def async_save(self, snapshot: dict[str, object]) -> None:
@@ -359,6 +377,26 @@ def _seed_deferred(raw: object, tz: tzinfo) -> list[tuple[CycleKind, datetime]]:
             # `datetime`'s range that cannot be converted — dropped alone.
             continue
     return kept
+
+
+def _seed_instant(raw: object, tz: tzinfo) -> datetime | None:
+    """Return the aware instant `utc_iso` wrote, HA-local, or None when unusable.
+
+    The same discipline `_seed_deferred` applies to a reference: only an
+    ISO-8601 string carrying an offset is honoured. Absent (every document
+    written before Story 3.3), of another type, unparsable, naive, or at the
+    edge of `datetime`'s range all read as None — the caller documents what
+    that means for the field it is reading.
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        instant = datetime.fromisoformat(raw)
+        if instant.tzinfo is None:
+            return None
+        return instant.astimezone(tz)
+    except ValueError, OverflowError:
+        return None
 
 
 def _empty_ledger() -> dict[str, object]:
