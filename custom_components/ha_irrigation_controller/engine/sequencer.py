@@ -3,15 +3,17 @@
 The engine never sleeps, loops on wall time or arms timers. It exposes two
 methods:
 
-- ``next_wakeup(now)`` — the earliest pending time intent: a running cycle's
-  own boundary while one is active, otherwise the watchdog's next window-end
-  deadline (Story 3.3). ``None`` in three cases: before reconciliation, when
-  the watchdog has nothing it could act on (season off, or a plan with no
-  zones), and in the transient window inside ``advance`` where the last zone
-  has closed but the cycle has not completed yet. Daily cycle starts are NOT
-  a wakeup intent: they arrive from outside through ``request_cycle`` (tests
-  call it directly; Story 1.5 calls it from ``async_track_time_change``, per
-  AD-3's split).
+- ``next_wakeup(now)`` — the earliest pending time intent, a MINIMUM over
+  three sources: a running cycle's own boundary (or a pending run's start),
+  the watchdog's next window-end deadline (Story 3.3) and the earliest
+  safety deadline of a switch held open by hand (Story 3.5). ``None`` only
+  when none of them names an instant: before reconciliation, or with nothing
+  held by hand while the watchdog has nothing it could act on (season off, or
+  a plan with no zones) or the transient window inside ``advance`` where the
+  last zone has closed but the cycle has not completed yet. Daily cycle
+  starts are NOT a wakeup intent: they arrive from outside through
+  ``request_cycle`` (tests call it directly; Story 1.5 calls it from
+  ``async_track_time_change``, per AD-3's split).
 - ``advance(now)`` — perform EVERY transition due at ``now``: command ports,
   update run objects, journal. Idempotent for a given state and ``now``.
 
@@ -37,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from datetime import UTC, timedelta
 from typing import TYPE_CHECKING, Final
 
 from .history import history_entry, prune_history
@@ -186,13 +189,28 @@ class Sequencer:
         self._deferred: list[tuple[CycleKind, datetime]] = (
             [] if deferred is None else list(deferred)
         )
-        # The switches an operator is holding open BY HAND (Story 3.4).
-        # Non-empty IS the paused state — a set rather than a flag, so two
-        # hand-opened valves need two closes before the scheduler moves
-        # again. LIVE state on purpose: it is never journalled and never
-        # seeded, so a reload or a restart loses the pause (the start it
-        # deferred survives, in `_deferred`, and `async_reconcile` drains it).
-        self._manual_on: set[str] = set()
+        # The switches an operator is holding open BY HAND (Story 3.4), each
+        # mapped to the instant the engine closes it if the operator has not
+        # (Story 3.5). Non-empty IS the paused state — a collection rather
+        # than a flag, so two hand-opened valves need two closes before the
+        # scheduler moves again — and whatever the VALUES are, non-empty is
+        # still `manual_override`.
+        #
+        # A value of `None` is the SPENT state and the only thing `None` ever
+        # means here (Decision 1: the timeout is not disablable): the deadline
+        # of an entity the RUNNING cycle itself holds open came and went, and
+        # expiry deliberately did nothing with it (Decision 2 — the cycle's
+        # claim wins, and the slot's own close is what releases it). Spent
+        # rather than left in the past because `next_wakeup` folds in only
+        # real datetimes: an elapsed one would be named for ever, re-armed on
+        # a past instant and fired at once, in a loop.
+        #
+        # ONE collection, and each mutation is ONE synchronous statement
+        # before the lock (see `async_switch_observed`). LIVE state on
+        # purpose: never journalled, never seeded, so a reload or a restart
+        # loses the pause AND its deadlines (the start it deferred survives,
+        # in `_deferred`, and `async_reconcile` drains it).
+        self._manual_on: dict[str, datetime | None] = {}
         self._zone_index = 0
         # The Story 3.2 gate: False while a restored in-flight run (or an
         # unreadable one) awaits `async_reconcile`. A machine with nothing to
@@ -235,7 +253,12 @@ class Sequencer:
         THE paused state, read-only (AD-6): the cycle-status sensor projects
         it, and `request_cycle`, `_pop_deferred` and `_check_missed` gate on
         it. True from the first hand-opened switch until the last one is
-        observed off, whoever closed it.
+        released, and there are exactly TWO ways one is released: it is
+        observed OFF (by the operator's hand, by the cycle's own boundary
+        command or by the switch dropping out of Home Assistant), or its
+        safety deadline expires and the engine closes it itself (Story 3.5).
+        A spent deadline does NOT release anything — the switch is still
+        held, so this stays True.
         """
         return bool(self._manual_on)
 
@@ -311,11 +334,20 @@ class Sequencer:
         """Take one governed-switch observation and own the pause (Story 3.4).
 
         The adapter watches every governed entity and REPORTS — entity, on or
-        off, ours or not (AD-7). This method is the whole decision, and the
-        set `self._manual_on` is the state: non-empty is paused. A manual ON
-        adds; ANY observed OFF removes, whoever commanded it — that is what
-        lets the engine's own close of a hand-opened valve end the pause, and
-        it is the hook Story 3.5's safety timeout will pull.
+        off, ours or not (AD-7). This method is the whole decision, and
+        `self._manual_on` is the state: non-empty is paused. A manual ON
+        adds, with the instant the engine will close it as the value (Story
+        3.5); ANY observed OFF removes, whoever commanded it — that is what
+        lets the engine's own safety close of a hand-opened valve end the
+        pause by the very path a hand-close takes.
+
+        The deadline is minted HERE, from `now`, ONCE per manual open. The
+        repeat-ON dedup a few lines below returns before it, so a switch
+        flipped on twice never has its deadline extended; and it is read off
+        the plan in force at the observation, so a plan swapped mid-pause
+        never re-quotes a deadline already pending. Closing the switch by
+        hand before it expires cancels it silently — the release path below
+        is the whole mechanism.
 
         A manual OFF on its own never pauses (Decision 1): nothing is being
         held open, so there is nothing to step aside from. The operator
@@ -334,13 +366,15 @@ class Sequencer:
           watch onto the state machine for no effect — and, since a caller's
           `block_till_done` does not wait for the entry's background tasks,
           would make the daily start that follows queue behind them too;
-        - the set is then never stale. A set read before the lock and
+        - the collection is then never stale. One read before the lock and
           mutated after it would drop the OFF of a switch flipped on and
           straight off again — that OFF testing an `_manual_on` its own ON
           had not reached yet — and leave the entity held for ever with the
           switch physically off. Mutating it here is safe precisely because
-          each mutation is one synchronous statement: nothing interleaves
-          with it, which is the one thing the lock is not needed for.
+          each mutation is one synchronous statement (`_manual_on[entity_id]
+          = deadline`, `_manual_on.pop(entity_id, None)`): nothing
+          interleaves with it, which is the one thing the lock is not needed
+          for.
 
         `_reconciled` is read before the lock for the same reason, and only
         ever goes False→True: a no-op until reconciliation has run, exactly
@@ -366,22 +400,36 @@ class Sequencer:
             if entity_id in self._manual_on:
                 return
             first = not self._manual_on
-            self._manual_on.add(entity_id)
+            self._manual_on[entity_id] = self._manual_deadline(now)
             if not first:
                 return
             async with self._lock:
                 await self._defer_pending_run()
             return
         # An ON that is not manual can only ever be ours, and a release can
-        # only concern an entity the set holds: both are no-ops here, which
-        # is what keeps our own commands off the lock entirely.
+        # only concern an entity we hold: both are no-ops here, which is what
+        # keeps our own commands off the lock entirely.
         if is_on or entity_id not in self._manual_on:
             return
-        self._manual_on.discard(entity_id)
+        self._manual_on.pop(entity_id, None)
         if self._manual_on:
             return
         async with self._lock:
             await self._resume(now)
+
+    def _manual_deadline(self, now: datetime) -> datetime:
+        """Return the instant a switch hand-opened at `now` is closed (3.5).
+
+        Accumulated in UTC and converted back, exactly as `plan.zone_windows`
+        does and for the same reason: the timeout is ELAPSED seconds, and
+        adding a `timedelta` to a `ZoneInfo`-aware datetime is wall-clock
+        arithmetic. Across a fall-back that would leave a valve open a full
+        hour past its configured maximum; across a spring-forward it would
+        close one an hour early.
+        """
+        return (
+            now.astimezone(UTC) + timedelta(seconds=self.plan.manual_timeout_s)
+        ).astimezone(now.tzinfo)
 
     async def _defer_pending_run(self) -> None:
         """Hand a PENDING scheduled run back to `_deferred` (Story 3.4).
@@ -417,11 +465,37 @@ class Sequencer:
         `_pop_deferred`, so a switch hand-opened again between the release
         and this lock acquisition simply holds the queue where it is.
 
+        The watchdog is asked BEFORE the drain, exactly as `_advance_locked`
+        and `async_reconcile` order it: a popped run is `self._run` the
+        instant it is installed, and `missed_cycles` reads a live run as
+        "another cycle is watering" — so the day's other kind would be filed
+        `recorded` instead of re-run, burning that `(day, kind)` for ever
+        (Story 3.4's triage #4). The `_advance_locked` below asks again,
+        which costs nothing: a miss it already filed is in history and is
+        undetectable from then on.
+        """
+        await self._check_missed(now)
+        await self._drain_deferred(now)
+        await self._advance_locked(now)
+
+    async def _drain_deferred(self, now: datetime) -> None:
+        """Drop the stale-day deferrals and pop what is left (Stories 3.4, 3.5).
+
+        Called from inside the lock, by the resume that ends a pause and by
+        `_advance_locked` when a safety timeout released the last hand-opened
+        switch (Story 3.5) — ONE implementation of "the pause is over, honour
+        what it deferred". Both call sites ask `_check_missed` FIRST and this
+        second, so the hand-close path and the timeout path really do not
+        drift: neither installs a popped run before the watchdog has looked.
+
         The save at the end covers the ONE case `_pop_deferred` cannot: a
         stale-day deferral dropped while nothing was popped after it — the
         queue ended empty, or a cycle is still running and holds the drain.
         Every pop journals itself, so the length test is what tells the two
         apart. The pause itself is live state and is never journalled.
+
+        It must NOT call `_advance_locked` back: that method calls this one,
+        and the popped cycle is started by its own loop.
         """
         today = irrigation_day(now)
         kept = [entry for entry in self._deferred if irrigation_day(entry[1]) == today]
@@ -431,7 +505,6 @@ class Sequencer:
         await self._pop_deferred(now)
         if dropped and len(self._deferred) == queued:
             await self._save()
-        await self._advance_locked(now)
 
     async def request_cycle(self, kind: CycleKind, now: datetime) -> None:
         """Request a cycle start; defers if another run is active.
@@ -532,20 +605,38 @@ class Sequencer:
         """Return the earliest pending time intent, or None when there is none.
 
         THE re-arm contract of the one point-in-time callback (AD-3), and
-        since Story 3.3 the home of TWO sources of intent:
+        since Story 3.5 a MINIMUM rather than a priority chain. Until then
+        the first matching branch returned and a run's boundary "won"; a
+        per-entity safety deadline cannot live in a chain, because it must be
+        able to fall BETWEEN two zone boundaries — and every early return of
+        the old shape (a RUNNING cycle's boundary, a PENDING run's
+        `scheduled_start`, the transient `_zone_index` window, and the idle
+        branch's season/no-zones short-circuits) would swallow it. So the
+        four branches are a CANDIDATE, computed verbatim by
+        `_run_or_watchdog_deadline`, and the answer is the earliest of that
+        and the earliest pending manual deadline:
 
-        - a cycle is active → its own boundary wins, exactly as before. The
-          watchdog has nothing to serve while the machine is watering, and a
-          deadline that pre-empted a zone boundary would leave a valve open.
-        - the machine is idle → `next_deadline(self.plan, now)`, the next
-          cycle window end. That is the watchdog's timer, and it is armed
-          permanently: a nominal window end fires, finds nothing missing,
-          writes nothing and re-arms on the following one. Except when the
-          watchdog provably cannot act: the season being off and a plan with
-          no zones both make `missed_cycles` return nothing whatever the
-          instant, so an off-season controller must not re-arm a timer twice
-          a day for a check that can only do nothing. Both are read live, so
-          turning the season back on re-arms it through the ordinary tail.
+        - the candidate — a cycle is active → its own boundary (or a pending
+          run's start); the machine is idle → `next_deadline(self.plan,
+          now)`, the next cycle window end. That is the watchdog's timer, and
+          it is armed permanently: a nominal window end fires, finds nothing
+          missing, writes nothing and re-arms on the following one. Except
+          when the watchdog provably cannot act: the season being off and a
+          plan with no zones both make `missed_cycles` return nothing
+          whatever the instant, so an off-season controller must not re-arm a
+          timer twice a day for a check that can only do nothing. Both are
+          read live, so turning the season back on re-arms it through the
+          ordinary tail;
+        - the manual deadlines (Story 3.5) — the instants the engine closes
+          the switches an operator is holding open. `None` values are SKIPPED
+          and that is load-bearing: a spent deadline (Decision 2) left in the
+          past would be named for ever, re-armed on a past instant and fired
+          at once, in a loop.
+
+        Taking the minimum is also what keeps a zone boundary from being
+        pre-empted OR missed: a deadline inside a slot is served in its own
+        `advance` and the boundary is re-armed straight after, and a deadline
+        after the boundary loses the `min` until the boundary has been served.
 
         None while `async_reconcile` has not run (Story 3.2): a restored
         run's boundaries are not the engine's intent until it has been
@@ -553,14 +644,29 @@ class Sequencer:
         the past would otherwise fire, do nothing and be re-armed at once.
         The watchdog is gated by the same flag for the reason AC 3 names:
         boot must not re-run a cycle before recovery has decided what the
-        journal's run was.
+        journal's run was. The guard stays FIRST and still answers None
+        outright: `async_switch_observed` is a no-op until then, so nothing
+        can be held by hand and `_manual_on` is provably empty there.
 
         `now` is the caller's clock read; the engine keeps none of its own
         (AD-1). It is used ONLY for the idle deadline — a run's boundaries
-        are absolute instants already.
+        and a manual deadline are absolute instants already.
         """
         if not self._reconciled:
             return None
+        candidate = self._run_or_watchdog_deadline(now)
+        pending = [due for due in self._manual_on.values() if due is not None]
+        if not pending:
+            return candidate
+        earliest = min(pending)
+        return earliest if candidate is None else min(candidate, earliest)
+
+    def _run_or_watchdog_deadline(self, now: datetime) -> datetime | None:
+        """Return the intent of the run, or of the watchdog when idle (3.3).
+
+        `next_wakeup`'s candidate, moved out of it verbatim when Story 3.5
+        turned that accessor into a minimum. See there for the whole rule.
+        """
         run = self._run
         if run is None:
             if not self._season_enabled or not self.plan.zones:
@@ -724,16 +830,37 @@ class Sequencer:
     async def _advance_locked(self, now: datetime) -> None:
         """Run the `advance` loop for a caller that already holds the lock.
 
-        The missed-cycle check (Story 3.3) runs FIRST, before any transition:
-        a late re-run it dispatches is a PENDING run scheduled at `now`, so
-        the loop below starts it in this very call — the same "delayed, never
-        skipped" tail a deferred cycle gets.
+        Four steps, in an order every one of which is load-bearing:
+
+        1. `_expire_manual` (Story 3.5) — the safety closes due at `now`.
+           FIRST, because a close that ends the pause has to be visible to
+           everything below it in this same call;
+        2. `_check_missed` (Story 3.3) — the watchdog, before any transition:
+           a late re-run it dispatches is a PENDING run scheduled at `now`,
+           so the loop below starts it in this very call — the same "delayed,
+           never skipped" tail a deferred cycle gets;
+        3. the drain, but ONLY when step 1 released the last hand-opened
+           switch. Expiry deliberately does not drain itself: the watchdog
+           must be asked BEFORE a popped run becomes `self._run`, or
+           `missed_cycles` reads that run as "another cycle is watering" and
+           files the day's other kind `recorded` instead of re-running it —
+           burning that `(day, kind)` for ever. Story 3.4's triage #4, which
+           `async_reconcile` already answers with the same check-then-pop
+           order. The popped cycle still starts in this call, from the loop;
+        4. the transition loop itself;
+        5. `_rearm_spent` (Story 3.5) — LAST, because step 4 is where a
+           cycle's claim on a hand-opened switch ends (`_complete_cycle`
+           clears the run). The loop therefore `break`s rather than returns:
+           every exit from it has to reach this tail.
         """
+        released = await self._expire_manual(now)
         await self._check_missed(now)
+        if released:
+            await self._drain_deferred(now)
         while (run := self._run) is not None:
             if run.status is CycleStatus.PENDING:
                 if now < run.scheduled_start:
-                    return
+                    break
                 await self._start_cycle(run, now)
             # No bounds guard needed on the index here (unlike in
             # `next_wakeup`, which outside callers reach mid-transition):
@@ -743,7 +870,204 @@ class Sequencer:
             elif now >= (zone := run.zone_runs[self._zone_index]).planned_end:
                 await self._finish_zone(run, zone, now)
             else:
-                return
+                break
+        self._rearm_spent(now)
+
+    async def _expire_manual(self, now: datetime) -> bool:
+        """Close the hand-opened switches due at `now`; True iff the pause ended.
+
+        Story 3.5's whole effect, and the first step of `_advance_locked`.
+        Called from inside the lock, so the closes are issued exactly like
+        every other engine command — strictly sequential, through the same
+        verified `SwitchPort`.
+
+        ONE attempt per manual open: nothing is ever re-armed, retried or
+        re-opened, and nothing but the entity whose deadline fired is ever
+        commanded (the AD-4 cap on compensation applies to a safety close
+        too). The entity is released WHATEVER the close reported — an
+        unconfirmed one raises `VALVE_CLOSE_UNCONFIRMED` /
+        `PUMP_OFF_UNCONFIRMED` through `_outcome` like any other plan-issued
+        command, but holding the pause open on it would recreate the
+        permanent, watering-free pause the story exists to remove.
+
+        THE exception is Decision 2: an entity the RUNNING cycle itself holds
+        open is skipped entirely — no close, no `manual_valve_timeout` — and
+        its deadline is merely spent. Closing the live slot's valve would end
+        that zone early while the run still books its full planned duration,
+        carrying no deficit; closing the pump would run every remaining zone
+        dry. Nothing in a run's accounting may be written from here, so the
+        cycle's claim wins and the slot's own close at the boundary releases
+        the switch, through the ordinary non-manual OFF observation.
+
+        The per-entity membership test inside the loop is not defensive: each
+        close awaits its verification, and a hand-close of ANOTHER held
+        switch can land in that window — reporting a timeout for a switch the
+        operator has just closed themselves would be a lie. The entity being
+        expired is RELEASED BEFORE its close is commanded, which is what
+        makes that test enough: no observation can then remove an entry this
+        loop is half-way through. It also cannot be done the other way round,
+        because our OWN close is observed as a non-manual OFF and the release
+        path pops before taking the lock — and the standing watch is
+        subscribed ahead of the per-command one, so that hop is scheduled
+        first and lands while this `await` is still suspended. A test after
+        the await would therefore see every close as "the operator got there
+        first" and report nothing at all.
+
+        Returns whether the LAST hold is now gone, for `_advance_locked` to
+        drain on — this method never drains itself (see there).
+        """
+        if not self._manual_on:
+            return False
+        run = self._run
+        for entity_id in self._due_order(now):
+            if entity_id not in self._manual_on:
+                continue
+            if run is not None and self._run_holds(entity_id, run, now):
+                self._manual_on[entity_id] = None
+                continue
+            self._manual_on.pop(entity_id, None)
+            confirmed, error = await self._command(on=False, entity_id=entity_id)
+            context: dict[str, object] = {
+                "zone_id": self._zone_id_for(entity_id),
+                "entity_id": entity_id,
+            }
+            # The close's OWN kind comes from the plan's pump id, never from
+            # `zone_id is not None`: a valve whose zone was deleted while it
+            # was held resolves to no zone, and choosing on that would report
+            # "the pump did not confirm off" about a zone valve.
+            self._outcome(
+                AnomalyKind.PUMP_OFF_UNCONFIRMED
+                if entity_id == self.plan.pump_entity_id
+                else AnomalyKind.VALVE_CLOSE_UNCONFIRMED,
+                context,
+                confirmed=confirmed,
+                error=error,
+            )
+            self._report(AnomalyKind.MANUAL_VALVE_TIMEOUT, context)
+        return not self._manual_on
+
+    def _due_order(self, now: datetime) -> list[str]:
+        """Return the held entities whose deadline has elapsed, in command order.
+
+        `plan.governed_entities` order — pump first, then plan order — so two
+        deadlines due in the same `advance` are served in one defined
+        sequence. Held entities the CURRENT plan no longer governs (a zone
+        deleted while its valve was held open by hand, the plan swapped in
+        place) are appended AFTER that pass rather than dropped: their
+        deadline would otherwise sit elapsed in `_manual_on` for ever, named
+        by `next_wakeup`, re-armed on a past instant and fired at once.
+
+        A `None` value is never due: it is a spent deadline (Decision 2), and
+        the switch it belongs to is released by its slot's own close — or, if
+        that close never confirms, by the fresh deadline `_rearm_spent` gives
+        it once the run lets go.
+        """
+        due = {
+            entity_id
+            for entity_id, deadline in self._manual_on.items()
+            if deadline is not None and now >= deadline
+        }
+        governed = self.plan.governed_entities
+        order = [entity_id for entity_id in governed if entity_id in due]
+        order += [
+            entity_id
+            for entity_id in self._manual_on
+            if entity_id in due and entity_id not in governed
+        ]
+        return order
+
+    def _run_holds(self, entity_id: str, run: CycleRun, now: datetime) -> bool:
+        """Report whether `run` is itself holding `entity_id` open (Decision 2).
+
+        THE one expression of the Decision 2 predicate. Read off the run's own
+        AD-8 snapshot, never the live plan — exactly as `_recover` and
+        `async_suspend` read `run.pump_entity_id` — so a plan edited while
+        the cycle waters cannot make the engine close a switch that cycle is
+        using, or spare one it is not.
+
+        Two things count, and only while the run is RUNNING:
+
+        - the PUMP, once it has been COMMANDED (`pump_on_confirmed is not
+          None`), confirmed or not. Every remaining zone depends on its
+          pressure, and a pump whose ON went unconfirmed may well be running
+          anyway — closing it mid-cycle is the one move with no recovery;
+        - the valve of the slot that is LIVE AT `now` — `planned_start <= now
+          < planned_end` — while that zone's status is still `PENDING` or
+          `RUNNING`. The window, not `self._zone_index`: this method is
+          reached from `_expire_manual`, which is the FIRST step of
+          `_advance_locked`, so on a single late call that drains several
+          boundaries the index still names an earlier slot. Reading it there
+          would close the valve the loop is about to open, report a timeout
+          for a valve about to water, and flap it.
+
+        The two are deliberately ASYMMETRIC about a failed actuation, and
+        that asymmetry is the point rather than an oversight to tidy away. A
+        FAILED zone is excluded: its open was never confirmed, so whatever
+        holds that valve open it is not this cycle, and sheltering it would
+        leave a hand-opened valve past its maximum with nothing to close it.
+        An unconfirmed PUMP is included for the opposite reason: the cost of
+        being wrong runs the other way — sparing a pump that is really off
+        costs nothing, closing one that is really on starves every zone left.
+        A SKIPPED zone (rain covered it, 0 s) needs no clause at all: its
+        window is empty, so no instant is ever inside it.
+        """
+        if run.status is not CycleStatus.RUNNING:
+            return False
+        if entity_id == run.pump_entity_id and run.pump_on_confirmed is not None:
+            return True
+        return any(
+            zone.valve_entity_id == entity_id
+            and zone.status in (ZoneRunStatus.PENDING, ZoneRunStatus.RUNNING)
+            and zone.planned_start <= now < zone.planned_end
+            for zone in run.zone_runs
+        )
+
+    def _rearm_spent(self, now: datetime) -> None:
+        """Re-arm the bound on a switch the run has stopped holding (3.5).
+
+        A spent deadline (Decision 2) hands the bound to the CYCLE: the
+        slot's own close at the boundary is what releases the switch. When
+        that close is not confirmed no OFF is ever observed, and nothing
+        would look at the entry again — `_due_order` skips a `None` and
+        `next_wakeup` folds in only real datetimes — so the pause would
+        outlive the cycle for ever, with the scheduler stopped, the watchdog
+        returning at once and nothing left to close the valve. That is
+        exactly the permanent, watering-free pause this story exists to
+        remove, and it must not come back through the Decision 2 door.
+
+        So the bound returns the moment the claim goes: a full timeout
+        counted from `now`, and the switch times out normally from there.
+        Deliberately a fresh quote rather than the elapsed one — the cycle
+        really was watering that zone, and the operator's session is only
+        now unaccounted for.
+
+        The TAIL of `_advance_locked`, not part of `_expire_manual`: the
+        claim ends inside the transition loop, which runs after expiry.
+        """
+        run = self._run
+        for entity_id, deadline in self._manual_on.items():
+            if deadline is None and (
+                run is None or not self._run_holds(entity_id, run, now)
+            ):
+                self._manual_on[entity_id] = self._manual_deadline(now)
+
+    def _zone_id_for(self, entity_id: str) -> str | None:
+        """Return the zone the CURRENT plan drives with `entity_id`, or None.
+
+        The anomaly SUBJECT of a safety close (Story 3.5): a valve is keyed
+        by its zone, the pump has none — and neither has a valve whose zone
+        was deleted while it was held open. Read off the plan rather than off
+        a run, like the rest of `_expire_manual`: the switch may have been
+        hand-opened with no cycle anywhere near it.
+        """
+        return next(
+            (
+                spec.zone_id
+                for spec in self.plan.zones
+                if spec.valve_entity_id == entity_id
+            ),
+            None,
+        )
 
     async def async_reconcile(self, now: datetime) -> None:
         """Resync the journal's intent against the hardware, ONCE, at startup.
@@ -1235,10 +1559,11 @@ class Sequencer:
     async def _check_missed(self, now: datetime) -> None:
         """File, report and make up every cycle of today that never ran (Story 3.3).
 
-        THE watchdog. Called at the top of every `_advance_locked` — so at
-        each window end the re-armed callback serves, and at every cycle
-        transition — and once explicitly from `async_reconcile`, after the
-        gate lifts and BEFORE its deferred-queue drain (see there).
+        THE watchdog. Called by every `_advance_locked`, right after the
+        safety-timeout closes and before any transition — so at each window
+        end the re-armed callback serves, and at every cycle transition — and
+        once explicitly from `async_reconcile`, after the gate lifts and
+        BEFORE its deferred-queue drain (see there).
         `watchdog.missed_cycles` makes the whole decision (pure, on the
         virtual clock); this method is the effects.
 
@@ -1304,8 +1629,15 @@ class Sequencer:
         lookback is today only, so a window that closed before the day turned
         is no longer visible to `missed_cycles`, and the start deferred
         behind the pause is dropped as stale at the resume. Neither leaves a
-        record. That is the accepted cost of an unbounded pause, and it is
-        what Story 3.5's safety timeout exists to bound.
+        record.
+
+        Story 3.5's safety timeout is what BOUNDS that exposure, and bounds
+        is all it does. Every hand-opened switch now carries a deadline of at
+        most the configured maximum, so a pause can no longer last until the
+        operator remembers — but a chain of overlapping hand-opens still can
+        cross midnight, and a switch the RUNNING cycle itself holds open is
+        released by its slot's close rather than by its deadline (Decision
+        2). So the cost above is narrowed, not removed.
         """
         if not self._reconciled or self.manual_override:
             return

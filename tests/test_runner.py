@@ -77,6 +77,7 @@ from tests.common import (
     register_switch_domain,
     zone_subentry_data,
 )
+from tests.engine.common import MANUAL_TIMEOUT_S
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -93,6 +94,7 @@ def make_plan(*, morning_enabled: bool = True) -> ControllerPlan:
         morning_enabled=morning_enabled,
         morning_start=time(7, 0),
         evening_start=time(20, 0),
+        manual_timeout_s=MANUAL_TIMEOUT_S,
         zones=(
             ZoneSpec(
                 zone_id="zone-1",
@@ -1354,6 +1356,7 @@ async def test_replan_rearms_the_daily_starts_from_the_new_plan(
         morning_enabled=True,
         morning_start=time(7, 0),
         evening_start=time(7, 15),
+        manual_timeout_s=MANUAL_TIMEOUT_S,
         zones=(
             ZoneSpec(
                 zone_id="zone-1",
@@ -1766,6 +1769,85 @@ async def test_a_manual_pause_and_resume_keep_exactly_one_registration(
     assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls] == [
         ("turn_on", PUMP),
         ("turn_on", VALVE_1),
+        ("turn_off", VALVE_1),
+        ("turn_on", VALVE_2),
+    ]
+    assert live == 1
+    assert peak == 1
+
+    runner.async_shutdown()
+
+
+async def test_a_pending_safety_deadline_keeps_exactly_one_registration(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    paris: None,
+) -> None:
+    """AD-3 with Story 3.5 wired: the deadline shares the ONE handle.
+
+    `next_wakeup` became a minimum in this story, so a pending safety
+    deadline is served by the same re-armed point-in-time callback as the
+    watchdog's window end and a running cycle's boundaries. Asserted while
+    idle, across the expiry itself and again mid-cycle — a second
+    registration anywhere in there would break AD-3.
+    """
+    live = 0
+    peak = 0
+    real = getattr(timing, "async_track_point_in_time")  # noqa: B009 — an import, not an export
+
+    def _tracked(*args: Any, **kwargs: Any) -> Callable[[], None]:
+        nonlocal live, peak
+        unsubscribe = real(*args, **kwargs)
+        live += 1
+        peak = max(peak, live)
+
+        def _wrapped() -> None:
+            nonlocal live
+            live -= 1
+            unsubscribe()
+
+        return _wrapped
+
+    monkeypatch.setattr(timing, "async_track_point_in_time", _tracked)
+    calls = register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, sequencer, _ = make_entry_runner(hass, make_plan())
+    await runner.async_start()
+    assert live == 1
+
+    # Idle, a deadline at 07:29 pending, and the daily start queued behind it.
+    await runner.async_switch_observed(VALVE_1, is_on=True, manual=True)
+    assert live == 1
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    assert sequencer.deferred_kinds == (CycleKind.MORNING,)
+    assert live == 1
+
+    # The watchdog's window end wins the `min` first and stays silent.
+    await fire_at(hass, freezer, "2026-07-31 07:20:00+02:00")
+    assert calls == []
+    assert live == 1
+
+    # ...then the deadline: closed, released, and the queue watered.
+    await fire_at(hass, freezer, "2026-07-31 07:29:00+02:00")
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls] == [
+        ("turn_off", VALVE_1),
+        ("turn_on", PUMP),
+        ("turn_on", VALVE_1),
+    ]
+    assert sequencer.manual_override is False
+    assert live == 1
+    assert peak == 1
+
+    # Mid-cycle, a second hand-open whose deadline falls past the boundary:
+    # the handle keeps the boundary and no zone slot is pre-empted.
+    freezer.move_to("2026-07-31 07:30:00+02:00")
+    await runner.async_switch_observed(VALVE_2, is_on=True, manual=True)
+    assert sequencer.manual_override is True
+    assert live == 1
+
+    await fire_at(hass, freezer, "2026-07-31 07:39:00+02:00")
+    assert [(call.service, call.data[ATTR_ENTITY_ID]) for call in calls][3:] == [
         ("turn_off", VALVE_1),
         ("turn_on", VALVE_2),
     ]

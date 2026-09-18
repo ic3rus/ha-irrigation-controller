@@ -39,6 +39,13 @@ _DEFAULT_ACTUATION_TIMEOUT_S = 10
 _MIN_ACTUATION_TIMEOUT_S = 1
 _MAX_ACTUATION_TIMEOUT_S = 120
 
+# Same values as const.py's DEFAULT/MIN/MAX_MANUAL_TIMEOUT_MINUTES, pinned by
+# tests/test_init.py like everything else duplicated here. MINUTES at this
+# surface (the stored contract), seconds on the plan.
+_DEFAULT_MANUAL_TIMEOUT_MINUTES = 30
+_MIN_MANUAL_TIMEOUT_MINUTES = 1
+_MAX_MANUAL_TIMEOUT_MINUTES = 240
+
 # Home Assistant's entity-id grammar, restated here because the engine cannot
 # import `homeassistant.core.valid_entity_id` (AD-1). Shape only: whether the
 # entity exists is a runtime question the switch port answers.
@@ -168,6 +175,31 @@ def parse_actuation_timeout(options: Mapping[str, object]) -> int:
     return value
 
 
+def _manual_timeout_s(options: Mapping[str, object], context: str) -> int:
+    """Return the stored manual-valve safety timeout in seconds, or fail loud.
+
+    `parse_actuation_timeout`'s trust boundary and `_duration_s`'s units: the
+    key holds whole MINUTES (the UI and storage surface) and the plan carries
+    SECONDS. An ABSENT key is the default, not an error — entries created
+    before Story 3.5 have no such key and must keep loading. A present key is
+    validated for type (bool rejected: it is an int subclass, and True
+    minutes is exactly the storage drift this builder exists to catch) and
+    range; there is no "disabled" value, because a pause nothing closes is
+    the failure this timeout exists to remove (Decision 1).
+    """
+    value = options.get("manual_timeout", _DEFAULT_MANUAL_TIMEOUT_MINUTES)
+    if isinstance(value, bool) or not isinstance(value, int):
+        msg = f"{context}: 'manual_timeout' must be whole minutes, got {value!r}"
+        raise PlanValidationError(msg)
+    if not _MIN_MANUAL_TIMEOUT_MINUTES <= value <= _MAX_MANUAL_TIMEOUT_MINUTES:
+        msg = (
+            f"{context}: 'manual_timeout' must be {_MIN_MANUAL_TIMEOUT_MINUTES}-"
+            f"{_MAX_MANUAL_TIMEOUT_MINUTES} minutes, got {value!r}"
+        )
+        raise PlanValidationError(msg)
+    return value * _SECONDS_PER_MINUTE
+
+
 def build_plan(
     options: Mapping[str, object],
     zones: Iterable[tuple[str, str, Mapping[str, object]]],
@@ -210,5 +242,6 @@ def build_plan(
         morning_enabled=_bool(options, "morning_enabled", context),
         morning_start=_start_time(options, "morning_start", context),
         evening_start=_start_time(options, "evening_start", context),
+        manual_timeout_s=_manual_timeout_s(options, context),
         zones=specs,
     )

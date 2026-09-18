@@ -244,3 +244,41 @@ def test_actuation_timeout_out_of_range_fails_loud(out_of_range: int) -> None:
     """Values outside 1..120 seconds are rejected naming the key."""
     with pytest.raises(PlanValidationError, match="actuation_timeout"):
         parse_actuation_timeout({**OPTIONS, "actuation_timeout": out_of_range})
+
+
+# --------------------------------------------------------------------------
+# The manual-valve safety timeout (Story 3.5)
+# --------------------------------------------------------------------------
+
+
+def test_manual_timeout_valid_value_becomes_seconds() -> None:
+    """A stored in-range int comes back as SECONDS (valid class).
+
+    Minutes at the stored surface, seconds on the plan — the zone-duration
+    convention, not the actuation timeout's seconds-everywhere one.
+    """
+    plan = build_plan({**OPTIONS, "manual_timeout": 45}, [zone_item()])
+    assert plan.manual_timeout_s == 2700
+
+
+def test_manual_timeout_absent_key_is_the_default() -> None:
+    """Entries created before the key existed must keep loading (Story 3.5)."""
+    assert build_plan(OPTIONS, [zone_item()]).manual_timeout_s == 1800
+
+
+@pytest.mark.parametrize("bad_type", ["30", 30.0, None, True])
+def test_manual_timeout_wrong_type_fails_loud(bad_type: Any) -> None:
+    """Non-int values (incl. bool, an int subclass) are storage drift."""
+    with pytest.raises(PlanValidationError, match="manual_timeout"):
+        build_plan({**OPTIONS, "manual_timeout": bad_type}, [zone_item()])
+
+
+@pytest.mark.parametrize("out_of_range", [0, -5, 241])
+def test_manual_timeout_out_of_range_fails_loud(out_of_range: int) -> None:
+    """Values outside 1..240 minutes are rejected naming the key.
+
+    `0` included: there is no "disabled" value (Decision 1) — a pause nothing
+    ever closes is the failure the timeout exists to remove.
+    """
+    with pytest.raises(PlanValidationError, match="manual_timeout"):
+        build_plan({**OPTIONS, "manual_timeout": out_of_range}, [zone_item()])

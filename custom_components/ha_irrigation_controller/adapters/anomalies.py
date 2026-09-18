@@ -67,7 +67,14 @@ _SUBJECT_KEYS: Final[dict[AnomalyKind, tuple[str, ...]]] = {
     AnomalyKind.PUMP_ON_UNCONFIRMED: ("entity_id",),
     AnomalyKind.PUMP_OFF_UNCONFIRMED: ("entity_id",),
     AnomalyKind.VALVE_OPEN_UNCONFIRMED: ("zone_id",),
-    AnomalyKind.VALVE_CLOSE_UNCONFIRMED: ("zone_id",),
+    # `entity_id` is the FALLBACK, never the usual answer: every close a
+    # cycle issues carries a `zone_id` and is keyed by it exactly as before.
+    # It is reached only by Story 3.5's safety close of a valve whose zone
+    # was deleted while it was held open, whose context has `zone_id: None`
+    # — without it that close would land on the bare `valve_close_unconfirmed`
+    # id, one controller-level issue shared by every zone-less valve and
+    # poppable by any other subject's `clear`.
+    AnomalyKind.VALVE_CLOSE_UNCONFIRMED: ("zone_id", "entity_id"),
     AnomalyKind.CONFIGURED_ENTITY_MISSING: ("zone_id", "role"),
     AnomalyKind.CYCLE_INTERRUPTED: (),
     # Story 3.2: one issue for the whole controller, like the interruption
@@ -76,6 +83,14 @@ _SUBJECT_KEYS: Final[dict[AnomalyKind, tuple[str, ...]]] = {
     # Story 3.3: one issue for the whole controller, like the recovery it
     # sits next to. Never cleared by the engine — acknowledge only.
     AnomalyKind.MISSED_CYCLE: (),
+    # Story 3.5: per SWITCH, not per controller — two valves left open by hand
+    # are two things to go and close. `CONFIGURED_ENTITY_MISSING`'s
+    # first-key-wins shape, so a zone valve is keyed by its zone and the pump
+    # — which has no zone — by its entity id. The zone key is the config
+    # SUBENTRY ID (a uuid, not the zone's name): opaque to read, but stable
+    # across a rename and across a valve swap, which is what a deduplication
+    # key has to be.
+    AnomalyKind.MANUAL_VALVE_TIMEOUT: ("zone_id", "entity_id"),
     AnomalyKind.JOURNAL_SAVE_FAILED: (),
 }
 

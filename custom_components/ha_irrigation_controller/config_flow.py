@@ -53,6 +53,7 @@ from .const import (
     CONF_EVENING_DURATION,
     CONF_EVENING_START,
     CONF_HUMIDITY_SENSOR,
+    CONF_MANUAL_TIMEOUT,
     CONF_MORNING_DURATION,
     CONF_MORNING_ENABLED,
     CONF_MORNING_START,
@@ -65,18 +66,21 @@ from .const import (
     CONF_VALVE_SWITCH,
     DEFAULT_ACTUATION_TIMEOUT_S,
     DEFAULT_EVENING_START,
+    DEFAULT_MANUAL_TIMEOUT_MINUTES,
     DEFAULT_MORNING_START,
     DEFAULT_RAIN_EXPOSED,
     DEFAULT_RAIN_FACTOR,
     DEFAULT_ZONE_DURATION_MINUTES,
     DOMAIN,
     MAX_ACTUATION_TIMEOUT_S,
+    MAX_MANUAL_TIMEOUT_MINUTES,
     MAX_RAIN_FACTOR,
     MAX_ZONE_DURATION_MINUTES,
     MIN_ACTUATION_TIMEOUT_S,
     MIN_HA_MAJOR,
     MIN_HA_MINOR,
     MIN_HA_VERSION,
+    MIN_MANUAL_TIMEOUT_MINUTES,
     MIN_RAIN_FACTOR,
     MIN_ZONE_DURATION_MINUTES,
     SUBENTRY_TYPE_ZONE,
@@ -261,6 +265,22 @@ def build_controller_schema() -> vol.Schema:
                     unit_of_measurement="s",
                 ),
             ),
+            # The manual-valve safety timeout (Story 3.5). Not clearable —
+            # there is no "never close it" value — so a plain `default=` is
+            # correct, like the actuation timeout above. MINUTES here: this
+            # is a watering-length decision, not a relay-confirmation wait.
+            vol.Required(
+                CONF_MANUAL_TIMEOUT,
+                default=DEFAULT_MANUAL_TIMEOUT_MINUTES,
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=MIN_MANUAL_TIMEOUT_MINUTES,
+                    max=MAX_MANUAL_TIMEOUT_MINUTES,
+                    step=1,
+                    mode=NumberSelectorMode.BOX,
+                    unit_of_measurement="min",
+                ),
+            ),
             # The anomaly push target (Story 3.1): a notify ENTITY, optional
             # and clearable like the weather sensors, hence no `default=`.
             vol.Optional(CONF_NOTIFY_TARGET): EntitySelector(
@@ -285,9 +305,10 @@ def _normalize_controller_input(
     the two are compared as strings by both flows, and a registry id on either
     side would make that comparison silently miss.
 
-    The timeout is rounded to int seconds for the same reason zone durations
-    are rounded to int minutes: `NumberSelector` coerces to float, and the
-    stored contract (and the engine parser) wants whole seconds.
+    Both timeouts are rounded to whole units for the same reason zone
+    durations are: `NumberSelector` coerces to float, and the stored contract
+    (and the engine parsers) wants whole seconds for the actuation timeout
+    and whole minutes for the manual-valve one.
 
     The notify target, when given, is resolved to an entity_id too: the
     registry tracker follows it by entity id, and `parse_notify_target`
@@ -299,6 +320,7 @@ def _normalize_controller_input(
         CONF_MORNING_START: cv.time(user_input[CONF_MORNING_START]).isoformat(),
         CONF_EVENING_START: cv.time(user_input[CONF_EVENING_START]).isoformat(),
         CONF_ACTUATION_TIMEOUT: _round_whole(user_input[CONF_ACTUATION_TIMEOUT]),
+        CONF_MANUAL_TIMEOUT: _round_whole(user_input[CONF_MANUAL_TIMEOUT]),
     }
     if (target := user_input.get(CONF_NOTIFY_TARGET)) is not None:
         normalized[CONF_NOTIFY_TARGET] = _resolve_entity_id(hass, target)

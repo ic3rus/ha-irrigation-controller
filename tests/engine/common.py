@@ -45,6 +45,14 @@ def aware(
 # handed — so only a `ZoneInfo` exercises the 23- and 25-hour days.
 PARIS = ZoneInfo("Europe/Paris")
 
+# THE manual-valve safety timeout every engine suite runs on (Story 3.5), in
+# seconds. It mirrors `const.DEFAULT_MANUAL_TIMEOUT_MINUTES` so the suites
+# exercise the shipped behaviour, but it does NOT pin it: the engine cannot
+# import `const.py` (AD-1), and `tests/test_init.py`'s drift trio is what
+# holds the two values together. One definition here rather than a literal
+# per call site, so a suite-wide change is one edit.
+MANUAL_TIMEOUT_S = 1800
+
 
 def paris(  # noqa: PLR0913 — a datetime constructor; one keyword per field is the readable shape
     year: int,
@@ -225,12 +233,20 @@ def make_plan(
     morning_enabled: bool = True,
     morning_start: time = time(7, 0),
     evening_start: time = time(20, 0),
+    manual_timeout_s: int = MANUAL_TIMEOUT_S,
 ) -> ControllerPlan:
-    """Build a controller plan with representative defaults."""
+    """Build a controller plan with representative defaults.
+
+    `manual_timeout_s` defaults to `MANUAL_TIMEOUT_S` (see there for what it
+    does and does not pin), so a suite that does not care about Story 3.5
+    gets the shipped behaviour; a test that needs a deadline inside or
+    outside its own time map passes its own.
+    """
     return ControllerPlan(
         pump_entity_id=pump,
         morning_enabled=morning_enabled,
         morning_start=morning_start,
         evening_start=evening_start,
+        manual_timeout_s=manual_timeout_s,
         zones=zones,
     )

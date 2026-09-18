@@ -54,6 +54,7 @@ from tests.common import (
     fire_at,
     register_switch_domain,
 )
+from tests.engine.common import MANUAL_TIMEOUT_S
 
 if TYPE_CHECKING:
     from freezegun.api import FrozenDateTimeFactory
@@ -71,6 +72,7 @@ def dst_plan(morning_start: time) -> ControllerPlan:
         morning_enabled=True,
         morning_start=morning_start,
         evening_start=time(20, 0),
+        manual_timeout_s=MANUAL_TIMEOUT_S,
         zones=(
             ZoneSpec(
                 zone_id="zone-1",

@@ -156,6 +156,21 @@ class AnomalyKind(StrEnum):
       a cycle already in history in any status (completed, waived, cancelled
       or interrupted), a live or deferred run for that day and kind, and an
       unconsumed day credit are all silent.
+    - MANUAL_VALVE_TIMEOUT (Story 3.5) — a governed switch the operator opened
+      BY HAND held the scheduler paused for the configured safety timeout, so
+      the engine closed it itself through the verified port and released the
+      pause. Context: `entity_id` (the switch that was closed) and `zone_id`
+      (the zone whose valve it is, None for the pump and for a valve whose
+      zone was deleted while it was held). Raised per switch, once per manual
+      open: expiry never retries and never re-arms. An unconfirmed close
+      raises VALVE_CLOSE_UNCONFIRMED / PUMP_OFF_UNCONFIRMED alongside it and
+      the switch is released anyway — a pause must never survive its own
+      timeout. NEVER cleared by the engine, like CYCLE_RECOVERED and
+      MISSED_CYCLE: it is news the operator acknowledges. Silent in two
+      cases: a switch closed BY HAND before its deadline (nothing commanded,
+      nothing reported), and a switch the RUNNING cycle itself holds open —
+      the cycle's claim wins, the deadline is spent and the slot's own close
+      releases it.
     """
 
     PUMP_ON_UNCONFIRMED = "pump_on_unconfirmed"
@@ -167,6 +182,7 @@ class AnomalyKind(StrEnum):
     CYCLE_INTERRUPTED = "cycle_interrupted"
     CYCLE_RECOVERED = "cycle_recovered"
     MISSED_CYCLE = "missed_cycle"
+    MANUAL_VALVE_TIMEOUT = "manual_valve_timeout"
 
 
 class AnomalyPort(Protocol):

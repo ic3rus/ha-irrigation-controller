@@ -31,6 +31,11 @@ CONF_MORNING_ENABLED = "morning_enabled"
 CONF_MORNING_START = "morning_start"
 CONF_EVENING_START = "evening_start"
 CONF_ACTUATION_TIMEOUT = "actuation_timeout"
+# How long a switch opened BY HAND may hold the scheduler paused before the
+# controller closes it itself (Story 3.5). Deliberately NOT
+# `manual_valve_timeout`: that string is the ANOMALY kind the expiry raises,
+# and one literal meaning two things is exactly the drift the two names avoid.
+CONF_MANUAL_TIMEOUT = "manual_timeout"
 # The notify ENTITY (`notify.*`) anomalies are pushed to (Story 3.1). Optional
 # and clearable like the weather sensors: absent means no push, everything
 # else in the anomaly pipeline still happens. Legacy `notify.<service>` names
@@ -46,6 +51,19 @@ CONF_NOTIFY_TARGET = "notify_target"
 DEFAULT_ACTUATION_TIMEOUT_S = 10
 MIN_ACTUATION_TIMEOUT_S = 1
 MAX_ACTUATION_TIMEOUT_S = 120
+
+# Manual-valve safety timeout — MINUTES at the UI and storage surface,
+# seconds inside the engine (the zone-duration convention, not the actuation
+# timeout's): this is a watering-length decision the operator makes in the
+# units they think in. NOT disablable (Story 3.5, Decision 1) — the bounds
+# start at one minute and stop at four hours, so a hand-opened switch always
+# closes itself eventually; an unbounded pause would take the scheduler, the
+# watchdog and a start deferred across midnight down with it. Absent key =
+# the default (entries created before Story 3.5 have no such key and must
+# keep loading).
+DEFAULT_MANUAL_TIMEOUT_MINUTES = 30
+MIN_MANUAL_TIMEOUT_MINUTES = 1
+MAX_MANUAL_TIMEOUT_MINUTES = 240
 
 # Verb-named actions (FR5, AD-10). Registered in `async_setup` and NEVER
 # removed on unload (`action-setup`), so an automation referencing one stays

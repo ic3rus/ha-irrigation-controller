@@ -205,6 +205,61 @@ async def test_a_hand_opened_valve_defers_the_start_and_its_close_waters_it(
     await unload(hass, entry)
 
 
+async def test_a_hand_opened_valve_closes_itself_at_the_safety_timeout(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 3.5 AC 1-2 end to end, through the real setup path.
+
+    06:55 the operator opens zone A's valve on site; 07:00 the daily start
+    fires into the queue; 07:25 the 30-minute safety timeout elapses and the
+    controller closes the valve itself through the verified switch path,
+    raises ONE Repairs issue keyed by the zone, pushes ONE notification —
+    and waters the deferred cycle in the same call.
+    """
+    pushes = register_notify_domain(hass)
+    events = record_events(hass)
+    entry, calls = await setup_entry(hass, freezer)
+    sequencer = entry.runtime_data.sequencer
+    zone_a = next(iter(entry.subentries.values()))
+
+    await flip(hass, freezer, "2026-07-31 06:55:00+02:00", VALVE_1, STATE_ON)
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+
+    assert sequencer.deferred_kinds == (CycleKind.MORNING,)
+    assert calls == []
+    assert our_issues(hass) == []
+    assert pushes == []
+
+    # The window end at 07:10 comes first and must stay silent; the deadline
+    # is what the ONE timer then points at.
+    await fire_at(hass, freezer, "2026-07-31 07:10:00+02:00")
+    assert calls == []
+    assert our_issues(hass) == []
+
+    await fire_at(hass, freezer, "2026-07-31 07:25:00+02:00")
+
+    assert commands(calls) == [
+        ("turn_off", VALVE_1),
+        ("turn_on", PUMP),
+        ("turn_on", VALVE_1),
+    ]
+    assert sequencer.manual_override is False
+    assert cycle_status(hass, entry).attributes["manual_override"] is False
+    run = sequencer.current_run
+    assert run is not None
+    assert run.status is CycleStatus.RUNNING
+    assert run.cycle_id == "2026-07-31-morning"
+    assert run.late_rerun is False
+    # ONE issue, keyed by the zone; ONE push; ONE bus event.
+    assert our_issues(hass) == [f"manual_valve_timeout:{zone_a.subentry_id}"]
+    assert len(pushes) == 1
+    assert [event.data["anomaly"] for event in events] == ["manual_valve_timeout"]
+
+    await unload(hass, entry)
+
+
 async def test_our_own_cycle_never_pauses_itself(
     hass: HomeAssistant,
     freezer: FrozenDateTimeFactory,

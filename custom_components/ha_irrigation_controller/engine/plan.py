@@ -59,6 +59,12 @@ class ControllerPlan:
     morning_enabled: bool
     morning_start: time
     evening_start: time
+    # How long a hand-opened governed switch may hold the scheduler paused
+    # before the engine closes it itself (Story 3.5). SECONDS here, minutes
+    # at the UI and storage surface — the zone-duration convention. No
+    # default on purpose: every other field is explicit, and a plan built
+    # without it would silently quote a timeout nobody configured.
+    manual_timeout_s: int
     zones: tuple[ZoneSpec, ...]
 
     def start_time(self, kind: CycleKind) -> time:
