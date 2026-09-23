@@ -40,8 +40,21 @@ time axis running from the cycle's start to its end, and one segment per zone,
 proportional to its duration and labelled in plain text with the zone name and
 its planned start–end in your Home Assistant time format. Before a cycle runs,
 the rows come from the configured plan (base durations); once a cycle is
-running, its quoted windows are drawn instead. Live progress, the 7-day
-history, the health indicator and the visual editor arrive in later stories.
+running, its quoted windows are drawn instead, and they stay on screen after
+it finishes — the day's last cycle until the irrigation day changes, an
+earlier one until the next cycle finishes. While a cycle runs, the running
+zone fills live and a cursor crosses the row once per second; each zone is
+coloured by the engine's status (pending, running, completed, failed,
+skipped) and a completed, cancelled or interrupted cycle says so in its
+header. Progress
+is computed from the wall clock against the backend's timestamps — corrected
+by the client/server offset each pushed document's `generated_at` yields, so a
+tablet whose clock is minutes off still shows the truth — never from
+accumulated ticks: a tab throttled in the background lands at the right
+position the moment it is visible again. A zone duration edited while a cycle
+runs (`set_zone_duration` or a zone edit) reaches the card as the next pushed
+document, milliseconds later. The 7-day history, the health indicator and the
+visual editor arrive in later stories.
 
 The card reads the [state view](#state-view-and-websocket-api) over the
 `state_subscribe` WebSocket command and nothing else — no entity states, no
@@ -785,7 +798,9 @@ The subscription follows the engine-state signal the entities already use: a
 document arrives after every engine step (a cycle start, a zone boundary, a
 completion, a cancel, a season change, a manual-override change, an anomaly
 raised, cleared or acknowledged, a config edit deferred behind a running
-cycle). One engine step can push more than once. While the entry reloads the
+cycle). A document is also pushed on every mid-run configuration edit whose
+new plan validates — not only the first — so `plan.today` carries the
+recalculated schedule at once. One engine step can push more than once. While the entry reloads the
 subscription stays open: pushes that land while the engine is torn down are
 skipped, and the rebuilt engine's first push delivers a fresh document on the
 same subscription.

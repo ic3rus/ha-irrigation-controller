@@ -92,10 +92,28 @@ export function eveningRun(overrides: Partial<RunView> = {}): RunView {
   };
 }
 
+/** The evening run once every zone is done: `status` completed, actuals filled in. */
+export function completedEveningRun(overrides: Partial<RunView> = {}): RunView {
+  const run = eveningRun({ status: "completed", live_zone_id: null, ...overrides });
+  return {
+    ...run,
+    zones: run.zones.map((zone) => ({
+      ...zone,
+      status: "completed",
+      actual_start: zone.planned_start,
+      actual_end: zone.planned_end,
+      effective_s: zone.duration_s,
+    })),
+  };
+}
+
 export interface ViewOptions {
   morningEnabled?: boolean;
   current?: RunView | null;
+  last?: RunView | null;
   cycles?: ScheduleView[];
+  /** `generated_at` on the wire; the card's clock offset is estimated from it. */
+  generatedAt?: string;
 }
 
 export function stateView(options: ViewOptions = {}): StateView {
@@ -104,7 +122,7 @@ export function stateView(options: ViewOptions = {}): StateView {
   return {
     schema_version: 1,
     version: "0.1.0",
-    generated_at: "2026-09-23T04:00:00+00:00",
+    generated_at: options.generatedAt ?? "2026-09-23T04:00:00+00:00",
     controller: {
       entry_id: "entry-1",
       season_enabled: true,
@@ -142,7 +160,7 @@ export function stateView(options: ViewOptions = {}): StateView {
       ],
       today: { irrigation_day: IRRIGATION_DAY, cycles },
     },
-    runs: { current: options.current ?? null, last: null },
+    runs: { current: options.current ?? null, last: options.last ?? null },
     ledger: {
       settled_cycle_id: null,
       day_credit: null,

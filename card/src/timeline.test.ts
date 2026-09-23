@@ -1,7 +1,27 @@
 import { describe, expect, it } from "vitest";
 
-import { EVENING, eveningRun, MORNING, stateView, TIME_ZONE, zoneRun } from "./fixtures.test-helpers";
-import { buildTimeline, isTodaysRun, localDate } from "./timeline";
+import {
+  completedEveningRun,
+  EVENING,
+  eveningRun,
+  MORNING,
+  stateView,
+  TIME_ZONE,
+  zoneRun,
+} from "./fixtures.test-helpers";
+import type { TimelineRow, TimelineSegment } from "./timeline";
+import { buildTimeline, cursorAt, isTodaysRun, localDate, progressOf } from "./timeline";
+
+const ms = (iso: string): number => Date.parse(iso);
+
+/** The evening run's row: Lawn running 18:00–18:20, Beds pending, axis 18:00–18:30. */
+function runningRow(): TimelineRow {
+  const [, evening] = buildTimeline(stateView({ current: eveningRun() }), TIME_ZONE).rows;
+  if (evening === undefined) {
+    throw new Error("no evening row");
+  }
+  return evening;
+}
 
 describe("buildTimeline", () => {
   it("draws both cycles from the plan, in plan order, when no run exists", () => {
@@ -203,6 +223,215 @@ describe("buildTimeline", () => {
       end: bare.scheduled_start,
       segments: [],
     });
+  });
+});
+
+describe("statuses", () => {
+  it("stamps every plan segment and row `planned`", () => {
+    const { rows } = buildTimeline(stateView(), TIME_ZONE);
+
+    expect(rows.every((row) => row.status === "planned")).toBe(true);
+    expect(rows.flatMap((row) => row.segments).every((segment) => segment.status === "planned")).toBe(true);
+  });
+
+  it("copies the engine's zone and cycle statuses verbatim from a run", () => {
+    const row = runningRow();
+
+    expect(row.status).toBe("running");
+    expect(row.segments.map((segment) => segment.status)).toEqual(["running", "pending"]);
+  });
+
+  it("carries completed, failed and skipped through untouched", () => {
+    const run = eveningRun({
+      zones: [
+        zoneRun({ zone_id: "z1", status: "completed" }),
+        zoneRun({ zone_id: "z2", status: "failed" }),
+        zoneRun({ zone_id: "z3", status: "skipped" }),
+      ],
+    });
+    const [, evening] = buildTimeline(stateView({ current: run }), TIME_ZONE).rows;
+
+    expect(evening?.segments.map((segment) => segment.status)).toEqual(["completed", "failed", "skipped"]);
+  });
+
+  it("keeps a cancelled run's row: the cycle says cancelled, z1 terminal, z2 still pending", () => {
+    const cancelled = eveningRun({
+      status: "cancelled",
+      live_zone_id: null,
+      zones: [
+        zoneRun({ zone_id: "z1", status: "completed" }),
+        zoneRun({ zone_id: "z2", status: "pending" }),
+      ],
+    });
+    const [, evening] = buildTimeline(stateView({ last: cancelled }), TIME_ZONE).rows;
+
+    expect(evening).toMatchObject({ source: "run", status: "cancelled" });
+    expect(evening?.segments.map((segment) => segment.status)).toEqual(["completed", "pending"]);
+  });
+});
+
+describe("runs.last in the authority rule", () => {
+  it("draws the cycle from runs.last once current is cleared (the cycle ended)", () => {
+    const view = stateView({ current: null, last: completedEveningRun() });
+    const [morning, evening] = buildTimeline(view, TIME_ZONE).rows;
+
+    expect(morning?.source).toBe("plan");
+    expect(evening).toMatchObject({
+      source: "run",
+      status: "completed",
+      // The run's quoted envelope, not the plan's 18:35.
+      end: "2026-09-23T18:30:00+00:00",
+    });
+    expect(evening?.segments.every((segment) => segment.status === "completed")).toBe(true);
+  });
+
+  it("rejects yesterday's last run: the plan is drawn", () => {
+    const yesterday = completedEveningRun({
+      cycle_id: "2026-09-22-evening",
+      configured_start: "2026-09-22T18:00:00+00:00",
+      scheduled_start: "2026-09-22T18:00:00+00:00",
+    });
+    const [, evening] = buildTimeline(stateView({ last: yesterday }), TIME_ZONE).rows;
+
+    expect(evening).toMatchObject({ source: "plan", status: "planned", end: "2026-09-23T18:35:00+00:00" });
+  });
+
+  it("prefers current over last for the same cycle", () => {
+    const view = stateView({ current: eveningRun(), last: completedEveningRun() });
+    const [, evening] = buildTimeline(view, TIME_ZONE).rows;
+
+    expect(evening?.status).toBe("running");
+  });
+
+  it("lets last answer for the morning while current runs the evening", () => {
+    const morningDone = completedEveningRun({
+      cycle_id: "2026-09-23-morning",
+      kind: "morning",
+      configured_start: "2026-09-23T05:00:00+00:00",
+      scheduled_start: "2026-09-23T05:00:00+00:00",
+    });
+    const view = stateView({ current: eveningRun(), last: morningDone });
+    const [morning, evening] = buildTimeline(view, TIME_ZONE).rows;
+
+    expect(morning).toMatchObject({ source: "run", status: "completed" });
+    expect(evening).toMatchObject({ source: "run", status: "running" });
+  });
+
+  it("keeps an unplanned kind's row from last once current is cleared; current wins while both exist", () => {
+    // `run_now(morning)` while the morning cycle is disabled, now finished.
+    const morningDone = completedEveningRun({
+      cycle_id: "2026-09-23-morning",
+      kind: "morning",
+      manual: true,
+      configured_start: "2026-09-23T05:00:00+00:00",
+      scheduled_start: "2026-09-23T09:00:00+00:00",
+      zones: [
+        zoneRun({
+          zone_id: "z1",
+          name: "Lawn",
+          planned_start: "2026-09-23T09:00:00+00:00",
+          planned_end: "2026-09-23T09:10:00+00:00",
+        }),
+      ],
+    });
+    const { rows } = buildTimeline(stateView({ morningEnabled: false, last: morningDone }), TIME_ZONE);
+    expect(rows.map((row) => [row.kind, row.source, row.status])).toEqual([
+      ["morning", "run", "completed"],
+      ["evening", "plan", "planned"],
+    ]);
+
+    const morningAgain = eveningRun({
+      kind: "morning",
+      manual: true,
+      configured_start: "2026-09-23T05:00:00+00:00",
+      scheduled_start: "2026-09-23T11:00:00+00:00",
+      zones: [
+        zoneRun({
+          zone_id: "z1",
+          name: "Lawn",
+          status: "running",
+          planned_start: "2026-09-23T11:00:00+00:00",
+          planned_end: "2026-09-23T11:10:00+00:00",
+        }),
+      ],
+    });
+    const both = buildTimeline(
+      stateView({ morningEnabled: false, current: morningAgain, last: morningDone }),
+      TIME_ZONE,
+    ).rows;
+    expect(both.map((row) => [row.kind, row.status])).toEqual([
+      ["morning", "running"],
+      ["evening", "planned"],
+    ]);
+
+    // Yesterday's last run of that kind is still rejected.
+    const stale = completedEveningRun({
+      kind: "morning",
+      configured_start: "2026-09-22T05:00:00+00:00",
+      scheduled_start: "2026-09-22T09:00:00+00:00",
+    });
+    expect(
+      buildTimeline(stateView({ morningEnabled: false, last: stale }), TIME_ZONE).rows.map((row) => row.kind),
+    ).toEqual(["evening"]);
+  });
+});
+
+describe("cursorAt", () => {
+  it("matches the golden value: 18:05 on the 18:00–18:30 axis is 1/6", () => {
+    expect(cursorAt(runningRow(), ms("2026-09-23T18:05:00+00:00"))).toBeCloseTo(0.1667, 4);
+  });
+
+  it("sits on both ends inclusive", () => {
+    const row = runningRow();
+    expect(cursorAt(row, ms("2026-09-23T18:00:00+00:00"))).toBe(0);
+    expect(cursorAt(row, ms("2026-09-23T18:30:00+00:00"))).toBe(1);
+  });
+
+  it("is undefined before the row starts and after it ends", () => {
+    const row = runningRow();
+    expect(cursorAt(row, ms("2026-09-23T17:59:59+00:00"))).toBeUndefined();
+    expect(cursorAt(row, ms("2026-09-23T18:30:01+00:00"))).toBeUndefined();
+  });
+
+  it("is undefined on a zero-length axis (no division by zero) and for an unusable now", () => {
+    const point: TimelineRow = { ...runningRow(), end: runningRow().start };
+    expect(cursorAt(point, ms(point.start))).toBeUndefined();
+    expect(cursorAt(runningRow(), Number.NaN)).toBeUndefined();
+  });
+});
+
+describe("progressOf", () => {
+  const [lawn, beds] = runningRow().segments as [TimelineSegment, TimelineSegment];
+
+  it("matches the golden values: the running zone is a quarter through, the pending one empty", () => {
+    expect(progressOf(lawn, 0.1667)).toBeCloseTo(0.25, 3);
+    expect(progressOf(beds, 0.1667)).toBe(0);
+  });
+
+  it("clamps the running fill to its own segment", () => {
+    // The cursor is past Lawn's end (inside Beds): Lawn is full.
+    expect(progressOf(lawn, 0.9)).toBe(1);
+    // The cursor is before the segment: nothing filled.
+    expect(progressOf({ ...lawn, x0: 0.5, x1: 0.8 }, 0.2)).toBe(0);
+  });
+
+  it("fills a running zone completely once the cursor has left the row", () => {
+    expect(progressOf(lawn, undefined)).toBe(1);
+  });
+
+  it("has nothing to fill on a zero-width running segment", () => {
+    expect(progressOf({ ...lawn, x0: 0.3, x1: 0.3 }, 0.3)).toBe(0);
+    expect(progressOf({ ...lawn, x0: 0.3, x1: 0.3 }, undefined)).toBe(0);
+  });
+
+  it("is full for completed and failed, empty for planned, pending and skipped", () => {
+    for (const status of ["completed", "failed"] as const) {
+      expect(progressOf({ ...lawn, status }, 0.1)).toBe(1);
+      expect(progressOf({ ...lawn, status }, undefined)).toBe(1);
+    }
+    for (const status of ["planned", "pending", "skipped"] as const) {
+      expect(progressOf({ ...lawn, status }, 0.5)).toBe(0);
+    }
   });
 });
 
