@@ -9,7 +9,7 @@
  * evening cycle at 20:00 local is 18:00Z.
  */
 
-import type { RunView, ScheduleView, StateView, ZoneRunView } from "./types";
+import type { CycleKind, HistoryRow, Outcome, RunView, ScheduleView, StateView, ZoneRunView } from "./types";
 
 export const TIME_ZONE = "Europe/Paris";
 export const IRRIGATION_DAY = "2026-09-23";
@@ -107,6 +107,56 @@ export function completedEveningRun(overrides: Partial<RunView> = {}): RunView {
   };
 }
 
+/**
+ * One engine-stamped history row for `day` and `kind` with `outcome`, the
+ * rest at sane defaults: a completed, non-manual, single-run cycle with
+ * zero totals and no rain reading. Override what a test cares about.
+ */
+export function historyRow(
+  day: string,
+  kind: CycleKind,
+  outcome: Outcome,
+  overrides: Partial<HistoryRow> = {},
+): HistoryRow {
+  return {
+    irrigation_day: day,
+    kind,
+    outcome,
+    cycle_id: `${day}-${kind}`,
+    status: "completed",
+    manual: false,
+    waived_by: null,
+    recovery: null,
+    late_rerun: false,
+    runs: 1,
+    ended_at: null,
+    rain_total_mm: null,
+    planned_s: 0,
+    carried_s: 0,
+    effective_s: 0,
+    rain_credit_s: 0,
+    ...overrides,
+  };
+}
+
+/** The spec's golden week: the six days before `IRRIGATION_DAY`, then it, oldest first. */
+export const WEEK = [
+  "2026-09-17",
+  "2026-09-18",
+  "2026-09-19",
+  "2026-09-20",
+  "2026-09-21",
+  "2026-09-22",
+  "2026-09-23",
+];
+
+/** Fourteen rows of `outcome`: every (day, kind) of the golden week. */
+export function fullWeek(outcome: Outcome = "ran"): HistoryRow[] {
+  return WEEK.flatMap((day) =>
+    (["morning", "evening"] as CycleKind[]).map((kind) => historyRow(day, kind, outcome)),
+  );
+}
+
 export interface ViewOptions {
   morningEnabled?: boolean;
   current?: RunView | null;
@@ -114,6 +164,10 @@ export interface ViewOptions {
   cycles?: ScheduleView[];
   /** `generated_at` on the wire; the card's clock offset is estimated from it. */
   generatedAt?: string;
+  /** `history` on the wire: the engine's pruned, outcome-stamped rows. */
+  history?: HistoryRow[];
+  /** `plan.today.irrigation_day`; defaults to `IRRIGATION_DAY`. */
+  irrigationDay?: string;
 }
 
 export function stateView(options: ViewOptions = {}): StateView {
@@ -158,7 +212,7 @@ export function stateView(options: ViewOptions = {}): StateView {
           rain_factor: 0.5,
         },
       ],
-      today: { irrigation_day: IRRIGATION_DAY, cycles },
+      today: { irrigation_day: options.irrigationDay ?? IRRIGATION_DAY, cycles },
     },
     runs: { current: options.current ?? null, last: options.last ?? null },
     ledger: {
@@ -167,7 +221,7 @@ export function stateView(options: ViewOptions = {}): StateView {
       rain_source: null,
       zones: { z1: { deficit_s: 0, rain_baseline_mm: null }, z2: { deficit_s: 0, rain_baseline_mm: null } },
     },
-    history: [],
+    history: options.history ?? [],
     health: { open: [], last: null },
   };
 }

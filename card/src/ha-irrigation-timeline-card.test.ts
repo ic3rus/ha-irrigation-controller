@@ -7,24 +7,33 @@ import {
   completedEveningRun,
   EVENING,
   eveningRun,
+  fullWeek,
+  historyRow,
+  IRRIGATION_DAY,
   MORNING,
   stateView,
   TIME_ZONE,
+  WEEK,
   zoneRun,
 } from "./fixtures.test-helpers";
 import {
   HaIrrigationTimelineCard,
+  HISTORY_HEADER_PX,
+  HISTORY_ROW_PX,
   type IrrigationTimelineCardConfig,
   LANE_HEIGHT,
   RETRY_DELAY_MS,
 } from "./ha-irrigation-timeline-card";
+import * as history from "./history";
 import * as timeline from "./timeline";
-import type { StateView } from "./types";
+import type { CycleKind, Outcome, StateView } from "./types";
 import { WS_TYPE_STATE_GET, WS_TYPE_STATE_SUBSCRIBE } from "./ws";
 
-// The real geometry, wrapped in spies: the memo test below counts the calls
-// the card makes into it (ESM exports cannot be spied on after the fact).
+// The real geometry and history logic, wrapped in spies: the memo tests
+// below count the calls the card makes into them (ESM exports cannot be
+// spied on after the fact).
 vi.mock("./timeline", { spy: true });
+vi.mock("./history", { spy: true });
 
 const CARD_TYPE = "ha-irrigation-timeline-card";
 
@@ -183,6 +192,32 @@ function cursorX(row: HTMLElement): number | undefined {
 
 function renderSpy(card: HaIrrigationTimelineCard): ReturnType<typeof vi.spyOn> {
   return vi.spyOn(card as unknown as { render: () => unknown }, "render");
+}
+
+function strip(card: HaIrrigationTimelineCard): HTMLElement {
+  const section = card.shadowRoot?.querySelector("section.history");
+  if (!(section instanceof HTMLElement)) {
+    throw new Error("no history strip");
+  }
+  return section;
+}
+
+function cell(card: HaIrrigationTimelineCard, day: string, kind: CycleKind): HTMLElement {
+  const found = strip(card).querySelector(`.outcome[data-day="${day}"][data-kind="${kind}"]`);
+  if (!(found instanceof HTMLElement)) {
+    throw new Error(`no cell for ${day} ${kind}`);
+  }
+  return found;
+}
+
+function outcomesOf(card: HaIrrigationTimelineCard, kind: CycleKind): Array<string | null> {
+  return [...strip(card).querySelectorAll(`.outcome[data-kind="${kind}"]`)].map((el) =>
+    el.getAttribute("data-outcome"),
+  );
+}
+
+function iconOf(el: Element): string | null {
+  return el.querySelector("ha-icon")?.getAttribute("icon") ?? null;
 }
 
 /**
@@ -551,10 +586,265 @@ describe("ha-irrigation-timeline-card", () => {
     fake.push(stateView());
     await card.updateComplete;
 
-    expect(card.getCardSize()).toBeGreaterThan(2);
-    // Two cycles of two lanes each: header + 2 × (40 + 2 × LANE_HEIGHT) px = 248 px → 4 rows.
-    expect(card.getGridOptions().rows).toBe(Math.ceil((56 + 2 * (40 + 2 * LANE_HEIGHT)) / 64));
+    // Card size in ~50 px units: the header, then per cycle its header line
+    // plus its two lanes, then the strip (header + two kind rows) on the
+    // same pixel budget getGridOptions uses.
+    const stripPx = HISTORY_HEADER_PX + 2 * HISTORY_ROW_PX;
+    expect(card.getCardSize()).toBe(1 + 2 * (1 + Math.ceil((2 * LANE_HEIGHT) / 50)) + Math.ceil(stripPx / 50));
+    // Two cycles of two lanes each: header + 2 × (40 + 2 × LANE_HEIGHT) px = 248 px,
+    // then the strip: 72 px header and two 28 px kind rows = 128 px → 376 px → 6 rows.
+    expect(card.getGridOptions().rows).toBe(Math.ceil((56 + 2 * (40 + 2 * LANE_HEIGHT) + stripPx) / 64));
     expect(card.getGridOptions().rows).toBeGreaterThan(before);
+  });
+
+  it("sizes the strip by its kind rows: one row less when the morning cycle is disabled", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(stateView());
+    await card.updateComplete;
+    const both = { size: card.getCardSize(), px: card.getGridOptions().rows };
+
+    fake.push(stateView({ morningEnabled: false }));
+    await card.updateComplete;
+    expect(card.getCardSize()).toBeLessThan(both.size);
+    expect(card.getGridOptions().rows).toBeLessThan(both.px);
+    // Evening alone: one cycle of two lanes, then a strip of one kind row.
+    const stripPx = HISTORY_HEADER_PX + HISTORY_ROW_PX;
+    expect(card.getCardSize()).toBe(1 + (1 + Math.ceil((2 * LANE_HEIGHT) / 50)) + Math.ceil(stripPx / 50));
+    // 56 + (40 + 2 × LANE_HEIGHT) + 72 + 28 = 252 px → 4 rows.
+    expect(card.getGridOptions().rows).toBe(Math.ceil((56 + 40 + 2 * LANE_HEIGHT + stripPx) / 64));
+  });
+
+  // --------------------------------------------------------- history strip
+
+  it("renders the strip under today's rows: seven day columns ending today, one row per kind", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(stateView({ history: fullWeek() }));
+    await card.updateComplete;
+
+    const section = strip(card);
+    const title = section.querySelector(".history-header");
+    expect(title?.textContent).toContain("Last 7 days");
+    // Named by its visible title, not by a hand-copied label.
+    expect(title?.id).toBeTruthy();
+    expect(section.getAttribute("aria-labelledby")).toBe(title?.id);
+    // Under the cycles, not above them.
+    const body = card.shadowRoot?.querySelector(".content");
+    const order = [...(body?.children ?? [])].map((el) => el.className);
+    expect(order.indexOf("history")).toBeGreaterThan(order.lastIndexOf("cycle"));
+
+    const days = [...section.querySelectorAll(".history-day")];
+    expect(days.map((el) => el.getAttribute("data-day"))).toEqual(WEEK);
+    expect(days.map((el) => el.textContent?.trim())).toEqual(["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"]);
+    expect(days.map((el) => el.hasAttribute("data-today"))).toEqual([false, false, false, false, false, false, true]);
+
+    const kinds = [...section.querySelectorAll(".history-kind")].map((el) => el.textContent?.trim());
+    expect(kinds).toEqual(["Morning", "Evening"]);
+    expect(section.querySelectorAll(".outcome")).toHaveLength(14);
+    expect(outcomesOf(card, "morning")).toEqual(Array(7).fill("ran"));
+    expect(outcomesOf(card, "evening")).toEqual(Array(7).fill("ran"));
+    expect([...section.querySelectorAll(".outcome")].every((el) => el.getAttribute("data-anomaly") === "false")).toBe(
+      true,
+    );
+    expect(iconOf(cell(card, "2026-09-23", "evening"))).toBe("mdi:check-circle");
+  });
+
+  it("carries each row's outcome verbatim, and flags missed and recovered as the anomalies", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(
+      stateView({
+        history: [
+          historyRow("2026-09-20", "evening", "missed", { status: "missed", runs: 0 }),
+          historyRow("2026-09-21", "morning", "recovered", { recovery: "late_rerun", late_rerun: true }),
+          historyRow("2026-09-22", "evening", "cancelled", { status: "cancelled" }),
+          historyRow("2026-09-19", "evening", "waived", { status: "waived", waived_by: "run_now" }),
+          historyRow("2026-09-18", "evening", "reduced", { rain_total_mm: 4.2 }),
+          historyRow("2026-09-17", "evening", "ran"),
+        ],
+      }),
+    );
+    await card.updateComplete;
+
+    const flagged = [...strip(card).querySelectorAll('.outcome[data-anomaly="true"]')].map((el) =>
+      [el.getAttribute("data-day"), el.getAttribute("data-kind"), el.getAttribute("data-outcome")].join(" "),
+    );
+    expect(flagged.sort()).toEqual(["2026-09-20 evening missed", "2026-09-21 morning recovered"]);
+    expect(iconOf(cell(card, "2026-09-20", "evening"))).toBe("mdi:alert-circle");
+    expect(iconOf(cell(card, "2026-09-21", "morning"))).toBe("mdi:backup-restore");
+
+    const expectNominal = (day: string, kind: CycleKind, outcome: Outcome, icon: string): void => {
+      const el = cell(card, day, kind);
+      expect(el.getAttribute("data-outcome")).toBe(outcome);
+      expect(el.getAttribute("data-anomaly")).toBe("false");
+      expect(iconOf(el)).toBe(icon);
+    };
+    expectNominal("2026-09-22", "evening", "cancelled", "mdi:cancel");
+    expectNominal("2026-09-19", "evening", "waived", "mdi:hand-back-right");
+    expectNominal("2026-09-18", "evening", "reduced", "mdi:weather-rainy");
+    expectNominal("2026-09-17", "evening", "ran", "mdi:check-circle");
+  });
+
+  it("leaves a hollow no-record cell where no row exists, today's unrun evening included", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(stateView({ history: [historyRow(IRRIGATION_DAY, "morning", "ran")] }));
+    await card.updateComplete;
+
+    const today = cell(card, IRRIGATION_DAY, "evening");
+    expect(today.getAttribute("data-outcome")).toBe("none");
+    expect(today.getAttribute("data-anomaly")).toBe("false");
+    expect(iconOf(today)).toBe("mdi:circle-outline");
+    expect(today.getAttribute("aria-label")).toBe("Wed, Sep 23 · Evening · No record");
+    expect(cell(card, IRRIGATION_DAY, "morning").getAttribute("data-outcome")).toBe("ran");
+    expect(outcomesOf(card, "evening")).toEqual(Array(7).fill("none"));
+  });
+
+  it("gives every cell a tooltip and an accessible label built from the row", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(
+      stateView({
+        history: [historyRow("2026-09-21", "evening", "reduced", { effective_s: 720, rain_total_mm: 4.2 })],
+      }),
+    );
+    await card.updateComplete;
+
+    const el = cell(card, "2026-09-21", "evening");
+    const expected = "Mon, Sep 21 · Evening · Reduced by rain · 12 min watered · 4.2 mm rain";
+    expect(el.getAttribute("title")).toBe(expected);
+    expect(el.getAttribute("aria-label")).toBe(expected);
+    expect(el.getAttribute("role")).toBe("img");
+  });
+
+  it("shows the evening row alone when the morning cycle is disabled, both when an old morning row exists", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(stateView({ morningEnabled: false, history: [historyRow("2026-09-22", "evening", "ran")] }));
+    await card.updateComplete;
+    expect([...strip(card).querySelectorAll(".history-kind")].map((el) => el.textContent?.trim())).toEqual([
+      "Evening",
+    ]);
+    expect(strip(card).querySelectorAll(".outcome")).toHaveLength(7);
+
+    fake.push(stateView({ morningEnabled: false, history: [historyRow("2026-09-19", "morning", "ran")] }));
+    await card.updateComplete;
+    expect([...strip(card).querySelectorAll(".history-kind")].map((el) => el.textContent?.trim())).toEqual([
+      "Morning",
+      "Evening",
+    ]);
+    expect(outcomesOf(card, "morning")).toEqual(["none", "none", "ran", "none", "none", "none", "none"]);
+    // Today's timeline still shows the evening only: the strip has its own rows.
+    expect(card.shadowRoot?.querySelectorAll("section.cycle")).toHaveLength(1);
+  });
+
+  it("renders the strip with all hollow cells for an empty history, and with no cycle planned today", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(stateView({ history: [] }));
+    await card.updateComplete;
+    expect(strip(card).querySelectorAll(".outcome")).toHaveLength(14);
+    expect(strip(card).querySelectorAll('.outcome[data-outcome="none"]')).toHaveLength(14);
+
+    fake.push(stateView({ cycles: [], history: [historyRow("2026-09-22", "evening", "ran")] }));
+    await card.updateComplete;
+    expect(card.shadowRoot?.textContent).toContain("No cycle is planned today.");
+    expect(card.shadowRoot?.querySelectorAll("section.cycle")).toHaveLength(0);
+    expect(cell(card, "2026-09-22", "evening").getAttribute("data-outcome")).toBe("ran");
+  });
+
+  it("ignores out-of-window rows and a row with a malformed day without throwing", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(
+      stateView({
+        history: [
+          historyRow("2026-09-16", "evening", "missed"),
+          historyRow("2026-09-24", "evening", "missed"),
+          historyRow("garbage", "evening", "missed"),
+          historyRow("2026-09-17", "evening", "ran"),
+        ],
+      }),
+    );
+    await card.updateComplete;
+
+    expect(strip(card).querySelectorAll('.outcome[data-anomaly="true"]')).toHaveLength(0);
+    expect(outcomesOf(card, "evening")).toEqual(["ran", "none", "none", "none", "none", "none", "none"]);
+  });
+
+  it("draws an outcome this bundle does not know as an unknown record, carrying the raw value", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(stateView({ history: [historyRow("2026-09-22", "evening", "drizzle" as Outcome)] }));
+    await card.updateComplete;
+
+    const el = cell(card, "2026-09-22", "evening");
+    expect(el.getAttribute("data-outcome")).toBe("drizzle");
+    expect(el.getAttribute("data-anomaly")).toBe("false");
+    expect(iconOf(el)).toBe("mdi:help-circle");
+    expect(el.getAttribute("title")).toContain("Unknown outcome");
+  });
+
+  it("skips the strip — and still draws today's rows — when the irrigation day is unusable", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    expect(() => {
+      fake.push(stateView({ irrigationDay: "garbage", history: [historyRow("2026-09-22", "evening", "ran")] }));
+    }).not.toThrow();
+    await card.updateComplete;
+
+    expect(card.shadowRoot?.querySelector("section.history")).toBeNull();
+    expect(card.shadowRoot?.querySelectorAll("section.cycle")).toHaveLength(2);
+    expect(card.shadowRoot?.querySelector(".message.error")).toBeNull();
+  });
+
+  it("labels the days in hass.locale.language, and in the browser's locale without one", async () => {
+    const french = createHass();
+    french.hass = { ...french.hass, locale: { ...LOCALE, language: "fr" } } as HomeAssistant;
+    const card = await connectedCard(french);
+    french.push(stateView());
+    await card.updateComplete;
+    expect(strip(card).querySelector(".history-day")?.textContent?.trim()).toMatch(/^jeu\.?$/);
+
+    const bare = createHass();
+    bare.hass = { ...bare.hass, locale: undefined } as unknown as HomeAssistant;
+    const plain = await connectedCard(bare);
+    bare.push(stateView());
+    await plain.updateComplete;
+    const expected = new Intl.DateTimeFormat(undefined, { weekday: "short", timeZone: "UTC" }).format(
+      new Date("2026-09-17T00:00:00Z"),
+    );
+    expect(strip(plain).querySelector(".history-day")?.textContent?.trim()).toBe(expected);
+  });
+
+  it("renders once per push and reuses the history model across sixty idle ticks", async () => {
+    clockAt("2026-09-23T12:00:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    const build = vi.mocked(history.buildHistory);
+    build.mockClear();
+    const render = renderSpy(card);
+    pushNow(fake, { history: fullWeek() });
+    await card.updateComplete;
+    expect(render).toHaveBeenCalledTimes(1);
+    expect(build).toHaveBeenCalledTimes(1);
+    const model = build.mock.results[0]?.value as history.HistoryModel;
+    expect(model.cells.size).toBe(14);
+
+    await vi.advanceTimersByTimeAsync(SLOW_TICK_MS * 60);
+    card.getCardSize();
+    card.getGridOptions();
+    await card.updateComplete;
+    expect(render).toHaveBeenCalledTimes(1);
+    expect(build).toHaveBeenCalledTimes(1);
+
+    // The next document rebuilds it: one more call, one more render.
+    pushNow(fake, { history: fullWeek() });
+    await card.updateComplete;
+    expect(render).toHaveBeenCalledTimes(2);
+    expect(build).toHaveBeenCalledTimes(2);
+    expect(build.mock.results[1]?.value).not.toBe(model);
   });
 
   // ------------------------------------------------------------------ gate
