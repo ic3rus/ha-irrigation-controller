@@ -19,6 +19,7 @@ from custom_components.ha_irrigation_controller.engine.plan import CycleKind
 from custom_components.ha_irrigation_controller.engine.runs import CycleStatus
 from custom_components.ha_irrigation_controller.engine.sequencer import Sequencer
 from tests.engine.common import (
+    MANUAL_TIMEOUT_S,
     FakeAnomalyPort,
     FakeJournalPort,
     FakeSwitchPort,
@@ -39,11 +40,18 @@ VALVE_2 = "switch.zone_2_valve"
 MORNING_END = aware(7, 20)
 
 
-def two_zone_plan() -> ControllerPlan:
-    """Two zones of 600 s morning / 900 s evening; morning 07:00, evening 20:00."""
+def two_zone_plan(*, manual_timeout_s: int = MANUAL_TIMEOUT_S) -> ControllerPlan:
+    """Two zones of 600 s morning / 900 s evening; morning 07:00, evening 20:00.
+
+    `manual_timeout_s` is Story 3.5's safety timeout, defaulted to the
+    shipped 30 minutes. A case that drives the clock past a hand-open plus 30
+    minutes has to raise it, or the timeout it is not testing fires inside
+    it — every such case says so in its own docstring.
+    """
     return make_plan(
         make_zone("zone-1", valve=VALVE_1, morning_s=600, evening_s=900),
         make_zone("zone-2", valve=VALVE_2, morning_s=600, evening_s=900),
+        manual_timeout_s=manual_timeout_s,
     )
 
 
@@ -173,9 +181,10 @@ async def test_the_pause_is_a_set_not_a_flag() -> None:
 async def test_any_observed_off_clears_the_entry_whoever_commanded_it() -> None:
     """The engine's own close of a hand-opened valve ends the pause too.
 
-    That is the hook Story 3.5's safety timeout pulls: it closes the valve
-    through the verified port, the watch reports a NON-manual off, and the
-    pause ends by the same path a hand-close takes.
+    That is the hook Story 3.5's safety timeout pulls, and the path a live
+    cycle's own boundary close takes: the valve is closed through the
+    verified port, the watch reports a NON-manual off, and the pause ends by
+    the same route a hand-close takes.
     """
     sequencer, _, _, _ = make_sequencer()
     await manual_on(sequencer, VALVE_1, aware(6, 30))
@@ -322,8 +331,16 @@ async def test_a_pending_run_is_handed_back_to_the_queue() -> None:
 
 
 async def test_the_watchdog_returns_at_once_while_paused() -> None:
-    """Matrix row 9: no missed record, no anomaly, no re-run; re-checked on resume."""
-    sequencer, switches, journal, anomalies = make_sequencer()
+    """Matrix row 9: no missed record, no anomaly, no re-run; re-checked on resume.
+
+    The safety timeout is set to four hours deliberately: the pause has to
+    outlive the 07:20 window end for the watchdog to be asked while it holds,
+    and on the default 30 minutes Story 3.5's expiry would close the valve at
+    07:00 instead — which is that story's contract, not this one's.
+    """
+    sequencer, switches, journal, anomalies = make_sequencer(
+        two_zone_plan(manual_timeout_s=14400),
+    )
     await manual_on(sequencer, VALVE_1, aware(6, 30))
 
     # The morning window end: a miss the watchdog would normally make up.

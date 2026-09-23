@@ -40,20 +40,24 @@ from custom_components.ha_irrigation_controller.adapters.timing import CycleRunn
 from custom_components.ha_irrigation_controller.const import (
     CONF_ACTUATION_TIMEOUT,
     CONF_EVENING_START,
+    CONF_MANUAL_TIMEOUT,
     CONF_MORNING_DURATION,
     CONF_NOTIFY_TARGET,
     CONF_PUMP_SWITCH,
     CONF_RAIN_SENSOR,
     DEFAULT_ACTUATION_TIMEOUT_S,
+    DEFAULT_MANUAL_TIMEOUT_MINUTES,
     DOMAIN,
     EVENT_HA_IRRIGATION_CONTROLLER,
     MAX_ACTUATION_TIMEOUT_S,
+    MAX_MANUAL_TIMEOUT_MINUTES,
     MAX_RAIN_FACTOR,
     MAX_ZONE_DURATION_MINUTES,
     MIN_ACTUATION_TIMEOUT_S,
     MIN_HA_MAJOR,
     MIN_HA_MINOR,
     MIN_HA_VERSION,
+    MIN_MANUAL_TIMEOUT_MINUTES,
     MIN_RAIN_FACTOR,
     MIN_ZONE_DURATION_MINUTES,
 )
@@ -444,6 +448,64 @@ async def test_entry_without_actuation_timeout_still_loads(
         key: value
         for key, value in CONTROLLER_OPTIONS.items()
         if key != CONF_ACTUATION_TIMEOUT
+    }
+    entry = controller_entry(options)
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+
+
+@pytest.mark.parametrize(
+    ("inside", "outside"),
+    [
+        (MIN_MANUAL_TIMEOUT_MINUTES, MIN_MANUAL_TIMEOUT_MINUTES - 1),
+        (MAX_MANUAL_TIMEOUT_MINUTES, MAX_MANUAL_TIMEOUT_MINUTES + 1),
+    ],
+)
+def test_manual_timeout_bounds_agree_with_const(inside: int, outside: int) -> None:
+    """The safety-timeout bounds duplicated in the engine match const.py (3.5).
+
+    Same drift defense as the actuation timeout above, and on both edges. The
+    plan carries SECONDS, so the pin is on the converted value — which is
+    also what catches a units mix-up in the builder.
+    """
+    plan = build_plan(
+        {**CONTROLLER_OPTIONS, CONF_MANUAL_TIMEOUT: inside},
+        [("zone-1", "Zone A", zone_subentry_data("Zone A", "switch.a")["data"])],
+    )
+    assert plan.manual_timeout_s == inside * 60
+
+    with pytest.raises(PlanValidationError, match=CONF_MANUAL_TIMEOUT):
+        build_plan(
+            {**CONTROLLER_OPTIONS, CONF_MANUAL_TIMEOUT: outside},
+            [("zone-1", "Zone A", zone_subentry_data("Zone A", "switch.a")["data"])],
+        )
+
+
+def test_manual_timeout_default_agrees_with_const() -> None:
+    """An absent key parses to exactly the const.py default (legacy entries)."""
+    options = {
+        key: value
+        for key, value in CONTROLLER_OPTIONS.items()
+        if key != CONF_MANUAL_TIMEOUT
+    }
+    plan = build_plan(
+        options,
+        [("zone-1", "Zone A", zone_subentry_data("Zone A", "switch.a")["data"])],
+    )
+    assert plan.manual_timeout_s == DEFAULT_MANUAL_TIMEOUT_MINUTES * 60
+
+
+async def test_entry_without_manual_timeout_still_loads(
+    hass: HomeAssistant,
+) -> None:
+    """An entry created before Story 3.5 has no timeout key and must keep loading."""
+    options = {
+        key: value
+        for key, value in CONTROLLER_OPTIONS.items()
+        if key != CONF_MANUAL_TIMEOUT
     }
     entry = controller_entry(options)
     entry.add_to_hass(hass)

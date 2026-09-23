@@ -20,6 +20,7 @@ from custom_components.ha_irrigation_controller.const import (
     CONF_EVENING_DURATION,
     CONF_EVENING_START,
     CONF_HUMIDITY_SENSOR,
+    CONF_MANUAL_TIMEOUT,
     CONF_MORNING_DURATION,
     CONF_MORNING_ENABLED,
     CONF_MORNING_START,
@@ -55,6 +56,7 @@ CONTROLLER_OPTIONS: dict[str, Any] = {
     CONF_MORNING_START: "07:00:00",
     CONF_EVENING_START: "20:00:00",
     CONF_ACTUATION_TIMEOUT: 10,
+    CONF_MANUAL_TIMEOUT: 30,
     CONF_NOTIFY_TARGET: "notify.mobile_app_phone",
 }
 

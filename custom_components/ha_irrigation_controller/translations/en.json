@@ -13,6 +13,7 @@
                     "morning_start": "Morning start time",
                     "evening_start": "Evening start time",
                     "actuation_timeout": "Actuation timeout",
+                    "manual_timeout": "Manual valve safety timeout",
                     "notify_target": "Notify target"
                 },
                 "data_description": {
@@ -24,6 +25,7 @@
                     "morning_start": "Local time the morning cycle starts, when it is enabled.",
                     "evening_start": "Local time the evening cycle starts.",
                     "actuation_timeout": "Seconds to wait for a pump or valve switch to confirm a command before raising an anomaly. The cycle continues either way.",
+                    "manual_timeout": "Minutes a valve or the pump may stay open after you switch it on by hand before the controller closes it itself and tells you. 1 to 240 minutes, 30 by default. It cannot be turned off. Changing it reloads the integration, which ends any pause in progress and drops the timeout of a switch already open by hand — nothing then closes that switch until you switch it off and on again.",
                     "notify_target": "Optional. A notify entity (for example your phone's companion app) that receives one push notification when an anomaly opens. Leave empty for no push notifications; anomalies still appear under Settings → Repairs."
                 }
             }
@@ -118,6 +120,7 @@
                     "morning_start": "Morning start time",
                     "evening_start": "Evening start time",
                     "actuation_timeout": "Actuation timeout",
+                    "manual_timeout": "Manual valve safety timeout",
                     "notify_target": "Notify target"
                 },
                 "data_description": {
@@ -129,6 +132,7 @@
                     "morning_start": "Local time the morning cycle starts, when it is enabled.",
                     "evening_start": "Local time the evening cycle starts.",
                     "actuation_timeout": "Seconds to wait for a pump or valve switch to confirm a command before raising an anomaly. The cycle continues either way.",
+                    "manual_timeout": "Minutes a valve or the pump may stay open after you switch it on by hand before the controller closes it itself and tells you. 1 to 240 minutes, 30 by default. It cannot be turned off. Changing it reloads the integration, which ends any pause in progress and drops the timeout of a switch already open by hand — nothing then closes that switch until you switch it off and on again.",
                     "notify_target": "Optional. A notify entity (for example your phone's companion app) that receives one push notification when an anomaly opens. Empty the field to remove it; anomalies still appear under Settings → Repairs."
                 }
             }
@@ -260,7 +264,7 @@
                 "step": {
                     "confirm": {
                         "title": "Pump did not confirm turning off",
-                        "description": "The pump switch `{entity_id}` did not report OFF within the actuation timeout at the end of cycle `{cycle_id}`. The pump may still be running against closed valves — check it now. Acknowledging clears this issue; it also clears itself when the pump next confirms turning off."
+                        "description": "The pump switch `{entity_id}` did not report OFF within the actuation timeout. The pump may still be running against closed valves — check it now. Cycle: `{cycle_id}` (`-` when the pump was not being switched off for a cycle, for example after it was left on by hand or at startup recovery). Acknowledging clears this issue; it also clears itself when the pump next confirms turning off."
                     }
                 }
             }
@@ -282,7 +286,7 @@
                 "step": {
                     "confirm": {
                         "title": "Valve did not confirm closing",
-                        "description": "The valve `{entity_id}` of zone `{zone_id}` did not report OFF within the actuation timeout during cycle `{cycle_id}`. The valve may still be open — check it now; the cycle continued with the next zone. Acknowledging clears this issue; it also clears itself when the valve next confirms closing."
+                        "description": "The valve `{entity_id}` (zone `{zone_id}`) did not report OFF within the actuation timeout. The valve may still be open — check it now. Nothing was stopped on account of it: a cycle that was running continued with its next zone, and a valve closed because it had been left open by hand is not commanded again. Cycle: `{cycle_id}` (`-` when the close did not belong to a cycle). Acknowledging clears this issue; it also clears itself when the valve next confirms closing."
                     }
                 }
             }
@@ -338,6 +342,17 @@
                     "confirm": {
                         "title": "A scheduled cycle did not run",
                         "description": "The `{kind}` cycle was scheduled but its watering window closed with no record of it: cycle `{cycle_id}` is filed as missed. Home Assistant was most likely down over the window, or the start fell inside the hour the clocks skip forward. Outcome: `{outcome}` — `rerun` means the cycle is watering right now, on the same irrigation day and on freshly calculated durations, and this happens at most once per missed cycle; `recorded` means the day's later cycle had already run, so nothing is watered on top of it and each zone's missed watering is carried forward as water debt, capped at one base duration. Acknowledging clears this issue; it does not clear itself."
+                    }
+                }
+            }
+        },
+        "manual_valve_timeout": {
+            "title": "A switch left open by hand was closed",
+            "fix_flow": {
+                "step": {
+                    "confirm": {
+                        "title": "A switch left open by hand was closed",
+                        "description": "The switch `{entity_id}` was switched on by hand and stayed open longer than the safety timeout, so the controller switched it off. Nothing else was changed, and no watering was cut short. Any cycle held back while you were on site starts as soon as the last hand-opened switch is off — including by this timeout. To keep a switch open for longer, switch it off and on again on site: the timeout starts over from that moment. Acknowledging clears this issue; it does not clear itself."
                     }
                 }
             }

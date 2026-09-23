@@ -454,11 +454,15 @@ at least one governed switch is being held **open** by hand the scheduler
   sees it as still due rather than missed;
 - a cycle that had been scheduled but had not commanded anything yet is put
   back in that same queue;
-- nothing is commanded, nothing is notified. A pause is normal operation, not a
-  fault: it raises no repair, sends no notification and fires no event.
+- nothing is commanded and nothing is notified *while the pause lasts*. A
+  pause is normal operation, not a fault: up to the
+  [safety timeout](#the-safety-timeout) it raises no repair, sends no
+  notification and fires no event.
 
-When the **last** hand-opened switch goes off again — by your hand or by the
-controller's own next command — the scheduler resumes: anything queued for
+When the **last** hand-opened switch goes off again — by your hand, by the
+controller's own next command, or because its
+[safety timeout](#the-safety-timeout) ran out — the scheduler resumes:
+anything queued for
 **today** is watered immediately, on freshly calculated durations (carried
 [water debt](#water-debt) and [rain credit](#rain-credit) both apply);
 anything queued for an earlier day is dropped. Two valves opened by hand need
@@ -487,11 +491,13 @@ Two limits worth knowing:
   back, and any change the controller can tie to one of its own commands are
   all ignored. The failure direction is to miss a manual act, never to invent a
   pause that stops watering.
-- **Nothing bounds the pause yet.** A valve left open by hand holds the
-  scheduler until it is closed — there is no timeout in this version, and no
-  notification to remind you. The pause is also lost across a restart or a
-  reload (the queued cycle is not: it waters once the controller is back and
-  nothing else is in progress).
+- **The pause is lost across a restart or a reload.** It lives in memory
+  only, so restarting Home Assistant — or editing the controller's options,
+  which reloads the integration — ends the pause and, with it, the safety
+  timeout below. The queued cycle survives: it waters once the controller is
+  back and nothing else is in progress. See
+  [The safety timeout](#the-safety-timeout) for what that means for a valve
+  still physically open.
 
 Two consequences of that last point are worth knowing, because in both the
 pause ends — or its queued cycle disappears — without you doing anything:
@@ -505,7 +511,63 @@ pause ends — or its queued cycle disappears — without you doing anything:
   only ever holds today's work, so a start deferred before midnight is dropped
   at the resume, and the [watchdog](#missed-cycles-and-late-re-runs) only looks
   back over the current day — so that cycle is neither watered nor recorded as
-  missed. Closing the valve the same day avoids it entirely.
+  missed. Closing the valve the same day avoids it entirely. The safety
+  timeout below makes this much harder to reach, but a chain of overlapping
+  hand-opens can still cross midnight.
+
+### The safety timeout
+
+A switch you open by hand does not hold the scheduler for ever. Each one gets
+a deadline the moment the controller notices it, and when that deadline passes
+the controller **switches it off itself** through the same verified path a
+cycle uses, raises a `manual_valve_timeout` anomaly (a Repairs issue and one
+push notification) and stops holding the scheduler for it. If that was the
+last hand-opened switch, anything queued waters right away.
+
+The push is sent when the issue **opens**, like every other
+[anomaly](#anomalies). A second timeout on the same switch refreshes the
+issue that is already there and sends nothing — so if you keep opening the
+same valve and letting it time out, you are told once until you acknowledge
+it in Repairs.
+
+- **Manual valve safety timeout** is a controller option: **30 minutes** by
+  default, anywhere from **1 to 240**. It cannot be turned off — a valve left
+  open all night is exactly what it exists to prevent. Editing it applies
+  without restarting Home Assistant. It is the delay before the controller
+  *acts*, not a guaranteed ceiling on how long a switch stays open — see the
+  limits below.
+- **Closing the switch yourself cancels it, silently.** No command, no issue,
+  no notification: nothing is said about a pause that ended the way it should.
+- **Each switch has its own deadline**, counted from when it was opened. Two
+  valves opened twenty minutes apart close twenty minutes apart, and the
+  scheduler resumes only after the last one.
+- **Re-opening a switch starts a fresh deadline.** Flipping an already-open
+  one does not extend it — switch it off and on again for another full session
+  on site.
+- **The pump counts too.** Opening it by hand pauses the scheduler and gets
+  the same deadline as a valve.
+
+Three limits, and none of them is a bug:
+
+- **A switch the running cycle is using is left alone.** If the valve you
+  opened is the one the cycle is watering right now, or if it is the pump
+  while a cycle runs, the deadline passes and nothing is commanded: closing
+  that valve would cut the zone short while the cycle still counts it as
+  fully watered, and closing the pump would leave every remaining zone dry.
+  The cycle's own close is what shuts it instead, and *when* that comes
+  differs by switch: a **valve** is closed at the end of its own slot, so it
+  stays open at most for the rest of that zone; the **pump** is only switched
+  off when the whole cycle finishes, so it can stay open for the rest of the
+  cycle. If that close does not confirm, the switch gets a fresh timeout from
+  that moment and the controller tries once more on its own.
+- **A reload or a restart drops the deadline along with the pause.** Nothing
+  then closes a switch you left open: the controller has forgotten it was open
+  by hand. Flipping it again is what starts a new deadline. Since editing any
+  controller option reloads the integration, changing the timeout itself is
+  one of the things that does this.
+- **Editing the duration never moves a deadline already counting down.** A
+  deadline is quoted once, when the switch is first noticed. (In practice the
+  reload that the edit triggers has already dropped it, per the point above.)
 
 ## Anomalies
 
@@ -538,10 +600,12 @@ When something does go wrong, each anomaly fans out to four places at once:
 | `cycle_interrupted` | a forced reload, a disable or a removal of the integration stopped a running cycle | the cycle is recovered at the next load, or the next cycle completes or is cancelled |
 | `cycle_recovered` | a cycle found in progress in the journal at startup was resumed, closed or discarded (see [Restarts and recovery](#restarts-and-recovery)) | never — acknowledge it |
 | `missed_cycle` | a scheduled cycle's watering window closed with no record of it — it was re-run at once, or recorded and its watering carried forward as debt (see [Missed cycles and late re-runs](#missed-cycles-and-late-re-runs)) | never — acknowledge it |
+| `manual_valve_timeout` | a switch opened by hand stayed open past the [safety timeout](#the-safety-timeout), so the controller switched it off | never — acknowledge it |
 
 Issues are **per subject**: an unconfirmed valve is one issue per zone, an
 unconfirmed pump one per pump entity, a missing entity one per zone (for a
-valve) or per role (for the pump, the sensors and the notify target);
+valve) or per role (for the pump, the sensors and the notify target), a safety
+timeout one per zone (or per entity, for the pump);
 `journal_save_failed`, `cycle_interrupted`, `cycle_recovered` and
 `missed_cycle` are one issue for the whole controller.
 

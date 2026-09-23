@@ -16,6 +16,7 @@ from custom_components.ha_irrigation_controller.const import (
     CONF_ACTUATION_TIMEOUT,
     CONF_EVENING_START,
     CONF_HUMIDITY_SENSOR,
+    CONF_MANUAL_TIMEOUT,
     CONF_MORNING_ENABLED,
     CONF_MORNING_START,
     CONF_NOTIFY_TARGET,
@@ -46,6 +47,7 @@ _MINIMAL_INPUT: dict[str, Any] = {
     CONF_MORNING_START: "07:00:00",
     CONF_EVENING_START: "20:00:00",
     CONF_ACTUATION_TIMEOUT: 10,
+    CONF_MANUAL_TIMEOUT: 30,
 }
 
 
@@ -92,6 +94,7 @@ async def test_user_form_defaults_are_evening_only(hass: HomeAssistant) -> None:
         CONF_MORNING_START: "07:00:00",
         CONF_EVENING_START: "20:00:00",
         CONF_ACTUATION_TIMEOUT: 10,
+        CONF_MANUAL_TIMEOUT: 30,
     }
 
 
@@ -222,6 +225,69 @@ async def test_actuation_timeout_out_of_range_is_rejected_by_the_selector(
             result["flow_id"],
             user_input={**_MINIMAL_INPUT, CONF_ACTUATION_TIMEOUT: out_of_range},
         )
+
+
+async def test_manual_timeout_is_stored_as_whole_minutes(
+    hass: HomeAssistant,
+) -> None:
+    """A frontend float submission lands as the documented int minutes (3.5).
+
+    Same coercion as the actuation timeout above, in the other unit: the
+    safety timeout is MINUTES at the UI and storage surface, and the engine
+    parser wants whole ones.
+    """
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_USER},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        user_input={**_MINIMAL_INPUT, CONF_MANUAL_TIMEOUT: 45.0},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["options"][CONF_MANUAL_TIMEOUT] == 45
+    assert isinstance(result["options"][CONF_MANUAL_TIMEOUT], int)
+
+
+@pytest.mark.parametrize("out_of_range", [0, 241])
+async def test_manual_timeout_out_of_range_is_rejected_by_the_selector(
+    hass: HomeAssistant,
+    out_of_range: int,
+) -> None:
+    """The selector's own bounds refuse a timeout outside 1..240 minutes.
+
+    There is no "off" value on purpose (Story 3.5, Decision 1): a pause
+    nothing ever closes is the failure this option exists to remove, so `0`
+    is out of range rather than a way to disable it.
+    """
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_USER},
+    )
+    with pytest.raises(InvalidData, match=CONF_MANUAL_TIMEOUT):
+        await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            user_input={**_MINIMAL_INPUT, CONF_MANUAL_TIMEOUT: out_of_range},
+        )
+
+
+async def test_options_flow_edits_the_manual_timeout(hass: HomeAssistant) -> None:
+    """The safety timeout is editable without a restart, like every option."""
+    entry = controller_entry()
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={**CONTROLLER_OPTIONS, CONF_MANUAL_TIMEOUT: 90},
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+
+    assert entry.options[CONF_MANUAL_TIMEOUT] == 90
+    assert entry.runtime_data.sequencer.plan.manual_timeout_s == 5400
 
 
 async def test_user_flow_allows_identical_times_when_morning_disabled(

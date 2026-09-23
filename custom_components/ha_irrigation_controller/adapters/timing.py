@@ -317,9 +317,10 @@ class CycleRunner:
         its place in the middle, because a resume that completes a cycle is
         as good a moment to fire a deferred reload as any other.
 
-        No timer of its own, and no `asyncio`: the pause is unbounded in this
-        story (Story 3.5's safety timeout is what bounds it) and every future
-        time intent hangs off `next_wakeup` (AD-3).
+        No timer of its own, and no `asyncio`: Story 3.5's safety timeout
+        bounds the pause through `next_wakeup` like every other time intent
+        (AD-3), so the `_rearm` below is all the wiring it needs — the
+        handle simply points at the earliest deadline of what is held open.
 
         A no-op after shutdown, and that guard is load-bearing rather than
         defensive: `async_suspend` calls `async_shutdown()` FIRST and then
@@ -500,10 +501,14 @@ class CycleRunner:
         the past is fine — `async_track_point_in_time` fires it immediately
         and the loop converges.
 
-        The clock read is handed to the engine (Story 3.3): while a cycle is
-        active the answer is its own boundary, and while the machine is idle
-        it is the watchdog's next cycle-window end — which is why the handle
-        now normally exists between cycles too, still exactly one of it.
+        The clock read is handed to the engine, which answers with the
+        EARLIEST of everything pending (Story 3.5 made `next_wakeup` a
+        minimum rather than the priority chain Story 3.3 documented): a
+        running cycle's own boundary or a pending run's start, the watchdog's
+        next cycle-window end, and the safety deadline of a switch held open
+        by hand. So the handle normally exists between cycles too, it can
+        point INSIDE a slot rather than at its boundary, and it is still
+        exactly one of it.
         """
         if self._unsub_point is not None:
             self._unsub_point()

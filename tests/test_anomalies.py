@@ -245,6 +245,15 @@ async def test_a_repeat_report_refreshes_the_issue_and_never_pushes_again(
             "valve_close_unconfirmed:zone-1",
         ),
         (
+            # Story 3.5's safety close of a valve whose zone was deleted while
+            # it was held open by hand: no zone, so the entity id is the
+            # subject — never the bare kind, which would be one issue shared
+            # by every zone-less valve.
+            AnomalyKind.VALVE_CLOSE_UNCONFIRMED,
+            {"zone_id": None, "entity_id": "switch.zone_2_valve"},
+            "valve_close_unconfirmed:switch.zone_2_valve",
+        ),
+        (
             AnomalyKind.CONFIGURED_ENTITY_MISSING,
             {
                 "entity_id": "switch.zone_1_valve",
@@ -281,6 +290,16 @@ async def test_a_repeat_report_refreshes_the_issue_and_never_pushes_again(
                 "outcome": "rerun",
             },
             "missed_cycle",
+        ),
+        (
+            AnomalyKind.MANUAL_VALVE_TIMEOUT,
+            {"zone_id": "zone-1", "entity_id": "switch.zone_1_valve"},
+            "manual_valve_timeout:zone-1",
+        ),
+        (
+            AnomalyKind.MANUAL_VALVE_TIMEOUT,
+            {"zone_id": None, "entity_id": "switch.pool_pump"},
+            "manual_valve_timeout:switch.pool_pump",
         ),
         (
             AnomalyKind.JOURNAL_SAVE_FAILED,
@@ -440,6 +459,61 @@ async def test_missed_cycle_carries_its_outcome_and_is_never_auto_cleared(
     assert len(notify.sent) == 1
 
     ir.async_delete_issue(hass, DOMAIN, "missed_cycle")
+    await hass.async_block_till_done()
+    assert manager.open_anomalies == ()
+
+
+async def test_a_manual_valve_timeout_is_per_switch_and_never_auto_cleared(
+    hass: HomeAssistant,
+    manager: AnomalyManager,
+    notify: RecordingNotify,
+) -> None:
+    """Story 3.5: one issue per SWITCH, one push, acknowledge only.
+
+    Two valves left open by hand are two things to go and close, so the kind
+    is subject-keyed rather than controller-level: a valve by its zone, the
+    pump by its entity id (it has none). The engine never calls `clear` for
+    this kind — a safety close is news, not a fault that heals — so the only
+    way an issue goes is the operator's.
+    """
+    manager.report(
+        AnomalyKind.MANUAL_VALVE_TIMEOUT,
+        {"zone_id": "zone-1", "entity_id": "switch.zone_1_valve"},
+    )
+    manager.report(
+        AnomalyKind.MANUAL_VALVE_TIMEOUT,
+        {"zone_id": None, "entity_id": "switch.pool_pump"},
+    )
+    await hass.async_block_till_done()
+
+    assert domain_issue_ids(hass) == {
+        "manual_valve_timeout:zone-1",
+        "manual_valve_timeout:switch.pool_pump",
+    }
+    issue = issue_of(hass, "manual_valve_timeout:zone-1")
+    assert issue is not None
+    assert issue.translation_placeholders == {
+        "entity_id": "switch.zone_1_valve",
+        "zone_id": "zone-1",
+        "cycle_id": "-",
+        "kind": "-",
+        "role": "-",
+        "outcome": "-",
+    }
+    assert len(notify.sent) == 2
+    assert "manual valve timeout" in notify.sent[0][0]
+    assert "switch.zone_1_valve" in notify.sent[0][1]
+
+    # Reported again for the same switch: the same issue, no second push.
+    manager.report(
+        AnomalyKind.MANUAL_VALVE_TIMEOUT,
+        {"zone_id": "zone-1", "entity_id": "switch.zone_1_valve"},
+    )
+    await hass.async_block_till_done()
+    assert len(notify.sent) == 2
+
+    ir.async_delete_issue(hass, DOMAIN, "manual_valve_timeout:zone-1")
+    ir.async_delete_issue(hass, DOMAIN, "manual_valve_timeout:switch.pool_pump")
     await hass.async_block_till_done()
     assert manager.open_anomalies == ()
 
