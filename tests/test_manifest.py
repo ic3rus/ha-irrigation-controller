@@ -55,6 +55,10 @@ def test_manifest_declares_the_keys_ac2_requires() -> None:
     assert manifest["issue_tracker"].startswith("https://")
     # One controller entry only — enforced by HA core, not by the flow.
     assert manifest["single_config_entry"] is True
+    # The WebSocket read channel (Story 4.1) registers its commands in
+    # `async_setup`, so `websocket_api` (which pulls `http`) must be up first.
+    # Nothing else: no `frontend`, no static paths — those are Story 4.2's.
+    assert manifest["dependencies"] == ["websocket_api"]
 
 
 def test_min_ha_version_is_consistent_across_the_repo() -> None:

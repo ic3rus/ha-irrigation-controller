@@ -51,6 +51,15 @@ asyncio_mode = "auto"
 # breakage while it is still a warning, which is the whole point of that cron.
 filterwarnings = [
     "error",
+    # Home Assistant core's own `http` component still writes plain-string
+    # `app[...]` and `request[...]` keys for backwards compatibility, which
+    # aiohttp flags (`NotAppKeyWarning`, a `UserWarning`) on every `http`
+    # setup and every request. Declaring `websocket_api` (Story 4.1) pulls
+    # `http` into every entry setup, so the warning is core's to fix, not ours
+    # to fail on. Matched by MESSAGE and the builtin category on purpose: a
+    # module-qualified category would make pytest import aiohttp, which the
+    # bare AD-1 engine run (`tests/engine`, no Home Assistant) does not have.
+    "ignore:It is recommended to use web\\.(App|Request)Key instances for keys:UserWarning",
 ]
 
 [tool.mypy]

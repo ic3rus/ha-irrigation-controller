@@ -3,8 +3,9 @@
 This is the FIRST entity that commands, and that does NOT violate AD-6:
 `switch.turn_on` IS a Home Assistant service (AD-10's command channel), and
 the entity mutates nothing itself — it calls the runner, which re-arms the ONE
-timer and calls the engine. Reading is a plain projection of
-`sequencer.season_enabled`.
+timer and calls the engine. Reading is a plain projection of the state
+view's `controller.season_enabled` (`state_view.current_view`, AD-14 since
+Story 4.1) — the same document every other surface reads.
 
 No `RestoreEntity`, no optimistic state, no `assumed_state`: the journal is the
 authority (AD-2), and the entity re-reads the engine on the dispatcher push the
@@ -20,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 from homeassistant.components.switch import SwitchDeviceClass, SwitchEntity
 
+from ..state_view import current_view  # noqa: TID252
 from .entity import HaIrrigationControllerEntity
 
 if TYPE_CHECKING:
@@ -28,7 +30,6 @@ if TYPE_CHECKING:
 
     from .. import HaIrrigationConfigEntry  # noqa: TID252
     from ..adapters.timing import CycleRunner  # noqa: TID252
-    from ..engine.sequencer import Sequencer  # noqa: TID252
 
 # Mirrors the root `switch.py` (the module HA's loader actually imports): the
 # entity is dispatcher-pushed and never polls.
@@ -41,12 +42,9 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Add the season switch to the controller device."""
-    runtime_data = entry.runtime_data
     # No `config_subentry_id`: the controller base's DeviceInfo already puts
     # this on the controller device, where the cycle-status sensor lives.
-    async_add_entities(
-        [SeasonSwitch(entry, runtime_data.sequencer, runtime_data.runner)],
-    )
+    async_add_entities([SeasonSwitch(entry, entry.runtime_data.runner)])
 
 
 class SeasonSwitch(HaIrrigationControllerEntity, SwitchEntity):
@@ -63,18 +61,16 @@ class SeasonSwitch(HaIrrigationControllerEntity, SwitchEntity):
     def __init__(
         self,
         entry: HaIrrigationConfigEntry,
-        sequencer: Sequencer,
         runner: CycleRunner,
     ) -> None:
-        """Bind the switch to the engine it reads and the runner it commands."""
+        """Bind the switch to the entry it reads and the runner it commands."""
         super().__init__(entry, "season")
-        self._sequencer = sequencer
         self._runner = runner
 
     @property
     def is_on(self) -> bool:
-        """Return whether scheduling is active — a projection (AD-6)."""
-        return self._sequencer.season_enabled
+        """Return whether scheduling is active — a projection of the view (AD-6)."""
+        return current_view(self._entry)["controller"]["season_enabled"]
 
     async def async_turn_on(self, **kwargs: Any) -> None:  # noqa: ARG002 — SwitchEntity signature
         """Resume scheduling from this instant on."""

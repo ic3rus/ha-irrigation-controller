@@ -21,6 +21,8 @@ from ..const import DOMAIN, engine_state_signal  # noqa: TID252
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry, ConfigSubentry
 
+    from .. import HaIrrigationConfigEntry  # noqa: TID252
+
 
 class _EngineStateSubscriber(Entity):
     """Mixin: subscribe to the engine-state signal, write state, nothing else.
@@ -67,10 +69,15 @@ class HaIrrigationControllerEntity(_EngineStateSubscriber):
     key, never from a name the operator can change.
     """
 
+    # Narrowed once here (the mixin's `ConfigEntry` is what the dispatcher
+    # subscription needs): every platform reads `current_view(self._entry)`,
+    # which wants the typed entry and its `runtime_data`.
+    _entry: HaIrrigationConfigEntry
+
     _attr_has_entity_name = True
     _attr_should_poll = False
 
-    def __init__(self, entry: ConfigEntry, key: str) -> None:
+    def __init__(self, entry: HaIrrigationConfigEntry, key: str) -> None:
         """Bind the entity to its config entry under a stable key."""
         self._entry = entry
         self._key = key
@@ -89,12 +96,14 @@ class HaIrrigationZoneEntity(_EngineStateSubscriber):
     collide and a removed-and-re-added zone gets a genuinely new entity.
     """
 
+    _entry: HaIrrigationConfigEntry
+
     _attr_has_entity_name = True
     _attr_should_poll = False
 
     def __init__(
         self,
-        entry: ConfigEntry,
+        entry: HaIrrigationConfigEntry,
         subentry: ConfigSubentry,
         key: str,
     ) -> None:

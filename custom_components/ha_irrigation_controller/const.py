@@ -92,12 +92,24 @@ EVENT_TYPE_ANOMALY = "anomaly"
 EVENT_TYPE_ANOMALY_CLEARED = "anomaly_cleared"
 
 
+# The two READ commands of the WebSocket channel (Story 4.1, AD-10's "services
+# command, WebSocket reads"): `<domain>/<noun>_<verb>`, registered once in
+# `async_setup` beside the services and open to every authenticated user.
+# Commands (`run_now`, `cancel_cycle`, ...) stay HA services and never gain a
+# WebSocket twin.
+WS_TYPE_STATE_GET = f"{DOMAIN}/state_get"
+WS_TYPE_STATE_SUBSCRIBE = f"{DOMAIN}/state_subscribe"
+
+
 def engine_state_signal(entry_id: str) -> str:
     """Return the dispatcher signal pushed after every engine step (AD-6).
 
     THE one signal entity projections subscribe to: they never poll and never
-    read a second authority. Entry-scoped so a reload's fresh runner cannot
-    drive the previous entry's (already removed) entities.
+    read a second authority. Since Story 4.1 the WebSocket subscription
+    (`websocket.py`) hooks the same signal — it is the ONE trigger of every
+    state push, and the view is rebuilt on read rather than carried as a
+    payload. Entry-scoped so a reload's fresh runner cannot drive the
+    previous entry's (already removed) entities.
     """
     return f"{DOMAIN}_{entry_id}_engine_state"
 

@@ -4,8 +4,10 @@ ONE entity, `device_class: problem`: `on` iff at least one anomaly is open.
 Health IS the set of open Repairs issues — the anomaly manager keeps that set
 and pushes the engine-state signal on every open, clear and dismissal, so
 this projection refreshes the moment an issue appears or the operator
-acknowledges one. It reads the manager and never mutates it (AD-6): no
-polling, no `RestoreEntity`, no second authority.
+acknowledges one. Since Story 4.1 it reads the `health` section of the ONE
+state view (`state_view.current_view`, AD-14) — the same document the
+timeline card receives — and never mutates anything (AD-6): no polling, no
+`RestoreEntity`, no second authority.
 
 HA's loader imports `<package>.binary_sensor`, so the module it actually
 loads is the root-level `binary_sensor.py`; this module is what that one
@@ -21,7 +23,7 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntity,
 )
 
-from ..adapters.anomalies import subject_keys  # noqa: TID252
+from ..state_view import current_view  # noqa: TID252
 from .entity import HaIrrigationControllerEntity
 
 if TYPE_CHECKING:
@@ -29,7 +31,6 @@ if TYPE_CHECKING:
     from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
     from .. import HaIrrigationConfigEntry  # noqa: TID252
-    from ..adapters.anomalies import AnomalyManager  # noqa: TID252
 
 # Mirrors the root `binary_sensor.py` (the module HA's loader actually
 # imports): the projection is dispatcher-pushed and never polls.
@@ -42,7 +43,7 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Add the health entity to the controller device."""
-    async_add_entities([HealthBinarySensor(entry, entry.runtime_data.anomalies)])
+    async_add_entities([HealthBinarySensor(entry)])
 
 
 class HealthBinarySensor(HaIrrigationControllerEntity, BinarySensorEntity):
@@ -51,39 +52,27 @@ class HealthBinarySensor(HaIrrigationControllerEntity, BinarySensorEntity):
     `open_anomalies` lists `{anomaly, zone_id?, entity_id?, role?}` — the
     kind and the subject keys, the same shape as the `anomaly_cleared` bus
     payload — never the full contexts (the timeline card gets health from
-    the pushed state, not from attributes). `last_anomaly` is the most
-    recent report, kind plus context, kept after it clears.
+    the pushed state, which carries exactly these two values as
+    `health.open` and `health.last`). `last_anomaly` is the most recent
+    report, kind plus context, kept after it clears.
     """
 
     _attr_device_class = BinarySensorDeviceClass.PROBLEM
 
-    def __init__(
-        self,
-        entry: HaIrrigationConfigEntry,
-        anomalies: AnomalyManager,
-    ) -> None:
-        """Bind the projection to the controller entry and its anomaly manager."""
+    def __init__(self, entry: HaIrrigationConfigEntry) -> None:
+        """Bind the projection to the controller entry whose view it reads."""
         super().__init__(entry, "health")
-        self._anomalies = anomalies
 
     @property
     def is_on(self) -> bool:
         """Return True iff at least one anomaly is open."""
-        return bool(self._anomalies.open_anomalies)
+        return bool(current_view(self._entry)["health"]["open"])
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return the open anomalies (kind + subject) and the last report."""
-        last = self._anomalies.last_anomaly
+        health = current_view(self._entry)["health"]
         return {
-            "open_anomalies": [
-                {
-                    "anomaly": record.kind.value,
-                    **subject_keys(record.kind, record.context),
-                }
-                for record in self._anomalies.open_anomalies
-            ],
-            "last_anomaly": None
-            if last is None
-            else {**dict(last.context), "anomaly": last.kind.value},
+            "open_anomalies": health["open"],
+            "last_anomaly": health["last"],
         }

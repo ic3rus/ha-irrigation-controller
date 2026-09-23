@@ -167,7 +167,8 @@ class Sequencer:
         self._unreadable_run = run_unreadable
         # Completed-cycle outcomes, oldest→newest, pruned to the retention
         # window on every completion. Journalled with the rest of the state:
-        # Epic 4's state view reads it from here, never from storage (AD-14).
+        # Epic 4's state view reads it from here through the `history`
+        # property, never from storage (AD-14).
         self._history: list[dict[str, object]] = (
             [] if history is None else list(history)
         )
@@ -280,6 +281,21 @@ class Sequencer:
         `_complete_cycle` only — nothing outside the engine settles.
         """
         return self._ledger
+
+    @property
+    def history(self) -> tuple[dict[str, object], ...]:
+        """Return the stored outcome records, oldest→newest, read-only (AD-6).
+
+        THE read surface of the 7-day history (AD-14): `engine/view.py`
+        builds the state view's `history` rows from it, pruning ON READ with
+        `prune_history` and never touching this list — a stale record stays
+        stored until the next completion prunes it, and is simply absent
+        from the view meanwhile. A tuple, so no reader can append to or
+        reorder what only `_complete_cycle`, `_check_missed` and
+        `_dispatch_scheduled` write — but the records themselves are SHARED,
+        not copied: a reader must not mutate them.
+        """
+        return tuple(self._history)
 
     async def async_set_season(self, *, enabled: bool, now: datetime) -> bool:  # noqa: ARG002
         """Turn the season on or off; return True iff the value changed.

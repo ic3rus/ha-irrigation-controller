@@ -1,9 +1,17 @@
-"""Sensor platform — passive projections of engine state (AC 5, AD-6).
+"""Sensor platform — passive projections of the engine STATE VIEW (AC 5, AD-6).
 
-Both entities READ the sequencer and never mutate it: they command nothing,
-own no timer and hold no state of their own. Updates arrive through the ONE
-dispatcher signal the runner pushes after each engine step, so nothing polls
-and nothing restores (`RestoreEntity` is never authoritative — AD-2).
+Both entities READ the one state view (`state_view.current_view`, built by
+`engine/view.py`, AD-14) and never mutate anything: they command nothing,
+own no timer and hold no state of their own. Since Story 4.1 no entity reads
+an engine object directly — the view is the only projection contract, and
+the same document is what the WebSocket channel pushes. Updates arrive
+through the ONE dispatcher signal the runner pushes after each engine step,
+so nothing polls and nothing restores (`RestoreEntity` is never
+authoritative — AD-2).
+
+The attributes stay COARSE (AD-10): a handful of scalars per entity, never a
+section of the document — the recorder silently drops attribute sets above
+16 KB, and the timeline belongs on the WebSocket channel.
 
 HA's loader imports `<package>.sensor`, so the module it actually loads is the
 root-level `sensor.py`; this module is what that one re-exports.
@@ -21,11 +29,8 @@ from homeassistant.components.sensor import (
 from homeassistant.const import UnitOfTime
 
 from ..const import SUBENTRY_TYPE_ZONE  # noqa: TID252
-from ..engine.runs import (  # noqa: TID252
-    CycleStatus,
-    ZoneRunStatus,
-    effective_seconds,
-)
+from ..engine.runs import CycleStatus, ZoneRunStatus  # noqa: TID252
+from ..state_view import current_view  # noqa: TID252
 from .entity import HaIrrigationControllerEntity, HaIrrigationZoneEntity
 
 if TYPE_CHECKING:
@@ -34,8 +39,7 @@ if TYPE_CHECKING:
     from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
     from .. import HaIrrigationConfigEntry  # noqa: TID252
-    from ..engine.runs import CycleRun, ZoneRun  # noqa: TID252
-    from ..engine.sequencer import Sequencer  # noqa: TID252
+    from ..engine.view import RunView, StateView, ZoneRunView  # noqa: TID252
 
 # The engine has no cycle at all most of the time, which is not a CycleStatus:
 # an ENUM sensor must declare every state it can ever report.
@@ -52,15 +56,19 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Add the controller projection plus one projection per zone."""
-    sequencer = entry.runtime_data.sequencer
-    async_add_entities([CycleStatusSensor(entry, sequencer)])
+    async_add_entities([CycleStatusSensor(entry)])
     for subentry in entry.get_subentries_of_type(SUBENTRY_TYPE_ZONE):
         # `config_subentry_id` puts the entity on the zone's device AND makes
         # it removed with the subentry — no manual cleanup anywhere.
         async_add_entities(
-            [ZoneLastWateringSensor(entry, subentry, sequencer)],
+            [ZoneLastWateringSensor(entry, subentry)],
             config_subentry_id=subentry.subentry_id,
         )
+
+
+def _zone_in(run: RunView, zone_id: str) -> ZoneRunView | None:
+    """Return `zone_id`'s slot in the run view, or None when it has none."""
+    return next((zone for zone in run["zones"] if zone["zone_id"] == zone_id), None)
 
 
 class CycleStatusSensor(HaIrrigationControllerEntity, SensorEntity):
@@ -75,17 +83,9 @@ class CycleStatusSensor(HaIrrigationControllerEntity, SensorEntity):
     # No state_class and no unit: HA raises on either for an ENUM sensor.
     _attr_device_class = SensorDeviceClass.ENUM
 
-    def __init__(
-        self,
-        entry: HaIrrigationConfigEntry,
-        sequencer: Sequencer,
-    ) -> None:
-        """Bind the projection to the controller entry and its sequencer."""
+    def __init__(self, entry: HaIrrigationConfigEntry) -> None:
+        """Bind the projection to the controller entry whose view it reads."""
         super().__init__(entry, "cycle_status")
-        self._sequencer = sequencer
-        # The runner is where a deferred reload lives; rebuilt with this
-        # entity on every load, so reading it off `runtime_data` once is safe.
-        self._runner = entry.runtime_data.runner
         # Every state this sensor can report MUST be listed — HA raises on an
         # unlisted one — and each listed value needs a translation entry.
         #
@@ -105,8 +105,8 @@ class CycleStatusSensor(HaIrrigationControllerEntity, SensorEntity):
     @property
     def native_value(self) -> str:
         """Return the active run's status, or idle when nothing is running."""
-        run = self._sequencer.current_run
-        return STATE_IDLE if run is None else run.status.value
+        run = current_view(self._entry)["runs"]["current"]
+        return STATE_IDLE if run is None else run["status"]
 
     @property
     def extra_state_attributes(self) -> dict[str, str | bool | None]:
@@ -129,15 +129,22 @@ class CycleStatusSensor(HaIrrigationControllerEntity, SensorEntity):
         the ONE operator-visible surface of the pause — no new entity, no
         anomaly, no notification, because a pause is normal operation. It
         goes false again the moment the last hand-opened switch closes.
+
+        `current_zone` is the name of the view's `live_zone_id` — the
+        engine's one reading of "which slot is open" (Story 4.1).
         """
-        run = self._sequencer.current_run
-        zone = None if run is None else _live_zone(run)
+        view = current_view(self._entry)
+        run = view["runs"]["current"]
+        live_zone_id = None if run is None else run["live_zone_id"]
+        zone = (
+            None if run is None or live_zone_id is None else _zone_in(run, live_zone_id)
+        )
         return {
-            "cycle_id": None if run is None else run.cycle_id,
-            "current_zone": None if zone is None else zone.name,
-            "config_change_pending": self._runner.reload_pending,
-            "day_credit": self._sequencer.ledger.day_credit,
-            "manual_override": self._sequencer.manual_override,
+            "cycle_id": None if run is None else run["cycle_id"],
+            "current_zone": None if zone is None else zone["name"],
+            "config_change_pending": view["controller"]["config_change_pending"],
+            "day_credit": view["ledger"]["day_credit"],
+            "manual_override": view["controller"]["manual_override"],
         }
 
 
@@ -152,23 +159,21 @@ class ZoneLastWateringSensor(HaIrrigationZoneEntity, SensorEntity):
         self,
         entry: HaIrrigationConfigEntry,
         subentry: ConfigSubentry,
-        sequencer: Sequencer,
     ) -> None:
-        """Bind the projection to one zone subentry and the sequencer."""
+        """Bind the projection to one zone subentry of the entry whose view it reads."""
         super().__init__(entry, subentry, "last_watering_duration")
-        self._sequencer = sequencer
         self._zone_id = subentry.subentry_id
 
     @property
     def native_value(self) -> int | None:
         """Return this zone's last effective watering seconds, None if never.
 
-        The value itself always comes from `effective_seconds` — the ONE
-        helper Epic 2's deficit also reads (AD-5) — applied to the slot
-        `_shown_zone` selects.
+        The value is the view's `effective_s`, which the engine computes with
+        `effective_seconds` — the ONE helper Epic 2's deficit also reads
+        (AD-5) — for the slot `_shown_zone` selects.
         """
-        zone = self._shown_zone()
-        return None if zone is None else effective_seconds(zone)
+        zone = self._shown_zone(current_view(self._entry))
+        return None if zone is None else zone["effective_s"]
 
     @property
     def extra_state_attributes(self) -> dict[str, int]:
@@ -185,14 +190,16 @@ class ZoneLastWateringSensor(HaIrrigationZoneEntity, SensorEntity):
         no credit, not unknown ones. The ledger is READ here, never written
         (AD-6).
         """
-        zone = self._shown_zone()
+        view = current_view(self._entry)
+        zone = self._shown_zone(view)
+        ledger_zone = view["ledger"]["zones"].get(self._zone_id)
         return {
-            "carried_deficit": 0 if zone is None else zone.carried_s,
-            "pending_deficit": self._sequencer.ledger.deficit_s(self._zone_id),
-            "rain_credit": 0 if zone is None else zone.rain_credit_s,
+            "carried_deficit": 0 if zone is None else zone["carried_s"],
+            "pending_deficit": 0 if ledger_zone is None else ledger_zone["deficit_s"],
+            "rain_credit": 0 if zone is None else zone["rain_credit_s"],
         }
 
-    def _shown_zone(self) -> ZoneRun | None:
+    def _shown_zone(self, view: StateView) -> ZoneRunView | None:
         """Return the slot this sensor reports on, or None when it has none.
 
         The running cycle is consulted FIRST: once this zone's slot has closed
@@ -201,9 +208,9 @@ class ZoneLastWateringSensor(HaIrrigationZoneEntity, SensorEntity):
 
         Three cases where a zone with no `actual_end` is still an ANSWER
         rather than missing data — all water zero seconds, which is what the
-        README documents and what `effective_seconds` returns for them, and
-        any would otherwise flap a MEASUREMENT sensor to `unknown` and
-        pollute its long-term statistics:
+        README documents and what `effective_s` reads for them, and any
+        would otherwise flap a MEASUREMENT sensor to `unknown` and pollute
+        its long-term statistics:
 
         - a CANCELLED run: the cancel stopped the cycle before that zone's
           slot;
@@ -216,41 +223,15 @@ class ZoneLastWateringSensor(HaIrrigationZoneEntity, SensorEntity):
         `last_run` survives a reload since Story 3.2 (the journal restores
         it), so a reload no longer resets this sensor to `unknown`.
         """
-        for run in (self._sequencer.current_run, self._sequencer.last_run):
+        runs = view["runs"]
+        for run in (runs["current"], runs["last"]):
             if run is None:
                 continue
-            zone = _zone_run(run, self._zone_id)
+            zone = _zone_in(run, self._zone_id)
             if zone is not None and (
-                zone.actual_end is not None
-                or run.status in (CycleStatus.CANCELLED, CycleStatus.INTERRUPTED)
-                or zone.status is ZoneRunStatus.SKIPPED
+                zone["actual_end"] is not None
+                or run["status"] in (CycleStatus.CANCELLED, CycleStatus.INTERRUPTED)
+                or zone["status"] == ZoneRunStatus.SKIPPED
             ):
                 return zone
         return None
-
-
-def _zone_run(run: CycleRun, zone_id: str) -> ZoneRun | None:
-    """Return `zone_id`'s slot in `run`, or None when it has none."""
-    return next((zone for zone in run.zone_runs if zone.zone_id == zone_id), None)
-
-
-def _live_zone(run: CycleRun) -> ZoneRun | None:
-    """Return the zone whose slot is currently open, or None.
-
-    Identified by "started but not finished" rather than by status: a FAILED
-    zone is indistinguishable by status from a finished one, and it is still
-    the live slot until its planned end (fail-wet consumes the slot, AD-4).
-
-    The SAME rule is encoded in `engine/runs.py::live_zone`, which is what
-    a cancel, a suspend and the startup reconciler act on. The duplication
-    is deliberate (the entity layer keeps its own reading of the engine's
-    types), so the two must be edited together.
-    """
-    return next(
-        (
-            zone
-            for zone in run.zone_runs
-            if zone.actual_start is not None and zone.actual_end is None
-        ),
-        None,
-    )
