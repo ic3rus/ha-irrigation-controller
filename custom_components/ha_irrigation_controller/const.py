@@ -100,6 +100,11 @@ EVENT_TYPE_ANOMALY_CLEARED = "anomaly_cleared"
 WS_TYPE_STATE_GET = f"{DOMAIN}/state_get"
 WS_TYPE_STATE_SUBSCRIBE = f"{DOMAIN}/state_subscribe"
 
+# The ONE static path the bundled timeline card is served from (Story 4.2,
+# AD-12): registered at component setup beside the WebSocket commands. The
+# Lovelace resource points at this URL plus `?v=<manifest version>`.
+FRONTEND_URL = f"/{DOMAIN}/ha-irrigation-timeline-card.js"
+
 
 def engine_state_signal(entry_id: str) -> str:
     """Return the dispatcher signal pushed after every engine step (AD-6).

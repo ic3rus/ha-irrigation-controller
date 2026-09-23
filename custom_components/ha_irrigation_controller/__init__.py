@@ -41,6 +41,7 @@ from .const import (
 )
 from .engine.config import PlanValidationError, build_plan, parse_actuation_timeout
 from .engine.sequencer import JOURNAL_SCHEMA_VERSION, Sequencer
+from .frontend import async_register_frontend
 from .services import async_setup_services
 from .websocket import async_register_websocket_commands
 
@@ -138,9 +139,14 @@ async def async_setup(
     The two WebSocket READ commands (Story 4.1) are registered here for the
     same reason and resolve the entry per call the same way; `manifest.json`
     declares `websocket_api` so the component is up before this runs.
+
+    The bundled timeline card (Story 4.2) is served from here too — ONE
+    static path, ONE Lovelace resource, for the process lifetime — and
+    `manifest.json` declares `http` for the same reason.
     """
     async_setup_services(hass)
     async_register_websocket_commands(hass)
+    await async_register_frontend(hass)
     return True
 
 
