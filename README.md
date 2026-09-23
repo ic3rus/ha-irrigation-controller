@@ -645,7 +645,9 @@ entity.
 ### Health sensor
 
 The **Health** binary sensor on the controller device is `on` while at least
-one anomaly is open and carries two attributes:
+one anomaly is open and carries two attributes — both read from the `health`
+section of the [state view](#state-view-and-websocket-api), the same document
+the timeline card receives:
 
 - `open_anomalies` — a list of `{"anomaly": <kind>, ...}` entries with the
   subject keys of each open anomaly (`zone_id`, `entity_id` or `role`);
@@ -673,6 +675,149 @@ zone_id: 01J...
 `anomaly` events fire on every occurrence (including a fault that is already
 open); `anomaly_cleared` fires when the engine confirms the subject healthy
 again, not when you acknowledge an issue by hand.
+
+## State view and WebSocket API
+
+Everything the integration knows about the controller — the plan, the running
+and last cycles, the per-zone water debt, the last seven days of outcomes and
+the health state — is composed into **one versioned document**, the *state
+view*, built by the engine from the objects it already holds. The four
+entities project a few coarse scalars from it; dashboards read the whole
+thing over two custom WebSocket commands. There is no second source: what the
+card shows and what the entities show come from the same build.
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `ha_irrigation_controller/state_get` | Returns one document. |
+| `ha_irrigation_controller/state_subscribe` | Returns the handshake as the result, then the full document as the first `event`, then one `event` per engine push. |
+
+Both take an optional `entry_id`; with a single controller (the only supported
+configuration) it can be omitted. An unknown id answers `not_found`; an entry
+that exists but has no engine to read right now (unloaded, failed setup, the
+torn-down half of a reload) answers `not_loaded` — the same test the
+subscription's pushes apply, so a fetch made in answer to a pushed document is
+never refused.
+**Neither command requires an administrator**: any authenticated user — a
+non-admin household member's dashboard included — can fetch and subscribe.
+There is no per-user filtering; everybody sees the same document. Commands
+(`run_now`, `cancel_cycle`, `set_season`, `set_zone_duration`) stay
+[services](#services); the WebSocket channel is read-only.
+
+From a browser console on a dashboard:
+
+```js
+await hass.callWS({type: "ha_irrigation_controller/state_get"});
+await hass.connection.subscribeMessage(
+  console.log,
+  {type: "ha_irrigation_controller/state_subscribe"},
+);
+```
+
+The subscription follows the engine-state signal the entities already use: a
+document arrives after every engine step (a cycle start, a zone boundary, a
+completion, a cancel, a season change, a manual-override change, an anomaly
+raised, cleared or acknowledged, a config edit deferred behind a running
+cycle). One engine step can push more than once. While the entry reloads the
+subscription stays open: pushes that land while the engine is torn down are
+skipped, and the rebuilt engine's first push delivers a fresh document on the
+same subscription.
+
+### Handshake
+
+The subscribe result is `{"schema_version": 1, "version": "<manifest version>"}`,
+and the same two keys sit at the top of every document, next to
+`generated_at`, the UTC instant it was composed. `schema_version` is
+the document's schema (bumped when a key changes meaning or disappears —
+additions do not bump it); `version` is the integration release. A card that
+was built against another version can tell from these that its bundle is
+stale.
+
+### The document
+
+Wire conventions: keys are `snake_case`; every instant is a UTC ISO-8601
+string; every duration is in seconds; absent is `null`; enums are their
+string values; zones are keyed by their subentry id; history rows are keyed
+by irrigation day (the Home Assistant-local date of the cycle's configured
+start). The document is JSON primitives only.
+
+- `controller` — `entry_id`, `season_enabled`, `reconciled` (startup
+  reconciliation done), `manual_override`, `config_change_pending`,
+  `deferred` (cycle kinds queued behind a running cycle) and `next_wakeup`
+  (the engine's next timer, or `null` before reconciliation).
+- `plan` — the configured plan verbatim (`pump_entity_id`, `morning_enabled`,
+  `morning_start`, `evening_start` as `HH:MM:SS`, `manual_timeout_s`, the
+  `zones` with both durations and the rain inputs) plus `today`: the
+  `irrigation_day` and the `cycles` derived on it from the **base**
+  durations, each with its `start`, `end` and its zones' planned windows.
+  Once a cycle exists, `runs.current` is authoritative for
+  it — quoted durations, actual instants — and `plan.today` is what the card
+  draws before that.
+- `runs` — `current` and `last`, each `null` or a run: `cycle_id`, `kind`,
+  `status`, `manual`, `late_rerun`, `recovery`, `configured_start` (the
+  plan's intent, what the cycle id and the irrigation day key off) and
+  `scheduled_start` (when it was actually dispatched — later for a deferred
+  cycle), `pump_entity_id`, `rain_total_mm`, `live_zone_id` (the zone whose slot is
+  open, or `null`) and its `zones` — per zone the quoted `duration_s`, the
+  `base_s`, `carried_s` and `rain_credit_s` that produced it, the planned
+  window, the actual instants and `effective_s`, what it really watered. A
+  cancelled cycle is visible here as `runs.last` with `status: "cancelled"`
+  and `effective_s: 0` on the zones it never reached.
+- `ledger` — `settled_cycle_id`, `day_credit`, `rain_source` and per plan
+  zone `deficit_s` and `rain_baseline_mm`.
+- `history` — normally fourteen rows at most (seven days, two kinds), oldest
+  day first, **one per irrigation day and cycle kind**, each carrying an
+  engine-stamped `outcome` (below),
+  the `cycle_id` and `status` of the record that supplied it, the markers
+  (`manual`, `waived_by`, `recovery`, `late_rerun`), `runs` (how many records
+  went into the row), `ended_at`, `rain_total_mm` and the totals `planned_s`,
+  `carried_s`, `effective_s`, `rain_credit_s`. The stored history is pruned
+  to the retention window on every read, so a row disappears the day it ages
+  out even when no cycle has completed since; rows dated in the future (a
+  clock corrected backwards) are kept rather than erased.
+- `health` — `open`, the open anomalies as `{"anomaly": <kind>, ...}` with
+  their subject keys, and `last`, the most recent report with its full
+  context, kept after it clears. The same two values the Health sensor shows.
+
+### Outcomes
+
+Six values, stamped once by the engine — the card never re-derives them from
+raw records:
+
+| Outcome | When |
+|---|---|
+| `missed` | The watchdog filed the cycle as never performed (`status: "missed"`). |
+| `recovered` | The startup reconciler resumed or closed it (`recovery` set), the watchdog re-ran it late (`late_rerun`), or it was filed `interrupted`. |
+| `cancelled` | You stopped it with `cancel_cycle`. |
+| `waived` | A completed `run_now` had already watered the day (`waived_by` names it). |
+| `reduced` | Rain shortened or skipped at least one zone. |
+| `ran` | Everything else. |
+
+When several records share one day and kind — a missed marker and its late
+re-run, a run-now and the scheduled cycle it waived, two run-nows — the row
+takes the **highest-precedence** outcome, `recovered > missed > cancelled >
+waived > reduced > ran`, with `cycle_id`, `status` and totals from the record
+that supplied it and `runs` counting them all. Precedence rather than
+"latest" so that a later run-now can never bury a miss that was never made
+up, or a cancel you may want to see.
+
+### Older records
+
+History records written by earlier releases lack some keys; the reader
+defaults them rather than rewriting storage: `planned_s`, `carried_s` and
+`rain_credit_s` read 0, `rain_total_mm`, `waived_by` and `recovery` read
+`null`, `late_rerun` reads `false`, and `manual` is true only when stored as
+exactly `true`. A record whose `status` or `kind` is not a value this release
+knows is left out of the view and nothing else is affected.
+
+### Entity attributes stay coarse
+
+The entities read the same view but project only a few scalars from it —
+`cycle_id`, `current_zone`, the flags, the per-zone debt figures, the health
+lists. The document itself, the timeline and the history never enter an
+attribute: the recorder silently drops attribute sets above 16 KB, and the
+test suite pins every entity's attributes well under 2 KB.
 
 ## Development
 

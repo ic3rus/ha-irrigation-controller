@@ -6,6 +6,11 @@ it from the engine rather than from storage (AD-14).
 
 Records are coarse by design — this is history, not a replay log. The full
 run objects stay in the snapshot; what survives 7 days is the outcome.
+
+THE reader is `engine/view.py::history_rows` (Story 4.1): it prunes on read,
+defaults every key a record written before Stories 2.2-3.3 lacks, drops a
+record whose `status` or `kind` it does not know, and stamps the one
+`Outcome` per (irrigation day, kind) that the card renders.
 """
 
 from __future__ import annotations
@@ -99,6 +104,11 @@ def history_entry(
     record keeps its pre-run values (`status: "pending"`, `effective_s: 0`,
     `planned_s` the duration the ledger quoted). Records written before 3.3
     have no `late_rerun` key and are not backfilled.
+
+    None of the legacy gaps above is ever backfilled in storage: the ONE
+    reader that defaults them is `engine/view.py::history_rows` (`planned_s`,
+    `carried_s`, `rain_credit_s` → 0; `rain_total_mm`, `waived_by`,
+    `recovery` → None; `late_rerun` → False; `manual` through `is_manual`).
     """
     zone_runs = run.zone_runs
     return {
@@ -142,8 +152,11 @@ def prune_history(
     Every entry is one this module built or one the journal adapter's seed
     let through (`_seed_entry` refuses any record whose `irrigation_day` is
     not an ISO date, AD-11), so the day field is always parseable here.
-    Called on every completion AND once at load (Story 3.2), so entries age
-    out even when no cycle completes for a while.
+    Called on every completion, once at load (Story 3.2) AND on every read
+    of the state view (`engine/view.py`, Story 4.1) — the view filters what
+    it shows and leaves the stored list alone, so a stale record is
+    invisible the moment its day passes even when no cycle completes for a
+    while.
     """
     horizon = timedelta(days=days)
     return [

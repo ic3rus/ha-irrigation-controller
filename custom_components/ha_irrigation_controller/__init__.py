@@ -21,6 +21,7 @@ from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers import config_validation as cv, device_registry as dr
 from homeassistant.helpers.device_registry import DeviceEntryType
 from homeassistant.helpers.storage import Store
+from homeassistant.loader import async_get_loaded_integration
 
 from .adapters.anomalies import AnomalyManager, async_delete_domain_issues
 from .adapters.journal import STORAGE_KEY, JournalAdapter
@@ -41,6 +42,7 @@ from .const import (
 from .engine.config import PlanValidationError, build_plan, parse_actuation_timeout
 from .engine.sequencer import JOURNAL_SCHEMA_VERSION, Sequencer
 from .services import async_setup_services
+from .websocket import async_register_websocket_commands
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -114,6 +116,11 @@ class HaIrrigationRuntimeData:
     # The config the running engine was built from (or last given, when a
     # reload is deferred): the update listener's "did anything change?" test.
     config_fingerprint: ConfigFingerprint
+    # The manifest version, read ONCE at setup (Story 4.1): the second half
+    # of the state view's stale-bundle handshake, stamped on every document
+    # and on the subscribe result so a cached card bundle can tell it is
+    # older than the backend it talks to.
+    version: str
 
 
 async def async_setup(
@@ -127,8 +134,13 @@ async def async_setup(
     an action the operator cannot even open. Registered once here, they stay
     for the process lifetime and each call resolves the entry itself — so a
     call made while nothing is loaded explains that instead of vanishing.
+
+    The two WebSocket READ commands (Story 4.1) are registered here for the
+    same reason and resolve the entry per call the same way; `manifest.json`
+    declares `websocket_api` so the component is up before this runs.
     """
     async_setup_services(hass)
+    async_register_websocket_commands(hass)
     return True
 
 
@@ -323,6 +335,7 @@ async def async_setup_entry(
         tracker=tracker,
         switches=switches,
         config_fingerprint=config_fingerprint(entry),
+        version=str(async_get_loaded_integration(hass, DOMAIN).version),
     )
     # ALSO before forwarding: the manager re-seeds its open set from the
     # Repairs issues that survived the previous load, and the health binary

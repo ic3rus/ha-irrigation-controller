@@ -494,10 +494,11 @@ def live_zone(run: CycleRun) -> ZoneRun | None:
     the live slot until its planned end (fail-wet consumes the slot, AD-4).
 
     Shared by the cancel (which closes and mutates it), the suspend (which
-    closes and mutates nothing) and Story 3.2's reconciler (which decides
-    what the crash left open). `entities/sensor.py::_live_zone` encodes the
-    SAME rule for the projection — the engine may not import from
-    `entities/`, so the two must be edited together.
+    closes and mutates nothing), Story 3.2's reconciler (which decides what
+    the crash left open) and the state view (`engine/view.py`), which
+    publishes the answer as `runs.current.live_zone_id` — the ONE reading of
+    the rule every projection consumes (AD-14); nothing outside the engine
+    re-derives it.
     """
     return next(
         (

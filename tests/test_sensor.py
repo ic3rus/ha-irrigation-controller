@@ -45,10 +45,17 @@ from custom_components.ha_irrigation_controller.const import (
     SERVICE_RUN_NOW,
     SUBENTRY_TYPE_ZONE,
 )
+from custom_components.ha_irrigation_controller.engine.ports import AnomalyKind
 from custom_components.ha_irrigation_controller.engine.sequencer import (
     JOURNAL_SCHEMA_VERSION,
 )
-from tests.common import CONTROLLER_OPTIONS, fire_at, zone_subentry_data
+from tests.common import (
+    CONTROLLER_OPTIONS,
+    fire_at,
+    history_record,
+    journal_document,
+    zone_subentry_data,
+)
 
 if TYPE_CHECKING:
     from freezegun.api import FrozenDateTimeFactory
@@ -222,6 +229,96 @@ async def test_cycle_status_is_an_enum_with_a_coarse_summary(
     assert state.state in state.attributes[ATTR_OPTIONS]
     assert state.attributes["cycle_id"] == "2026-07-31-morning"
     assert state.attributes["current_zone"] == "Zone A"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+# The document's section names: none of them may ever become an attribute.
+DOCUMENT_SECTIONS = ("controller", "plan", "runs", "ledger", "history", "health")
+# AD-10's tripwire (Story 4.1, AC 5): the recorder silently drops attribute
+# sets above 16 KB; the entities must stay two orders of magnitude below it.
+MAX_ATTRIBUTES_BYTES = 2048
+
+
+async def test_entity_attributes_stay_coarse_with_six_zones_and_a_full_history(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Matrix "Attribute size": every entity under 2 KB, the document never inside.
+
+    Six zones, fourteen stored rows (seven days, both kinds), an open anomaly
+    and a RUNNING cycle — the fullest state view this controller produces.
+    The entities read that view and must project a handful of scalars from
+    it, never a section: the recorder would drop the whole attribute set at
+    16 KB without a word, and the timeline belongs on the WebSocket channel.
+    """
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    hass_storage[STORAGE_KEY] = journal_document(
+        history=[
+            history_record(
+                kind,
+                day=f"2026-07-{day:02d}",
+                status="missed" if day == 27 else "completed",
+                zones=[
+                    {
+                        "zone_id": f"zone-{index}",
+                        "status": "completed",
+                        "planned_s": 600,
+                        "carried_s": 0,
+                        "rain_credit_s": 60 * index,
+                        "effective_s": 600,
+                    }
+                    for index in range(1, 7)
+                ],
+            )
+            for day in range(25, 32)
+            for kind in ("morning", "evening")
+        ],
+    )
+    entry = controller_with_zones(
+        *(
+            {
+                **zone_subentry_data(f"Zone {index}", f"switch.zone_{index}_valve"),
+                "subentry_id": f"zone-{index}",
+            }
+            for index in range(1, 7)
+        ),
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    register_switches(hass)
+    entry.runtime_data.anomalies.report(
+        AnomalyKind.VALVE_OPEN_UNCONFIRMED,
+        {
+            "cycle_id": "2026-07-30-evening",
+            "zone_id": "zone-3",
+            "entity_id": "switch.zone_3_valve",
+        },
+    )
+
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+
+    entity_ids = [
+        registry_entry.entity_id
+        for registry_entry in er.async_entries_for_config_entry(
+            er.async_get(hass),
+            entry.entry_id,
+        )
+    ]
+    # The controller's three entities plus one per zone.
+    assert len(entity_ids) == 3 + 6
+    assert state_of(
+        hass, entity_id_for(hass, f"{entry.entry_id}_cycle_status")
+    ).state == ("running")
+    for entity_id in entity_ids:
+        attributes = state_of(hass, entity_id).attributes
+        assert len(json.dumps(attributes)) < MAX_ATTRIBUTES_BYTES, entity_id
+        for section in DOCUMENT_SECTIONS:
+            assert section not in attributes, (entity_id, section)
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

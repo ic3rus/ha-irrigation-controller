@@ -5,6 +5,9 @@
     "@ic3rus"
   ],
   "config_flow": true,
+  "dependencies": [
+    "websocket_api"
+  ],
   "documentation": "https://github.com/ic3rus/ha-irrigation-controller",
   "integration_type": "helper",
   "iot_class": "calculated",
