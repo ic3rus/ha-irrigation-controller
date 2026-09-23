@@ -10,18 +10,31 @@
  * `x = fraction * 1000` follows the card width with no resize observer.
  *
  * The authority rule from Story 4.1 lives here and nowhere else: a cycle is
- * drawn from `plan.today.cycles` (base durations) unless `runs.current` is a
- * run of the same kind on the same irrigation day, in which case that run's
- * zones' planned windows (quoted durations) are drawn instead.
+ * drawn from `plan.today.cycles` (base durations) unless `runs.current` —
+ * or, once the cycle is over, `runs.last` (Story 4.3) — is a run of the same
+ * kind on the same irrigation day, in which case that run's zones' planned
+ * windows (quoted durations) and engine statuses are drawn instead.
+ * Statuses come from the engine verbatim; nothing here derives an outcome.
+ *
+ * The live half (`cursorAt`, `progressOf`) is wall-clock math against the
+ * same rows: the element hands in the server-aligned "now" (`clock.ts`) and
+ * gets back fractions of the row's axis, so a tick costs no date parsing of
+ * its own beyond the row's two bounds.
  *
  * Instants are the wire's UTC ISO-8601 strings, parsed with `Date.parse`.
  * Nothing here formats anything for a human — the element does that with
  * the user's locale.
  */
 
-import type { CycleKind, RunView, ScheduleView, StateView } from "./types";
+import type { CycleKind, CycleStatus, RunView, ScheduleView, StateView, ZoneRunStatus } from "./types";
 
 export type TimelineSource = "plan" | "run";
+
+/** A segment's look: `planned` from the plan, the engine's status from a run. */
+export type SegmentStatus = "planned" | ZoneRunStatus;
+
+/** A row's look: `planned` from the plan, the engine's cycle status from a run. */
+export type RowStatus = "planned" | CycleStatus;
 
 export interface TimelineSegment {
   zoneId: string;
@@ -34,6 +47,7 @@ export interface TimelineSegment {
   x0: number;
   /** Right edge as a fraction of the row's axis, in [0, 1]; `x0 <= x1`. */
   x1: number;
+  status: SegmentStatus;
 }
 
 export interface TimelineRow {
@@ -43,6 +57,7 @@ export interface TimelineRow {
   /** The axis end: the cycle's end, UTC ISO-8601. */
   end: string;
   source: TimelineSource;
+  status: RowStatus;
   /** Empty when the cycle has no zones — the element shows a hint instead. */
   segments: TimelineSegment[];
 }
@@ -130,6 +145,7 @@ interface ZoneWindow {
   name: string;
   start: string;
   end: string;
+  status: SegmentStatus;
 }
 
 /** Lay `windows` out along the axis `start`..`end` as fractions. */
@@ -180,12 +196,14 @@ function rowFromPlan(cycle: ScheduleView, names: Map<string, string>): TimelineR
     name: names.get(zone.zone_id) ?? zone.zone_id,
     start: zone.start,
     end: zone.end,
+    status: "planned" as const,
   }));
   return {
     kind: cycle.kind,
     start: cycle.start,
     end: cycle.end,
     source: "plan",
+    status: "planned",
     segments: segmentsOf(windows, cycle.start, cycle.end),
   };
 }
@@ -196,6 +214,7 @@ function rowFromRun(run: RunView, names: Map<string, string>): TimelineRow {
     name: zone.name || (names.get(zone.zone_id) ?? zone.zone_id),
     start: zone.planned_start,
     end: zone.planned_end,
+    status: zone.status,
   }));
   // The run's axis is its zones' planned envelope; a run without zones
   // degenerates to a point at its scheduled start.
@@ -206,38 +225,88 @@ function rowFromRun(run: RunView, names: Map<string, string>): TimelineRow {
     start,
     end,
     source: "run",
+    status: run.status,
     segments: segmentsOf(windows, start, end),
   };
 }
 
 /**
  * Build the timeline rows of `view`: today's cycles in plan order, each from
- * the plan or — the authority rule — from `runs.current` when that run is
- * this cycle on this irrigation day. `timeZone` is the controller's IANA
- * zone (`hass.config.time_zone`), used only for the same-day test.
+ * the plan or — the authority rule — from `runs.current`, then `runs.last`,
+ * whichever is this cycle's run on this irrigation day. `timeZone` is the
+ * controller's IANA zone (`hass.config.time_zone`), used only for the
+ * same-day test.
  *
- * A current run whose kind has no planned cycle today (the engine allows
+ * `last` joins the rule because the engine clears `current` in the same
+ * step that finishes the run: the push showing the final zone `completed`
+ * is the push where `current` becomes `null`, and without `last` the row
+ * would snap back to the base-duration plan. Yesterday's `last` fails the
+ * same-day test and the plan is drawn.
+ *
+ * A run whose kind has no planned cycle today (the engine allows
  * `run_now(morning)` while the morning cycle is disabled) gets a row of its
- * own, unless the zone says it belongs to another day; rows are then kept
- * in start order.
+ * own — `current` first, then `last`, so the row survives the run's own
+ * completion — unless the zone says it belongs to another day; rows are
+ * then kept in start order.
  */
 export function buildTimeline(view: StateView, timeZone?: string): TimelineModel {
   const names = new Map(view.plan.zones.map((zone) => [zone.zone_id, zone.name]));
   const irrigationDay = view.plan.today.irrigation_day;
-  const current = view.runs.current;
+  const { current, last } = view.runs;
   const cycles = view.plan.today.cycles;
-  const rows = cycles.map((cycle) =>
-    current !== null && isTodaysRun(current, cycle, irrigationDay, timeZone)
-      ? rowFromRun(current, names)
-      : rowFromPlan(cycle, names),
+  const pick = (run: RunView | null, cycle: ScheduleView): TimelineRow | undefined =>
+    run !== null && isTodaysRun(run, cycle, irrigationDay, timeZone) ? rowFromRun(run, names) : undefined;
+  const rows = cycles.map(
+    (cycle) => pick(current, cycle) ?? pick(last, cycle) ?? rowFromPlan(cycle, names),
   );
-  if (
-    current !== null &&
-    !cycles.some((cycle) => cycle.kind === current.kind) &&
-    (onIrrigationDay(current, irrigationDay, timeZone) ?? true)
-  ) {
-    rows.push(rowFromRun(current, names));
+  const extra = [current, last].find(
+    (run): run is RunView =>
+      run !== null &&
+      !cycles.some((cycle) => cycle.kind === run.kind) &&
+      (onIrrigationDay(run, irrigationDay, timeZone) ?? true),
+  );
+  if (extra !== undefined) {
+    rows.push(rowFromRun(extra, names));
     rows.sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
   }
   return { irrigationDay, rows };
+}
+
+/**
+ * Where "now" sits on `row`'s axis, as a fraction: defined only while
+ * `start ≤ now ≤ end` on a span of positive length. Outside the row, on a
+ * zero-length axis or with an unusable instant there is no cursor.
+ */
+export function cursorAt(row: TimelineRow, nowMs: number): number | undefined {
+  const start = Date.parse(row.start);
+  const span = Date.parse(row.end) - start;
+  if (!(span > 0) || !(nowMs >= start) || !(nowMs <= start + span)) {
+    return undefined;
+  }
+  return (nowMs - start) / span;
+}
+
+/**
+ * How much of `segment` is filled, in [0, 1]: a running zone fills up to the
+ * cursor (all the way once the cursor has left the row — the engine, not
+ * the clock, decides when it is done); a completed or failed zone is full;
+ * a planned, pending or skipped one is empty. A zero-width segment has
+ * nothing to fill.
+ */
+export function progressOf(segment: TimelineSegment, cursor: number | undefined): number {
+  switch (segment.status) {
+    case "running": {
+      const width = segment.x1 - segment.x0;
+      if (!(width > 0)) {
+        return 0;
+      }
+      const at = Math.min(segment.x1, Math.max(segment.x0, cursor ?? segment.x1));
+      return (at - segment.x0) / width;
+    }
+    case "completed":
+    case "failed":
+      return 1;
+    default:
+      return 0;
+  }
 }

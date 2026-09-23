@@ -206,10 +206,19 @@ class CycleRunner:
         the mid-cycle case this story exists for).
 
         A no-op after shutdown: nothing may be armed behind an unload.
+
+        Pushes state once the trackers are re-armed (Story 4.3, AD-6): the
+        listener swapped `sequencer.plan` just before calling this, so
+        `plan.today` in the state view already reflects the edit, and the
+        card must draw the recalculated schedule NOW rather than at the
+        next zone boundary. `async_request_reload` pushes only for the
+        first deferred edit, which is what left the second and later
+        mid-run edits invisible until the engine next stepped.
         """
         if self._shutdown:
             return
         self._arm_daily()
+        self._async_push_state()
 
     @callback
     def _arm_daily(self) -> None:

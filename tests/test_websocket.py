@@ -26,10 +26,13 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 import custom_components.ha_irrigation_controller
 from custom_components.ha_irrigation_controller.const import (
     ATTR_CYCLE,
+    ATTR_DURATION,
+    ATTR_ZONE_ID,
     CONF_EVENING_START,
     DOMAIN,
     SERVICE_CANCEL_CYCLE,
     SERVICE_RUN_NOW,
+    SERVICE_SET_ZONE_DURATION,
     WS_TYPE_STATE_GET,
     WS_TYPE_STATE_SUBSCRIBE,
     engine_state_signal,
@@ -304,6 +307,75 @@ async def test_the_pushed_documents_follow_a_timer_driven_cycle(
     assert zone_a["effective_s"] == 600
     assert zone_b["status"] == "running"
     assert zone_b["actual_start"] == "2026-07-31T05:10:00+00:00"
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_every_mid_run_duration_edit_pushes_the_recalculated_plan(
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    freezer: FrozenDateTimeFactory,
+    entry: MockConfigEntry,
+) -> None:
+    """Story 4.3, matrix "Mid-run duration edit": AD-6 proven over the socket.
+
+    The morning cycle is live; two successive `set_zone_duration` calls edit
+    zone A's EVENING duration. Each call must yield at least one document
+    whose `plan.today` evening windows reflect the new duration — the second
+    edit too, which before 4.3 only travelled with the next engine step —
+    while the running cycle's zones keep their AD-8 snapshot.
+    """
+    register_switch_domain(hass)
+    client = await hass_ws_client(hass)
+    await subscribe(client)
+    await fire_at(hass, freezer, "2026-07-31 07:00:00+02:00")
+    running = await last_document(client)
+    current = running["runs"]["current"]
+    assert current is not None
+    planned_ends = [zone["planned_end"] for zone in current["zones"]]
+
+    def evening_windows(document: dict[str, Any]) -> list[tuple[str, str]]:
+        (evening,) = [
+            cycle
+            for cycle in document["plan"]["today"]["cycles"]
+            if cycle["kind"] == "evening"
+        ]
+        return [(zone["start"], zone["end"]) for zone in evening["zones"]]
+
+    # The base plan: zone A 20:00-20:15 local, zone B 20:15-20:30.
+    assert evening_windows(running) == [
+        ("2026-07-31T18:00:00+00:00", "2026-07-31T18:15:00+00:00"),
+        ("2026-07-31T18:15:00+00:00", "2026-07-31T18:30:00+00:00"),
+    ]
+
+    for minutes, zone_a_end, zone_b_end in (
+        (20, "2026-07-31T18:20:00+00:00", "2026-07-31T18:35:00+00:00"),
+        (25, "2026-07-31T18:25:00+00:00", "2026-07-31T18:40:00+00:00"),
+    ):
+        freezer.tick(60)
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_SET_ZONE_DURATION,
+            {ATTR_ZONE_ID: "zone-a", ATTR_CYCLE: "evening", ATTR_DURATION: minutes},
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+
+        documents = await pushed_documents(client)
+        assert documents, f"the {minutes}-minute edit pushed nothing"
+        document = documents[-1]
+        assert evening_windows(document) == [
+            ("2026-07-31T18:00:00+00:00", zone_a_end),
+            (zone_a_end, zone_b_end),
+        ]
+        # The edit is deferred behind the running cycle, whose zones are an
+        # AD-8 snapshot: nothing about the live run moved.
+        current = document["runs"]["current"]
+        assert current is not None
+        assert current["status"] == "running"
+        assert [zone["planned_end"] for zone in current["zones"]] == planned_ends
+        assert document["controller"]["config_change_pending"] is True
 
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()

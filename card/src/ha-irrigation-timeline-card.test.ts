@@ -2,15 +2,29 @@ import type { HomeAssistant } from "custom-card-helpers";
 import { formatTime } from "custom-card-helpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { EVENING, eveningRun, MORNING, stateView, TIME_ZONE } from "./fixtures.test-helpers";
+import { FAST_TICK_MS, SLOW_TICK_MS } from "./clock";
+import {
+  completedEveningRun,
+  EVENING,
+  eveningRun,
+  MORNING,
+  stateView,
+  TIME_ZONE,
+  zoneRun,
+} from "./fixtures.test-helpers";
 import {
   HaIrrigationTimelineCard,
   type IrrigationTimelineCardConfig,
   LANE_HEIGHT,
   RETRY_DELAY_MS,
 } from "./ha-irrigation-timeline-card";
+import * as timeline from "./timeline";
 import type { StateView } from "./types";
-import { WS_TYPE_STATE_SUBSCRIBE } from "./ws";
+import { WS_TYPE_STATE_GET, WS_TYPE_STATE_SUBSCRIBE } from "./ws";
+
+// The real geometry, wrapped in spies: the memo test below counts the calls
+// the card makes into it (ESM exports cannot be spied on after the fact).
+vi.mock("./timeline", { spy: true });
 
 const CARD_TYPE = "ha-irrigation-timeline-card";
 
@@ -21,6 +35,8 @@ type Listener = () => void;
 interface FakeHass {
   hass: HomeAssistant;
   subscribeMessage: ReturnType<typeof vi.fn>;
+  /** `hass.callWS`, shared by every `hass` object the fake hands out. */
+  callWS: ReturnType<typeof vi.fn>;
   unsubscribe: ReturnType<typeof vi.fn>;
   addEventListener: ReturnType<typeof vi.fn>;
   removeEventListener: ReturnType<typeof vi.fn>;
@@ -77,10 +93,11 @@ function createHass(options: FakeOptions = {}): FakeHass {
     listeners.get(type)?.delete(listener);
   });
   const connection = { subscribeMessage, addEventListener, removeEventListener };
+  const callWS = vi.fn();
   const make = (): HomeAssistant =>
     ({
       connection,
-      callWS: vi.fn(),
+      callWS,
       locale: LOCALE,
       config: options.timeZone === null ? {} : { time_zone: options.timeZone ?? TIME_ZONE },
       states: {},
@@ -88,6 +105,7 @@ function createHass(options: FakeOptions = {}): FakeHass {
   return {
     hass: make(),
     subscribeMessage,
+    callWS,
     unsubscribe,
     addEventListener,
     removeEventListener,
@@ -139,6 +157,46 @@ function sources(card: HaIrrigationTimelineCard): Array<string | null> {
   return [...(card.shadowRoot?.querySelectorAll("section.cycle") ?? [])].map((row) =>
     row.getAttribute("data-source"),
   );
+}
+
+function evening(card: HaIrrigationTimelineCard): HTMLElement {
+  const row = card.shadowRoot?.querySelector('section.cycle[data-kind="evening"]');
+  if (!(row instanceof HTMLElement)) {
+    throw new Error("no evening row");
+  }
+  return row;
+}
+
+/** The `scaleX(...)` factor of a progress overlay's inline transform. */
+function scaleOf(rect: Element | null | undefined): number {
+  const match = /scaleX\(([^)]+)\)/.exec(rect?.getAttribute("style") ?? "");
+  if (!match?.[1]) {
+    throw new Error(`no scaleX in ${rect?.getAttribute("style") ?? "(no rect)"}`);
+  }
+  return Number(match[1]);
+}
+
+function cursorX(row: HTMLElement): number | undefined {
+  const line = row.querySelector("line.cursor");
+  return line === null ? undefined : Number(line.getAttribute("x1"));
+}
+
+function renderSpy(card: HaIrrigationTimelineCard): ReturnType<typeof vi.spyOn> {
+  return vi.spyOn(card as unknown as { render: () => unknown }, "render");
+}
+
+/**
+ * Fake timers with the browser clock parked at `iso` (UTC), so
+ * `Date.now()` and every interval are under the test's control.
+ */
+function clockAt(iso: string): void {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date(iso));
+}
+
+/** Push `view` stamped `generated_at` = now, so the estimated offset is 0. */
+function pushNow(fake: FakeHass, options: Parameters<typeof stateView>[0] = {}): void {
+  fake.push(stateView({ generatedAt: new Date(Date.now()).toISOString(), ...options }));
 }
 
 describe("ha-irrigation-timeline-card", () => {
@@ -531,6 +589,475 @@ describe("ha-irrigation-timeline-card", () => {
     fake.push(stateView({ morningEnabled: false }));
     await card.updateComplete;
     expect(render).toHaveBeenCalledTimes(2);
+  });
+
+  // ------------------------------------------------------------ live clock
+
+  it("fills the running zone and places the cursor from the server-aligned clock, once per second", async () => {
+    clockAt("2026-09-23T18:05:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    pushNow(fake, { current: eveningRun() });
+    await card.updateComplete;
+
+    const row = evening(card);
+    // The golden values: cursor 5/30 of the axis, Lawn a quarter through, Beds empty.
+    expect(cursorX(row)).toBeCloseTo(166.67, 1);
+    const overlays = row.querySelectorAll("rect.progress");
+    expect(overlays).toHaveLength(1);
+    expect(overlays[0]?.getAttribute("data-zone")).toBe("z1");
+    expect(scaleOf(overlays[0])).toBeCloseTo(0.25, 6);
+    expect(row.querySelector('rect.segment[data-zone="z2"]')?.getAttribute("data-status")).toBe("pending");
+
+    const render = renderSpy(card);
+    await vi.advanceTimersByTimeAsync(FAST_TICK_MS);
+    expect(render).toHaveBeenCalledTimes(1);
+    // 18:05:01: the cursor moved 1 s along a 30 min axis, the fill 1 s along 20 min.
+    expect(cursorX(row)).toBeCloseTo((301 / 1800) * 1000, 3);
+    expect(scaleOf(row.querySelector("rect.progress"))).toBeCloseTo(301 / 1200, 6);
+
+    await vi.advanceTimersByTimeAsync(FAST_TICK_MS * 59);
+    expect(render).toHaveBeenCalledTimes(60);
+    expect(cursorX(row)).toBeCloseTo(200, 3);
+    expect(scaleOf(row.querySelector("rect.progress"))).toBeCloseTo(0.3, 6);
+  });
+
+  it("never accumulates ticks: after a 3-minute throttle the fill lands at the wall-clock position", async () => {
+    clockAt("2026-09-23T18:05:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    pushNow(fake, { current: eveningRun() });
+    await card.updateComplete;
+    const row = evening(card);
+
+    // The tab was throttled: the wall clock moved 3 minutes, no interval fired.
+    vi.setSystemTime(new Date("2026-09-23T18:08:00+00:00"));
+    expect(cursorX(row)).toBeCloseTo(166.67, 1);
+
+    const render = renderSpy(card);
+    await vi.advanceTimersByTimeAsync(FAST_TICK_MS);
+    await card.updateComplete;
+
+    expect(render).toHaveBeenCalledTimes(1);
+    // One tick, three minutes and one second further: 8:01 / 30:00 of the axis.
+    expect(cursorX(row)).toBeCloseTo((481 / 1800) * 1000, 3);
+    expect(scaleOf(row.querySelector("rect.progress"))).toBeCloseTo(481 / 1200, 6);
+  });
+
+  it("ticks at once when the tab becomes visible", async () => {
+    clockAt("2026-09-23T18:05:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    pushNow(fake, { current: eveningRun() });
+    await card.updateComplete;
+    const row = evening(card);
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    fake.callWS.mockRejectedValue({ code: "not_loaded", message: "" });
+
+    vi.setSystemTime(new Date("2026-09-23T18:10:00+00:00"));
+    document.dispatchEvent(new Event("visibilitychange"));
+    await card.updateComplete;
+
+    // The tick lands before (and regardless of) the fetch's answer.
+    expect(cursorX(row)).toBeCloseTo(333.33, 1);
+    expect(scaleOf(row.querySelector("rect.progress"))).toBeCloseTo(0.5, 6);
+    await settle(card);
+    // The refused fetch changes nothing: no error, document kept.
+    expect(card.shadowRoot?.querySelector(".message.error")).toBeNull();
+    expect(cursorX(row)).toBeCloseTo(333.33, 1);
+
+    // Going hidden ticks nothing and fetches nothing.
+    const render = renderSpy(card);
+    fake.callWS.mockClear();
+    visibility.mockReturnValue("hidden");
+    vi.setSystemTime(new Date("2026-09-23T18:11:00+00:00"));
+    document.dispatchEvent(new Event("visibilitychange"));
+    await card.updateComplete;
+    expect(render).not.toHaveBeenCalled();
+    expect(fake.callWS).not.toHaveBeenCalled();
+    expect(cursorX(row)).toBeCloseTo(333.33, 1);
+  });
+
+  it("re-estimates a delivery delay booked as offset with a fresh fetch when the tab turns visible", async () => {
+    clockAt("2026-09-23T18:05:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake, { entry_id: "entry-1" });
+    pushNow(fake, { current: eveningRun() });
+    await card.updateComplete;
+    expect(card.clockOffsetMs).toBe(0);
+    const row = evening(card);
+
+    // The tab froze at 18:05; the push stamped 18:05 is processed at 18:07 —
+    // two minutes of queueing read as a clock two minutes slow.
+    vi.setSystemTime(new Date("2026-09-23T18:07:00+00:00"));
+    fake.push(stateView({ current: eveningRun(), generatedAt: "2026-09-23T18:05:00+00:00" }));
+    await card.updateComplete;
+    expect(card.clockOffsetMs).toBe(-120_000);
+    expect(cursorX(row)).toBeCloseTo(166.67, 1);
+
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    fake.callWS.mockResolvedValue(stateView({ current: eveningRun(), generatedAt: "2026-09-23T18:07:00+00:00" }));
+    document.dispatchEvent(new Event("visibilitychange"));
+    await settle(card);
+
+    expect(fake.callWS).toHaveBeenCalledTimes(1);
+    expect(fake.callWS).toHaveBeenCalledWith({ type: WS_TYPE_STATE_GET, entry_id: "entry-1" });
+    expect(card.clockOffsetMs).toBe(0);
+    expect(cursorX(row)).toBeCloseTo((420 / 1800) * 1000, 3);
+  });
+
+  it("drops a fetched document that lands after the card was removed or re-pointed", async () => {
+    clockAt("2026-09-23T18:05:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    pushNow(fake, { current: eveningRun() });
+    await card.updateComplete;
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    let resolve: ((view: StateView) => void) | undefined;
+    fake.callWS.mockImplementation(() => new Promise<StateView>((done) => (resolve = done)));
+
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(fake.callWS).toHaveBeenCalledTimes(1);
+    card.remove();
+    resolve?.(stateView({ current: eveningRun(), generatedAt: "2026-09-23T18:15:00+00:00" }));
+    await settle(card);
+
+    expect(card.clockOffsetMs).toBe(0);
+    // Without an open subscription there is nothing to fetch for either.
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(fake.callWS).toHaveBeenCalledTimes(1);
+  });
+
+  it("corrects for clock drift: a generated_at 10 minutes ahead moves the cursor, silently", async () => {
+    clockAt("2026-09-23T18:00:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    expect(card.clockOffsetMs).toBe(0);
+
+    fake.push(stateView({ current: eveningRun(), generatedAt: "2026-09-23T18:10:00+00:00" }));
+    await card.updateComplete;
+
+    expect(card.clockOffsetMs).toBe(600_000);
+    const row = evening(card);
+    // The browser says 18:00; the server says 18:10 — the server wins.
+    expect(cursorX(row)).toBeCloseTo(333.33, 1);
+    expect(scaleOf(row.querySelector("rect.progress"))).toBeCloseTo(0.5, 6);
+    expect(card.shadowRoot?.textContent).not.toMatch(/drift|clock/i);
+
+    // An unparsable stamp keeps the previous estimate.
+    fake.push(stateView({ current: eveningRun(), generatedAt: "not an instant" }));
+    await card.updateComplete;
+    expect(card.clockOffsetMs).toBe(600_000);
+
+    // Every push re-estimates: the newest wins.
+    fake.push(stateView({ current: eveningRun(), generatedAt: "2026-09-23T18:00:30+00:00" }));
+    await card.updateComplete;
+    expect(card.clockOffsetMs).toBe(30_000);
+  });
+
+  it("ticks every minute without a run, and shows the cursor crossing a plan row", async () => {
+    // Inside the morning PLAN window (05:00–05:25), nothing running.
+    clockAt("2026-09-23T05:05:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    pushNow(fake);
+    await card.updateComplete;
+
+    const morning = card.shadowRoot?.querySelector('section.cycle[data-kind="morning"]') as HTMLElement;
+    expect(cursorX(morning)).toBeCloseTo(200, 3);
+    expect(morning.querySelector("rect.progress")).toBeNull();
+    expect(cursorX(evening(card))).toBeUndefined();
+
+    const render = renderSpy(card);
+    await vi.advanceTimersByTimeAsync(SLOW_TICK_MS - 1);
+    expect(render).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(render).toHaveBeenCalledTimes(1);
+    expect(cursorX(morning)).toBeCloseTo(240, 3);
+  });
+
+  it("renders zero times over fifty hass replacements and sixty idle ticks, once on a push", async () => {
+    // Midday: outside both plan windows, no run.
+    clockAt("2026-09-23T12:00:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    pushNow(fake);
+    await card.updateComplete;
+    expect(card.shadowRoot?.querySelector("line.cursor")).toBeNull();
+
+    const render = renderSpy(card);
+    for (let i = 0; i < 50; i += 1) {
+      card.hass = fake.replace();
+    }
+    await vi.advanceTimersByTimeAsync(SLOW_TICK_MS * 60);
+    await card.updateComplete;
+    expect(render).not.toHaveBeenCalled();
+
+    pushNow(fake, { morningEnabled: false });
+    await card.updateComplete;
+    expect(render).toHaveBeenCalledTimes(1);
+  });
+
+  it("switches the tick period with the document: 60 s idle, 1 s while running, 60 s once the cycle ends", async () => {
+    clockAt("2026-09-23T17:50:00+00:00");
+    const armed = vi.spyOn(globalThis, "setInterval");
+    const delays = (): unknown[] => armed.mock.calls.map((call) => call[1]);
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    pushNow(fake);
+    await card.updateComplete;
+    expect(delays()).toEqual([SLOW_TICK_MS]);
+    expect(vi.getTimerCount()).toBe(1);
+
+    // A run starts while the card is up.
+    vi.setSystemTime(new Date("2026-09-23T18:05:00+00:00"));
+    pushNow(fake, { current: eveningRun() });
+    await card.updateComplete;
+    expect(delays()).toEqual([SLOW_TICK_MS, FAST_TICK_MS]);
+    expect(vi.getTimerCount()).toBe(1);
+
+    // Another push with the same period re-arms nothing.
+    pushNow(fake, { current: eveningRun() });
+    await card.updateComplete;
+    expect(delays()).toEqual([SLOW_TICK_MS, FAST_TICK_MS]);
+
+    // The cycle ends at 18:30; the cursor has left the row.
+    vi.setSystemTime(new Date("2026-09-23T18:40:00+00:00"));
+    pushNow(fake, { current: null, last: completedEveningRun() });
+    await card.updateComplete;
+    expect(delays()).toEqual([SLOW_TICK_MS, FAST_TICK_MS, SLOW_TICK_MS]);
+    expect(vi.getTimerCount()).toBe(1);
+
+    const render = renderSpy(card);
+    await vi.advanceTimersByTimeAsync(SLOW_TICK_MS * 5);
+    // The slow ticks move nothing visible.
+    expect(render).not.toHaveBeenCalled();
+  });
+
+  it("renders the tick that takes the cursor off the end of its row, then no more", async () => {
+    // One second before the running row's axis ends.
+    clockAt("2026-09-23T18:29:59.500+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    pushNow(fake, { current: eveningRun({ live_zone_id: "z2", zones: eveningRun().zones.map((zone) =>
+      zone.zone_id === "z1" ? { ...zone, status: "completed" } : { ...zone, status: "running" },
+    ) }) });
+    await card.updateComplete;
+    const row = evening(card);
+    expect(cursorX(row)).toBeDefined();
+
+    const render = renderSpy(card);
+    await vi.advanceTimersByTimeAsync(FAST_TICK_MS);
+    expect(render).toHaveBeenCalledTimes(1);
+    expect(cursorX(row)).toBeUndefined();
+    // The engine has not said "completed" yet: the running zone is drawn full.
+    expect(scaleOf(row.querySelector("rect.progress"))).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(FAST_TICK_MS * 10);
+    expect(render).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears the interval and the visibility listener when removed from the DOM", async () => {
+    clockAt("2026-09-23T18:05:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    pushNow(fake, { current: eveningRun() });
+    await card.updateComplete;
+    expect(vi.getTimerCount()).toBe(1);
+    const removeListener = vi.spyOn(document, "removeEventListener");
+
+    card.remove();
+
+    expect(vi.getTimerCount()).toBe(0);
+    expect(fake.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(removeListener).toHaveBeenCalledWith("visibilitychange", expect.any(Function));
+
+    // Re-attached five minutes later: the ticker comes back with the document
+    // it still holds, and the cursor catches up at once, not at the next tick.
+    const before = cursorX(evening(card));
+    vi.setSystemTime(new Date("2026-09-23T18:10:00+00:00"));
+    document.body.append(card);
+    await settle(card);
+    expect(vi.getTimerCount()).toBe(1);
+    expect(before).toBeCloseTo(166.67, 1);
+    expect(cursorX(evening(card))).toBeCloseTo(333.33, 1);
+  });
+
+  it("stops the ticker when re-pointed at another controller", async () => {
+    clockAt("2026-09-23T18:05:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake, { entry_id: "a" });
+    pushNow(fake, { current: eveningRun() });
+    await card.updateComplete;
+    expect(vi.getTimerCount()).toBe(1);
+
+    card.setConfig({ type: CARD_TYPE, entry_id: "b" });
+    await settle(card);
+
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  // -------------------------------------------------------------- statuses
+
+  it("colours segments by their engine status on the push that reports them, overlay on the running one only", async () => {
+    clockAt("2026-09-23T18:22:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    const zones = eveningRun().zones;
+    pushNow(fake, {
+      current: eveningRun({
+        live_zone_id: "z2",
+        zones: [
+          { ...zones[0]!, status: "completed", actual_end: "2026-09-23T18:20:00+00:00", effective_s: 1200 },
+          { ...zones[1]!, status: "running", actual_start: "2026-09-23T18:20:01+00:00" },
+        ],
+      }),
+    });
+    await card.updateComplete;
+
+    const row = evening(card);
+    expect(row.getAttribute("data-status")).toBe("running");
+    expect(row.querySelector('rect.segment[data-zone="z1"]')?.getAttribute("data-status")).toBe("completed");
+    expect(row.querySelector('rect.segment[data-zone="z2"]')?.getAttribute("data-status")).toBe("running");
+    const overlays = row.querySelectorAll("rect.progress");
+    expect(overlays).toHaveLength(1);
+    expect(overlays[0]?.getAttribute("data-zone")).toBe("z2");
+    // Beds runs 18:20–18:30; at 18:22 it is a fifth through.
+    expect(scaleOf(overlays[0])).toBeCloseTo(0.2, 6);
+
+    pushNow(fake, {
+      current: eveningRun({
+        live_zone_id: "z2",
+        zones: [
+          { ...zones[0]!, status: "failed" },
+          { ...zones[1]!, status: "running" },
+        ],
+      }),
+    });
+    await card.updateComplete;
+    expect(row.querySelector('rect.segment[data-zone="z1"]')?.getAttribute("data-status")).toBe("failed");
+    expect(row.querySelectorAll("rect.progress")).toHaveLength(1);
+  });
+
+  it("keeps the finished run on screen from runs.last, marked completed, without a cursor", async () => {
+    clockAt("2026-09-23T18:40:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    pushNow(fake, { current: null, last: completedEveningRun() });
+    await card.updateComplete;
+
+    const row = evening(card);
+    expect(row.getAttribute("data-source")).toBe("run");
+    expect(row.getAttribute("data-status")).toBe("completed");
+    expect(row.querySelector(".cycle-status")?.textContent).toBe("Completed");
+    expect([...row.querySelectorAll("rect.segment")].map((rect) => rect.getAttribute("data-status"))).toEqual([
+      "completed",
+      "completed",
+    ]);
+    expect(row.querySelector("rect.progress")).toBeNull();
+    expect(cursorX(row)).toBeUndefined();
+    // The run's quoted envelope, not the plan's 18:35.
+    expect(row.querySelector(".cycle-header")?.textContent).toContain(time("2026-09-23T18:30:00+00:00"));
+  });
+
+  it("says Cancelled in the header of a cancelled run, z1 terminal and z2 still pending", async () => {
+    clockAt("2026-09-23T18:12:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    pushNow(fake, {
+      current: null,
+      last: eveningRun({
+        status: "cancelled",
+        live_zone_id: null,
+        zones: [
+          zoneRun({ zone_id: "z1", name: "Lawn", status: "completed", planned_start: "2026-09-23T18:00:00+00:00", planned_end: "2026-09-23T18:20:00+00:00" }),
+          zoneRun({ zone_id: "z2", name: "Beds", status: "pending", planned_start: "2026-09-23T18:20:00+00:00", planned_end: "2026-09-23T18:30:00+00:00" }),
+        ],
+      }),
+    });
+    await card.updateComplete;
+
+    const row = evening(card);
+    expect(row.getAttribute("data-status")).toBe("cancelled");
+    expect(row.querySelector(".cycle-status")?.textContent).toBe("Cancelled");
+    expect(row.querySelector('rect.segment[data-zone="z1"]')?.getAttribute("data-status")).toBe("completed");
+    expect(row.querySelector('rect.segment[data-zone="z2"]')?.getAttribute("data-status")).toBe("pending");
+    expect(row.querySelector("rect.progress")).toBeNull();
+    // 18:12 is inside the row's axis, but a finished run has no "now".
+    expect(cursorX(row)).toBeUndefined();
+    const render = renderSpy(card);
+    await vi.advanceTimersByTimeAsync(SLOW_TICK_MS * 3);
+    expect(render).not.toHaveBeenCalled();
+  });
+
+  it("says Interrupted for a run the startup reconciler closed", async () => {
+    clockAt("2026-09-23T18:12:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    pushNow(fake, { current: null, last: eveningRun({ status: "interrupted", live_zone_id: null }) });
+    await card.updateComplete;
+
+    const row = evening(card);
+    expect(row.getAttribute("data-status")).toBe("interrupted");
+    expect(row.querySelector(".cycle-status")?.textContent).toBe("Interrupted");
+    expect(cursorX(row)).toBeUndefined();
+  });
+
+  it("draws the plan again when runs.last is yesterday's run, with no status word", async () => {
+    clockAt("2026-09-23T12:00:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    pushNow(fake, {
+      last: completedEveningRun({
+        cycle_id: "2026-09-22-evening",
+        configured_start: "2026-09-22T18:00:00+00:00",
+        scheduled_start: "2026-09-22T18:00:00+00:00",
+      }),
+    });
+    await card.updateComplete;
+
+    const row = evening(card);
+    expect(row.getAttribute("data-source")).toBe("plan");
+    expect(row.getAttribute("data-status")).toBe("planned");
+    expect(row.querySelector(".cycle-status")).toBeNull();
+  });
+
+  it("does not put a status word on a planned or running row", async () => {
+    clockAt("2026-09-23T18:05:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    pushNow(fake, { current: eveningRun() });
+    await card.updateComplete;
+
+    expect(card.shadowRoot?.querySelectorAll(".cycle-status")).toHaveLength(0);
+  });
+
+  it("rebuilds the geometry only when the document changes (memoised across ticks)", async () => {
+    clockAt("2026-09-23T18:05:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    const build = vi.mocked(timeline.buildTimeline);
+    build.mockClear();
+    pushNow(fake, { current: eveningRun() });
+    await card.updateComplete;
+    const afterPush = build.mock.calls.length;
+    expect(afterPush).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(FAST_TICK_MS * 5);
+    card.getCardSize();
+    card.getGridOptions();
+    expect(build).toHaveBeenCalledTimes(afterPush);
+
+    // The zone is the memo's other key: a new one rebuilds on the next read.
+    card.hass = { ...fake.replace(), config: { time_zone: "UTC" } } as HomeAssistant;
+    expect(build).toHaveBeenCalledTimes(afterPush);
+    await vi.advanceTimersByTimeAsync(FAST_TICK_MS);
+    expect(build).toHaveBeenCalledTimes(afterPush + 1);
+    expect(build.mock.calls[afterPush]?.[1]).toBe("UTC");
+
+    pushNow(fake, { current: eveningRun() });
+    await card.updateComplete;
+    expect(build).toHaveBeenCalledTimes(afterPush + 2);
   });
 
   // ---------------------------------------------------------------- errors

@@ -2,10 +2,11 @@
  * The card's ONLY data path: Story 4.1's two WebSocket read commands.
  *
  * The card never reads entity states or attributes and never subscribes to
- * bus events (custom event types are admin-only from the frontend). Today
- * the element follows pushes with `state_subscribe` alone; `fetchState`
- * (`state_get`) is the one-shot fetch a later story will use. Both commands
- * are open to every authenticated user.
+ * bus events (custom event types are admin-only from the frontend). The
+ * element follows pushes with `state_subscribe`; `fetchState` (`state_get`)
+ * is the one-shot fetch it makes when a tab turns visible again, to
+ * re-estimate the clock offset from a fresh round-trip (Story 4.3). Both
+ * commands are open to every authenticated user.
  */
 
 import type { HomeAssistant } from "custom-card-helpers";

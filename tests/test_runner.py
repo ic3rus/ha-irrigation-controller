@@ -1420,6 +1420,52 @@ async def test_replan_after_shutdown_arms_nothing(
     assert sequencer.current_run is None
 
 
+async def test_replan_pushes_state_exactly_once_and_never_after_shutdown(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    paris: None,
+) -> None:
+    """Story 4.3 (AD-6): every mid-run edit reaches the card as a document.
+
+    The listener swaps the plan and calls `async_replan`; without a push here
+    the recalculated `plan.today` would only travel with the next engine step
+    (a zone boundary, minutes away). One push per call — the runner adds no
+    coalescing — and none behind an unload.
+    """
+    register_switch_domain(hass)
+    freezer.move_to("2026-07-31 06:59:00+02:00")
+    runner, _, entry = make_entry_runner(hass, make_plan())
+    pushes = 0
+
+    def _on_signal() -> None:
+        nonlocal pushes
+        pushes += 1
+
+    # Subscribed AFTER the start: `async_start` reconciles and pushes once
+    # itself (Story 3.2), and this test counts the pushes of the replans.
+    await runner.async_start()
+    unsubscribe = async_dispatcher_connect(
+        hass,
+        engine_state_signal(entry.entry_id),
+        _on_signal,
+    )
+
+    runner.async_replan()
+    await hass.async_block_till_done()
+    assert pushes == 1
+
+    runner.async_replan()
+    await hass.async_block_till_done()
+    assert pushes == 2
+
+    runner.async_shutdown()
+    runner.async_replan()
+    await hass.async_block_till_done()
+    assert pushes == 2
+
+    unsubscribe()
+
+
 async def test_cancel_fires_the_pending_reload(
     hass: HomeAssistant,
     freezer: FrozenDateTimeFactory,
