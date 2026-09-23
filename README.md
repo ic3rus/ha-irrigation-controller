@@ -53,8 +53,25 @@ tablet whose clock is minutes off still shows the truth — never from
 accumulated ticks: a tab throttled in the background lands at the right
 position the moment it is visible again. A zone duration edited while a cycle
 runs (`set_zone_duration` or a zone edit) reaches the card as the next pushed
-document, milliseconds later. The 7-day history, the health indicator and the
-visual editor arrive in later stories.
+document, milliseconds later.
+
+Under today's rows sits the **7-day history strip**: seven columns — the six
+days before today, then today, labelled with their weekday in your language —
+and one row per cycle (morning when the morning cycle is enabled or has a
+record on one of those days, evening always). Each cell carries the outcome the engine
+stamped on that day's cycle, as a glyph and a colour: a check for _ran_, a
+rain cloud for _reduced by rain_, a raised hand for _waived by run-now_, a
+restore arrow for _recovered_, an alert for _missed_ and a cancel sign for
+_cancelled_. _Missed_ and _recovered_ are the anomalies: they are the only
+cells drawn as a filled badge, so a week that went wrong reads at a glance
+while a week that went well stays quiet. A day and cycle without a record —
+a cycle that has not run yet today, a day before the integration was
+installed — is a hollow circle. Hover (or focus with a screen reader) any
+cell for the full story: date, cycle, outcome, minutes actually watered and
+the rain total, when the row has them. The card never derives an outcome
+itself: it reads `history` from the state view and maps each row's `outcome`
+to its visual, nothing more. The health indicator and the visual editor
+arrive in later stories.
 
 The card reads the [state view](#state-view-and-websocket-api) over the
 `state_subscribe` WebSocket command and nothing else — no entity states, no

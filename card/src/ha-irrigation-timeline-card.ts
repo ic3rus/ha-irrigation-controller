@@ -6,9 +6,21 @@ import type { CSSResultGroup, PropertyValues, TemplateResult } from "lit";
 import { state } from "lit/decorators.js";
 
 import { estimateOffset, serverNow, tickPeriodFor, TRANSITION_MS } from "./clock";
+import type { HistoryModel } from "./history";
+import {
+  buildHistory,
+  cellKey,
+  cellTitle,
+  dayLabel,
+  HISTORY_DAYS,
+  KIND_LABELS,
+  NO_RECORD,
+  OUTCOME_VISUALS,
+  UNKNOWN_OUTCOME,
+} from "./history";
 import type { RowStatus, TimelineRow } from "./timeline";
 import { buildTimeline, cursorAt, progressOf } from "./timeline";
-import type { CycleKind, Handshake, StateView } from "./types";
+import type { CycleKind, Handshake, HistoryRow, StateView } from "./types";
 import type { UnsubscribeState } from "./ws";
 import { asWsError, ERR_NOT_FOUND, ERR_NOT_LOADED, fetchState, subscribeState } from "./ws";
 
@@ -31,10 +43,14 @@ const AXIS_WIDTH = 1000;
 /** Rough pixel budget per Lovelace grid row (56 px rows, 8 px gaps). */
 const GRID_ROW_PX = 64;
 
-const KIND_LABELS: Record<CycleKind, string> = {
-  morning: "Morning",
-  evening: "Evening",
-};
+/**
+ * The history strip's pixel budget, as the stylesheet implies: the
+ * separator (16 margin + 1 border + 12 padding), the title line (~19 + 6
+ * margin) and the weekday-label row (~16 + 2 gap) make the header; then
+ * one `.outcome` line per cycle kind.
+ */
+export const HISTORY_HEADER_PX = 72;
+export const HISTORY_ROW_PX = 28;
 
 /**
  * The word a row's header carries once its run has reached a terminal
@@ -58,11 +74,17 @@ function liveCursor(row: TimelineRow, nowMs: number): number | undefined {
   return LIVE_STATUSES.has(row.status) ? cursorAt(row, nowMs) : undefined;
 }
 
-/** The geometry memo: rows are rebuilt only when the document or the zone changes. */
+/**
+ * The document memo: today's rows and the history strip's model are rebuilt
+ * only when the document or the zone changes — never on a tick. The labels
+ * the strip shows are formatted at render time from the locale, so nothing
+ * locale-dependent is cached here.
+ */
 interface TimelineMemo {
   view: StateView;
   timeZone: string | undefined;
   rows: TimelineRow[];
+  history: HistoryModel;
 }
 
 export interface IrrigationTimelineCardConfig extends LovelaceCardConfig {
@@ -84,7 +106,8 @@ export interface GridOptions {
  * Today's irrigation plan as a timeline: one row per cycle, one proportional
  * segment per zone, labelled with the zone's name and planned start–end,
  * coloured by its engine status, with a live fill on the running zone and
- * a now-cursor across the row (Story 4.3).
+ * a now-cursor across the row (Story 4.3); under it, the last seven days'
+ * outcomes per cycle as a strip of glyphs (Story 4.4).
  *
  * The card reads the engine's state view over Story 4.1's `state_subscribe`
  * channel and nothing else, and it renders only when a document arrives
@@ -220,25 +243,30 @@ export class HaIrrigationTimelineCard extends LitElement {
   }
 
   public getCardSize(): number {
-    const rows = this._rows();
-    if (rows === undefined) {
+    const model = this._model();
+    if (model === undefined) {
       return 2;
     }
     // One unit (~50 px) for the header, then per cycle: its header line plus
-    // its lanes.
+    // its lanes; then the history strip on the same pixel budget as
+    // `getGridOptions`: its header plus one line per kind row.
     return (
       1 +
-      rows.reduce(
+      model.rows.reduce(
         (total, row) => total + 1 + Math.ceil((Math.max(1, row.segments.length) * LANE_HEIGHT) / 50),
         0,
-      )
+      ) +
+      Math.ceil((HISTORY_HEADER_PX + model.history.kinds.length * HISTORY_ROW_PX) / 50)
     );
   }
 
   public getGridOptions(): GridOptions {
-    const rows = this._rows() ?? [];
+    const model = this._model();
+    const rows = model?.rows ?? [];
     const px =
-      56 + rows.reduce((total, row) => total + 40 + Math.max(1, row.segments.length) * LANE_HEIGHT, 0);
+      56 +
+      rows.reduce((total, row) => total + 40 + Math.max(1, row.segments.length) * LANE_HEIGHT, 0) +
+      (model === undefined ? 0 : HISTORY_HEADER_PX + model.history.kinds.length * HISTORY_ROW_PX);
     return {
       rows: Math.max(2, Math.ceil(px / GRID_ROW_PX)),
       min_rows: 2,
@@ -285,19 +313,29 @@ export class HaIrrigationTimelineCard extends LitElement {
   }
 
   /**
-   * The rows of the current document, memoised on the document reference
-   * and the time zone: a tick never re-runs the geometry.
+   * The rows and the history model of the current document, memoised on
+   * the document reference and the time zone: a tick never re-runs the
+   * geometry nor the week's lookup.
    */
-  private _rows(): TimelineRow[] | undefined {
+  private _model(): TimelineMemo | undefined {
     const view = this._view;
     if (view === undefined) {
       return undefined;
     }
     const timeZone = this._hass?.config?.time_zone;
     if (this._memo?.view !== view || this._memo.timeZone !== timeZone) {
-      this._memo = { view, timeZone, rows: buildTimeline(view, timeZone).rows };
+      this._memo = {
+        view,
+        timeZone,
+        rows: buildTimeline(view, timeZone).rows,
+        history: buildHistory(view),
+      };
     }
-    return this._memo.rows;
+    return this._memo;
+  }
+
+  private _rows(): TimelineRow[] | undefined {
+    return this._model()?.rows;
   }
 
   /**
@@ -314,14 +352,88 @@ export class HaIrrigationTimelineCard extends LitElement {
     if (this._error !== undefined) {
       return html`<p class="message error" role="alert">${this._error}</p>`;
     }
-    const rows = this._rows();
-    if (rows === undefined) {
+    const model = this._model();
+    if (model === undefined) {
       return html`<p class="message">Connecting to the irrigation controller…</p>`;
     }
-    if (rows.length === 0) {
-      return html`<p class="message">No cycle is planned today.</p>`;
+    // The strip is independent of today's plan: a day without a cycle still
+    // has a week behind it.
+    return html`
+      ${model.rows.length === 0
+        ? html`<p class="message">No cycle is planned today.</p>`
+        : model.rows.map((row) => this._renderRow(row))}
+      ${this._renderHistory(model.history)}
+    `;
+  }
+
+  /**
+   * The 7-day history strip (Story 4.4): a CSS grid of one label column and
+   * seven day columns — the six days before today, then today — with one
+   * row per cycle kind. Every cell carries the engine's `outcome` as a
+   * glyph, a colour, a tooltip and an accessible label; a (day, kind)
+   * without a row is a hollow "no record" cell. The strip is drawn even
+   * when the history is empty, so a fresh install shows the week it has
+   * yet to fill rather than nothing. No columns at all (an unusable
+   * irrigation day) draws nothing.
+   */
+  private _renderHistory(history: HistoryModel): TemplateResult | typeof nothing {
+    const { days, kinds, cells } = history;
+    if (days.length === 0) {
+      return nothing;
     }
-    return html`${rows.map((row) => this._renderRow(row))}`;
+    const language = this._hass?.locale?.language;
+    const last = days.length - 1;
+    return html`
+      <section class="history" aria-labelledby="history-title">
+        <header class="history-header" id="history-title">Last 7 days</header>
+        <div class="history-grid">
+          <span class="history-corner" aria-hidden="true"></span>
+          ${days.map(
+            (day, index) => html`
+              <span class="history-day" data-day=${day} data-today=${index === last ? "true" : nothing}>
+                ${dayLabel(day, language)}
+              </span>
+            `,
+          )}
+          ${kinds.map(
+            (kind) => html`
+              <span class="history-kind" data-kind=${kind}>${KIND_LABELS[kind]}</span>
+              ${days.map((day) => this._renderCell(day, kind, cells.get(cellKey(day, kind)), language))}
+            `,
+          )}
+        </div>
+      </section>
+    `;
+  }
+
+  /**
+   * One cell of the strip. `data-outcome` is the row's `outcome` verbatim
+   * (`none` without a row); the glyph, the label and the anomaly flag come
+   * from `OUTCOME_VISUALS` (an outcome this bundle does not know reads as
+   * `UNKNOWN_OUTCOME`), so colour is never the only signal.
+   */
+  private _renderCell(
+    day: string,
+    kind: CycleKind,
+    row: HistoryRow | undefined,
+    language: string | undefined,
+  ): TemplateResult {
+    const visual = row === undefined ? NO_RECORD : (OUTCOME_VISUALS[row.outcome] ?? UNKNOWN_OUTCOME);
+    const title = cellTitle(day, kind, row, language);
+    return html`
+      <span
+        class="outcome"
+        role="img"
+        data-day=${day}
+        data-kind=${kind}
+        data-outcome=${row?.outcome ?? "none"}
+        data-anomaly=${visual.anomaly ? "true" : "false"}
+        title=${title}
+        aria-label=${title}
+      >
+        <ha-icon icon=${visual.icon}></ha-icon>
+      </span>
+    `;
   }
 
   private _renderRow(row: TimelineRow): TemplateResult {
@@ -755,6 +867,78 @@ export class HaIrrigationTimelineCard extends LitElement {
         font-size: 0.9em;
         color: var(--hic-secondary-text-color, var(--secondary-text-color));
       }
+
+      /* ---------------------------------------------------- history strip */
+      /* Like every --hic-* colour above, the history ones are theme hooks:
+         never defined here, only read with an HA theme-var fallback. */
+      .history {
+        margin-top: 16px;
+        padding-top: 12px;
+        border-top: 1px solid var(--hic-track-color, var(--divider-color, rgba(0, 0, 0, 0.12)));
+      }
+      .history-header {
+        margin-bottom: 6px;
+        font-weight: 500;
+      }
+      .history-grid {
+        display: grid;
+        grid-template-columns: fit-content(30%) repeat(${HISTORY_DAYS}, minmax(0, 1fr));
+        column-gap: 4px;
+        row-gap: 2px;
+        align-items: center;
+      }
+      .history-day,
+      .history-kind {
+        font-size: 0.85em;
+        color: var(--hic-secondary-text-color, var(--secondary-text-color));
+        white-space: nowrap;
+      }
+      .history-day {
+        text-align: center;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .history-day[data-today] {
+        font-weight: 600;
+        color: var(--hic-text-color, var(--primary-text-color));
+      }
+      .history-kind {
+        font-size: 0.9em;
+        padding-right: 8px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .outcome {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: ${HISTORY_ROW_PX}px;
+        border-radius: 6px;
+        color: var(--hic-history-nominal-color, var(--hic-secondary-text-color, var(--secondary-text-color, #727272)));
+        --mdc-icon-size: 20px;
+      }
+      .outcome ha-icon {
+        display: flex;
+        width: 20px;
+        height: 20px;
+        color: inherit;
+      }
+      .outcome[data-outcome="none"] {
+        color: var(--hic-history-empty-color, var(--hic-track-color, var(--divider-color, rgba(0, 0, 0, 0.12))));
+      }
+      .outcome[data-outcome="ran"] {
+        color: var(--hic-history-ran-color, var(--hic-completed-color, var(--success-color, #43a047)));
+      }
+      .outcome[data-outcome="reduced"] {
+        color: var(--hic-history-rain-color, var(--info-color, #039be5));
+      }
+      /* The anomalies are the only filled cells: a badge the eye lands on
+         in either theme, with a shape difference for colour-blind viewers. */
+      .outcome[data-anomaly="true"] {
+        color: var(--hic-history-anomaly-color, var(--hic-error-color, var(--error-color, #db4437)));
+        background: var(--hic-history-anomaly-bg, color-mix(in srgb, var(--hic-history-anomaly-color, var(--hic-error-color, var(--error-color, #db4437))) 15%, transparent));
+        box-shadow: inset 0 0 0 1px var(--hic-history-anomaly-color, var(--hic-error-color, var(--error-color, #db4437)));
+      }
     `;
   }
 }
@@ -794,7 +978,7 @@ if (!window.customCards.some((card) => card["type"] === CARD_TYPE)) {
     type: CARD_TYPE,
     name: "HA Irrigation Timeline Card",
     description:
-      "Today's irrigation plan: each cycle's zones as a proportional timeline with planned times, live progress and outcomes.",
+      "Today's irrigation plan: each cycle's zones as a proportional timeline with planned times, live progress and outcomes, plus the last seven days at a glance.",
   });
 }
 
