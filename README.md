@@ -27,9 +27,73 @@ older versions).
 Only one controller can be configured (`single_config_entry`).
 
 The built card ships inside `custom_components/`, so a HACS install delivers it
-in the same payload — no separate card install or download. Serving it to
-Lovelace (static path + resource registration) arrives with Story 4.2, so the
-card is not yet selectable in the dashboard editor.
+in the same payload — no separate card install or download. The integration
+serves the bundle and registers the dashboard resource itself; see
+[Dashboard card](#dashboard-card).
+
+## Dashboard card
+
+The integration bundles a Lovelace card, `ha-irrigation-timeline-card`, that
+shows **today's watering plan**: one row per cycle — morning and evening when
+the morning cycle is enabled, evening alone otherwise — each row with its own
+time axis running from the cycle's start to its end, and one segment per zone,
+proportional to its duration and labelled in plain text with the zone name and
+its planned start–end in your Home Assistant time format. Before a cycle runs,
+the rows come from the configured plan (base durations); once a cycle is
+running, its quoted windows are drawn instead. Live progress, the 7-day
+history, the health indicator and the visual editor arrive in later stories.
+
+The card reads the [state view](#state-view-and-websocket-api) over the
+`state_subscribe` WebSocket command and nothing else — no entity states, no
+bus events — so it works for non-admin household members too, and it
+re-renders only when a new document is pushed, not on every state change in
+the house.
+
+### Adding the card
+
+Pick **HA Irrigation Timeline Card** in the dashboard card picker, or add it in
+YAML:
+
+```yaml
+type: custom:ha-irrigation-timeline-card
+title: Garden # optional; defaults to "Irrigation"
+entry_id: 01J... # optional; only needed with several controllers
+```
+
+With no options the card finds the single controller by itself. If no
+controller is set up, or it is reloading, the card says so in its body and
+retries on its own.
+
+### The card resource
+
+The bundle is served by the integration at
+`/ha_irrigation_controller/ha-irrigation-timeline-card.js`. When your dashboard
+resources are managed in **storage mode** (the default — the list under
+**Settings → Dashboards → ⋮ → Resources**, shown only with **Advanced mode**
+enabled in your user profile), the integration registers the resource itself
+at startup: one `module` resource with that URL plus
+`?v=<integration version>`, so an upgrade invalidates the browser's cached
+copy. On upgrade the existing entry is updated in place — nothing is duplicated
+and there is nothing to do.
+
+**YAML mode fallback.** When resources are managed in YAML (`lovelace:` with
+`mode: yaml` or `resource_mode: yaml`), Home Assistant does not let an
+integration add resources. The integration logs one line pointing here; add the
+resource yourself:
+
+```yaml
+lovelace:
+  mode: yaml
+  resources:
+    - url: /ha_irrigation_controller/ha-irrigation-timeline-card.js?v=0.1.0
+      type: module
+```
+
+Bump `v=` to the new version after each upgrade (the version is in
+`custom_components/ha_irrigation_controller/manifest.json`); browsers may keep
+the old bundle otherwise. Neither case stops the integration from starting —
+the bundle is served regardless, and a Home Assistant without Lovelace at all
+simply gets no resource (one debug-level line).
 
 ## Services
 
@@ -684,7 +748,9 @@ the health state — is composed into **one versioned document**, the *state
 view*, built by the engine from the objects it already holds. The four
 entities project a few coarse scalars from it; dashboards read the whole
 thing over two custom WebSocket commands. There is no second source: what the
-card shows and what the entities show come from the same build.
+card shows and what the entities show come from the same build. The bundled
+[dashboard card](#dashboard-card) is this channel's first consumer: it
+subscribes once and draws each pushed document.
 
 ### Commands
 

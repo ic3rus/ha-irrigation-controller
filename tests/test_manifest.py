@@ -56,9 +56,14 @@ def test_manifest_declares_the_keys_ac2_requires() -> None:
     # One controller entry only — enforced by HA core, not by the flow.
     assert manifest["single_config_entry"] is True
     # The WebSocket read channel (Story 4.1) registers its commands in
-    # `async_setup`, so `websocket_api` (which pulls `http`) must be up first.
-    # Nothing else: no `frontend`, no static paths — those are Story 4.2's.
-    assert manifest["dependencies"] == ["websocket_api"]
+    # `async_setup`, so `websocket_api` must be up first; the card's static
+    # path (Story 4.2) calls `hass.http` directly, so `http` is declared in
+    # its own right rather than ridden in on `websocket_api`. Lovelace is an
+    # AFTER dependency: hassfest wants every imported `homeassistant.components`
+    # package declared, and the resource registration waits for lovelace
+    # without requiring it (YAML-mode and lovelace-less installs still work).
+    assert manifest["dependencies"] == ["http", "websocket_api"]
+    assert manifest["after_dependencies"] == ["lovelace"]
 
 
 def test_min_ha_version_is_consistent_across_the_repo() -> None:

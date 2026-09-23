@@ -1,11 +1,15 @@
 {
   "domain": "ha_irrigation_controller",
   "name": "HA Irrigation Controller",
+  "after_dependencies": [
+    "lovelace"
+  ],
   "codeowners": [
     "@ic3rus"
   ],
   "config_flow": true,
   "dependencies": [
+    "http",
     "websocket_api"
   ],
   "documentation": "https://github.com/ic3rus/ha-irrigation-controller",
