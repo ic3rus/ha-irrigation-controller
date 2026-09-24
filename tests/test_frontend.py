@@ -36,7 +36,10 @@ from custom_components.ha_irrigation_controller.frontend import (
 if TYPE_CHECKING:
     import pytest
     from homeassistant.core import HomeAssistant
-    from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
+    from pytest_homeassistant_custom_component.typing import (
+        ClientSessionGenerator,
+        WebSocketGenerator,
+    )
 
 MANIFEST_VERSION = json.loads(
     (
@@ -103,6 +106,28 @@ async def test_the_bundle_is_served_from_the_static_path(
     assert "Cache-Control" in response.headers
 
 
+async def test_the_bundle_is_served_without_authentication(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """Matrix "Bundle fetch, no auth" (Story 4.6): no token, still the bytes.
+
+    The static path is the first of the three layers a non-admin dashboard
+    goes through (bundle, resource list, `state_subscribe`); the browser
+    fetches a module resource with no bearer token at all, so anything less
+    than an open path would break every user's card, admin or not.
+    """
+    assert await async_setup_component(hass, DOMAIN, {})
+    await hass.async_block_till_done()
+
+    client = await hass_client_no_auth()
+    response = await client.get(FRONTEND_URL)
+
+    assert response.status == 200
+    assert response.content_type in {"application/javascript", "text/javascript"}
+    assert await response.read() == BUNDLE_PATH.read_bytes()
+
+
 async def test_the_static_path_does_not_need_lovelace(
     hass: HomeAssistant,
     hass_client: ClientSessionGenerator,
@@ -140,6 +165,35 @@ async def test_storage_mode_first_setup_creates_one_module_resource(
     assert items[0]["url"] == f"{FRONTEND_URL}?v={MANIFEST_VERSION}"
     assert fallback_lines(caplog, logging.WARNING) == []
     assert fallback_lines(caplog, logging.INFO) == []
+
+
+async def test_a_read_only_user_can_list_the_card_resource(
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    hass_read_only_access_token: str,
+) -> None:
+    """Matrix "Resource list, read-only user" (Story 4.6): `lovelace/resources`.
+
+    The second of the three layers a non-admin dashboard goes through: the
+    frontend asks for the resource list before it can load any custom card,
+    and Home Assistant does not admin-gate the command. Proven here as a
+    read-only WebSocket client rather than read from `hass.data`, so an
+    admin-gating of the command in a later HA release breaks a test before
+    it breaks every non-admin dashboard.
+    """
+    assert await async_setup_component(hass, "lovelace", {})
+    assert await async_setup_component(hass, DOMAIN, {})
+    await hass.async_block_till_done()
+
+    client = await hass_ws_client(hass, access_token=hass_read_only_access_token)
+    await client.send_json_auto_id({"type": "lovelace/resources"})
+    reply = await client.receive_json()
+
+    assert reply["success"], reply
+    ours = [item for item in reply["result"] if item["url"].startswith(FRONTEND_URL)]
+    assert len(ours) == 1
+    assert ours[0]["type"] == "module"
+    assert ours[0]["url"] == resource_url(MANIFEST_VERSION)
 
 
 async def test_storage_mode_restart_keeps_the_existing_resource(

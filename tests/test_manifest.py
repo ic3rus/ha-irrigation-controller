@@ -30,7 +30,8 @@ from custom_components.ha_irrigation_controller.engine.plan import CycleKind
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INTEGRATION_DIR = REPO_ROOT / "custom_components" / "ha_irrigation_controller"
-CARD_SRC = REPO_ROOT / "card" / "src" / "ha-irrigation-timeline-card.ts"
+# The card's contract module (`editor.ts`) owns CARD_VERSION (Story 4.6).
+CARD_CONTRACT_SRC = REPO_ROOT / "card" / "src" / "editor.ts"
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -88,9 +89,11 @@ def test_version_is_consistent_across_the_repo() -> None:
     assert package_json["version"] == manifest_version
 
     # CARD_VERSION is what users read in the console banner and on the card.
-    card_source = CARD_SRC.read_text(encoding="utf-8")
+    card_source = CARD_CONTRACT_SRC.read_text(encoding="utf-8")
     card_version = re.search(r'CARD_VERSION\s*=\s*"([^"]+)"', card_source)
-    assert card_version is not None, "CARD_VERSION not found in the card source"
+    assert card_version is not None, (
+        "CARD_VERSION not found in the card contract source"
+    )
     assert card_version.group(1) == manifest_version
 
 

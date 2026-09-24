@@ -1,4 +1,4 @@
-import type { HomeAssistant, LovelaceCardConfig } from "custom-card-helpers";
+import type { HomeAssistant } from "custom-card-helpers";
 import { formatTime } from "custom-card-helpers";
 import type { Connection } from "home-assistant-js-websocket";
 import { css, html, LitElement, nothing, svg } from "lit";
@@ -6,6 +6,19 @@ import type { CSSResultGroup, PropertyValues, TemplateResult } from "lit";
 import { state } from "lit/decorators.js";
 
 import { estimateOffset, serverNow, tickPeriodFor, TRANSITION_MS } from "./clock";
+import type { IrrigationTimelineCardConfig, LovelaceConfigForm } from "./editor";
+import {
+  assertCardConfig,
+  CARD_TYPE,
+  CARD_VERSION,
+  configForm,
+  entryIdOf,
+  headingOf,
+  showHealth,
+  showHistory,
+  showTitle,
+  stubConfig,
+} from "./editor";
 import type { HealthModel } from "./health";
 import { ALERT_ICON, buildHealth, chipLabel, healthSummary, itemLabel, NOMINAL } from "./health";
 import type { HistoryModel } from "./history";
@@ -26,8 +39,13 @@ import type { CycleKind, Handshake, HistoryRow, StateView } from "./types";
 import type { UnsubscribeState } from "./ws";
 import { asWsError, ERR_NOT_FOUND, ERR_NOT_LOADED, fetchState, subscribeState } from "./ws";
 
-const CARD_VERSION = "0.1.0";
-const CARD_TYPE = "ha-irrigation-timeline-card";
+export type { IrrigationTimelineCardConfig } from "./editor";
+
+/**
+ * Where the picker's "documentation" link points. This is the picker's link
+ * only: the Python resource fallback log has its own `README_CARD_ANCHOR`.
+ */
+const DOCUMENTATION_URL = "https://github.com/ic3rus/ha-irrigation-controller#dashboard-card";
 
 /** How long after a refused subscribe the card tries again. */
 export const RETRY_DELAY_MS = 5000;
@@ -115,13 +133,6 @@ interface TimelineMemo {
   rows: TimelineRow[];
   history: HistoryModel;
   health: HealthModel;
-}
-
-export interface IrrigationTimelineCardConfig extends LovelaceCardConfig {
-  type: string;
-  title?: string;
-  /** Optional: the controller entry to read. Omitted, the single controller answers. */
-  entry_id?: string;
 }
 
 /** Sections-view sizing hints (`getGridOptions`), in Lovelace grid units. */
@@ -231,22 +242,33 @@ export class HaIrrigationTimelineCard extends LitElement {
     return this._offsetMs ?? 0;
   }
 
+  /**
+   * The visual editor (FR29): a schema-only form HA's `hui-form-editor`
+   * renders with `ha-form` — the card ships no editor element. Called on
+   * the class by `hui-card-element-editor`.
+   */
+  public static getConfigForm(): LovelaceConfigForm {
+    return configForm();
+  }
+
+  /** The picker's default: `{}`, spread over `{type}` — the zero-config card. */
+  public static getStubConfig(): Record<string, never> {
+    return stubConfig();
+  }
+
   public setConfig(config: IrrigationTimelineCardConfig): void {
     // Lovelace hands over raw YAML, so the declared type is a promise rather
     // than a guarantee. Throwing is the contract that makes the card editor
-    // show an error instead of rendering a blank hole in the dashboard.
-    const candidate: unknown = config;
-    if (candidate === null || typeof candidate !== "object") {
-      throw new Error(`${CARD_TYPE}: invalid configuration`);
-    }
-    const next = candidate as IrrigationTimelineCardConfig;
-    if (next.entry_id !== undefined && typeof next.entry_id !== "string") {
-      throw new Error(`${CARD_TYPE}: invalid configuration (entry_id must be a string)`);
-    }
+    // show an error instead of rendering a blank hole in the dashboard; the
+    // editor's own `assertConfig` is the same validator, so it says the same.
+    assertCardConfig(config);
     const previous = this._config;
-    this._config = next;
-    if (previous !== undefined && previous.entry_id !== next.entry_id) {
+    this._config = config;
+    if (previous !== undefined && entryIdOf(previous) !== entryIdOf(config)) {
       // Another controller: the open subscription answers for the old one.
+      // Compared through `entryIdOf`, so a Controller picker cleared to `""`
+      // is the same "auto-detect" as an absent key. A display option flipped
+      // alone re-renders and touches nothing else.
       this._closeSubscription();
       this._view = undefined;
       this._error = undefined;
@@ -280,30 +302,34 @@ export class HaIrrigationTimelineCard extends LitElement {
     if (model === undefined) {
       return 2;
     }
-    // One unit (~50 px) for the header, then the anomaly banner when there
-    // is one, then per cycle: its header line plus its lanes; then the
-    // history strip on the same pixel budget as `getGridOptions`: its
-    // header plus one line per kind row.
+    // One unit (~50 px) for the header when it renders, then the anomaly
+    // banner when there is one (and health is shown), then per cycle: its
+    // header line plus its lanes; then the history strip when it is shown,
+    // on the same pixel budget as `getGridOptions`: its header plus one
+    // line per kind row. A hidden section contributes nothing.
+    const config = this._config;
     return (
-      1 +
-      Math.ceil(anomalyPx(model.health) / 50) +
+      (headerShown(config, model) ? 1 : 0) +
+      (showHealth(config) ? Math.ceil(anomalyPx(model.health) / 50) : 0) +
       model.rows.reduce(
         (total, row) => total + 1 + Math.ceil((Math.max(1, row.segments.length) * LANE_HEIGHT) / 50),
         0,
       ) +
-      Math.ceil((HISTORY_HEADER_PX + model.history.kinds.length * HISTORY_ROW_PX) / 50)
+      (showHistory(config) ? Math.ceil(historyPx(model.history) / 50) : 0)
     );
   }
 
   public getGridOptions(): GridOptions {
+    const config = this._config;
     const model = this._model();
     const rows = model?.rows ?? [];
     const px =
-      56 +
+      (headerShown(config, model) ? 56 : 0) +
       rows.reduce((total, row) => total + 40 + Math.max(1, row.segments.length) * LANE_HEIGHT, 0) +
       (model === undefined
         ? 0
-        : anomalyPx(model.health) + HISTORY_HEADER_PX + model.history.kinds.length * HISTORY_ROW_PX);
+        : (showHealth(config) ? anomalyPx(model.health) : 0) +
+          (showHistory(config) ? historyPx(model.history) : 0));
     return {
       rows: Math.max(2, Math.ceil(px / GRID_ROW_PX)),
       min_rows: 2,
@@ -345,25 +371,40 @@ export class HaIrrigationTimelineCard extends LitElement {
    * and it can hold the health chip beside the title. The chip is omitted
    * while there is no document to read health from, and while a connection
    * error is on screen — the body says what is wrong then.
+   *
+   * The options (Story 4.6): `show_title: false` drops the heading and
+   * keeps the chip; `show_health: false` drops the chip and the announcer
+   * (and the banner, in the body); the header renders only when it has
+   * something to hold — `headerShown` — so with the title off there is no
+   * empty band while connecting or on an error either, and no reserved
+   * height. A blank title is not a hidden heading: it reads "Irrigation".
    */
   protected override render(): TemplateResult | typeof nothing {
     if (!this._config) {
       return nothing;
     }
     const model = this._error === undefined ? this._model() : undefined;
-    // The announcer is always in the tree: a live region only announces
-    // changes inside a region that was already mounted, so a banner that
-    // appears with its content would be read neither on onset nor on
-    // clearance. Its text is the health summary, empty without a document.
+    const health = showHealth(this._config);
+    // The announcer mounts with the header and stays in the tree while
+    // health is shown: a live region only announces changes inside a region
+    // that was already mounted, so a banner that appears with its content
+    // would be read neither on onset nor on clearance. Its text is the
+    // health summary, empty without a document.
     return html`
       <ha-card>
-        <div class="card-header">
-          <h1 class="title">${this._config.title ?? "Irrigation"}</h1>
-          ${model === undefined ? nothing : this._renderChip(model.health)}
-          <span class="sr-only health-announcer" role="status" aria-live="polite"
-            >${model === undefined ? "" : healthSummary(model.health.items.length)}</span
-          >
-        </div>
+        ${headerShown(this._config, model)
+          ? html`
+              <div class="card-header">
+                ${showTitle(this._config) ? html`<h1 class="title">${headingOf(this._config)}</h1>` : nothing}
+                ${health && model !== undefined ? this._renderChip(model.health) : nothing}
+                ${health
+                  ? html`<span class="sr-only health-announcer" role="status" aria-live="polite"
+                      >${model === undefined ? "" : healthSummary(model.health.items.length)}</span
+                    >`
+                  : nothing}
+              </div>
+            `
+          : nothing}
         <div class="content">${this._renderBody()}</div>
       </ha-card>
     `;
@@ -416,13 +457,14 @@ export class HaIrrigationTimelineCard extends LitElement {
     }
     // The banner first — it is what the card exists to make unmissable —
     // then today's rows, then the strip, which is independent of today's
-    // plan: a day without a cycle still has a week behind it.
+    // plan: a day without a cycle still has a week behind it. A section
+    // switched off in the config is not rendered at all.
     return html`
-      ${this._renderAnomalies(model.health)}
+      ${showHealth(this._config) ? this._renderAnomalies(model.health) : nothing}
       ${model.rows.length === 0
         ? html`<p class="message">No cycle is planned today.</p>`
         : model.rows.map((row) => this._renderRow(row))}
-      ${this._renderHistory(model.history)}
+      ${showHistory(this._config) ? this._renderHistory(model.history) : nothing}
     `;
   }
 
@@ -684,7 +726,8 @@ export class HaIrrigationTimelineCard extends LitElement {
     ) {
       return;
     }
-    void this._subscribe(this._hass, this._config.entry_id);
+    // `entryIdOf`: a blank `entry_id` never reaches the wire.
+    void this._subscribe(this._hass, entryIdOf(this._config));
   }
 
   private async _subscribe(hass: HomeAssistant, entryId: string | undefined): Promise<void> {
@@ -842,7 +885,7 @@ export class HaIrrigationTimelineCard extends LitElement {
       return;
     }
     const generation = this._generation;
-    fetchState(hass, this._config?.entry_id)
+    fetchState(hass, entryIdOf(this._config))
       .then((view) => {
         if (generation === this._generation && this._unsubscribe !== undefined) {
           this._onView(view);
@@ -888,12 +931,15 @@ export class HaIrrigationTimelineCard extends LitElement {
         margin: 0;
         min-width: 0;
       }
-      /* The health chip: rem-sized so the 24 px header font does not scale it. */
+      /* The health chip: rem-sized so the 24 px header font does not scale it.
+         Pushed to the right edge on its own, so it stays put when the
+         title is switched off and leaves it alone in the header. */
       .health {
         display: inline-flex;
         align-items: center;
         gap: 4px;
         flex: none;
+        margin-left: auto;
         font-size: 0.875rem;
         font-weight: 400;
         line-height: normal;
@@ -1212,6 +1258,21 @@ function anomalyPx(health: HealthModel): number {
   return health.state === "nominal" ? 0 : ANOMALY_HEADER_PX + health.items.length * ANOMALY_ROW_PX;
 }
 
+/** The history strip's pixel height for the sizing hints: its header plus one line per kind row. */
+function historyPx(history: HistoryModel): number {
+  return HISTORY_HEADER_PX + history.kinds.length * HISTORY_ROW_PX;
+}
+
+/**
+ * Whether `.card-header` renders at all — the one predicate `render`,
+ * `getCardSize` and `getGridOptions` share: a heading is shown, or health
+ * is on AND a document is held to draw the chip from. Neither: no header,
+ * no empty band while connecting or on an error, no reserved height.
+ */
+function headerShown(config: IrrigationTimelineCardConfig | undefined, model: TimelineMemo | undefined): boolean {
+  return showTitle(config) || (showHealth(config) && model !== undefined);
+}
+
 /** The card body's wording for a refused subscribe, by backend error code. */
 function describeError(error: { code: string; message: string }): string {
   switch (error.code) {
@@ -1248,6 +1309,10 @@ if (!window.customCards.some((card) => card["type"] === CARD_TYPE)) {
     name: "HA Irrigation Timeline Card",
     description:
       "Today's irrigation plan: each cycle's zones as a proportional timeline with planned times, live progress and outcomes, the last seven days at a glance, and the controller's health.",
+    // The picker renders the stub as a live card: a real one with a single
+    // controller, or its own "no controller" sentence without.
+    preview: true,
+    documentationURL: DOCUMENTATION_URL,
   });
 }
 
