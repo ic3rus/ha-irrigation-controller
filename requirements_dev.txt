@@ -2,4 +2,4 @@
 -r requirements_test.txt
 # homeassistant is pinned in requirements_test.txt — the single place it belongs,
 # so the dev venv and the CI stable leg can never drift apart again.
-colorlog==6.10.1
+colorlog==6.12.0
