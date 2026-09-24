@@ -15,7 +15,7 @@
 
 import type { LovelaceCardConfig } from "custom-card-helpers";
 
-export const CARD_VERSION = "0.1.1";
+export const CARD_VERSION = "0.1.2";
 export const CARD_TYPE = "ha-irrigation-timeline-card";
 
 /** The integration's domain: the `config_entry` selector lists its entries. */

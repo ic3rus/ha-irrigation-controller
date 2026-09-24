@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import struct
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -69,8 +70,8 @@ SILVER_RULES: tuple[str, ...] = (
     "reauthentication-flow",
     "test-coverage",
 )
-# The one Bronze rule still open: an external home-assistant/brands submission.
-BRONZE_TODO_ALLOWED = frozenset({"brands"})
+# Every Bronze rule is done or exempt.
+BRONZE_TODO_ALLOWED: frozenset[str] = frozenset()
 RULE_STATUSES = frozenset({"done", "exempt", "todo"})
 
 
@@ -105,6 +106,20 @@ def test_manifest_declares_the_keys_ac2_requires() -> None:
     # without requiring it (YAML-mode and lovelace-less installs still work).
     assert manifest["dependencies"] == ["http", "websocket_api"]
     assert manifest["after_dependencies"] == ["lovelace"]
+
+
+def test_brand_icons_ship_with_the_integration() -> None:
+    """`brands`: HA 2026.3+ serves `brand/` images ahead of the brands CDN.
+
+    Square PNGs at 256 and 512 px, with an alpha channel so the corners
+    outside the round badge stay transparent on light and dark themes.
+    """
+    for name, side in (("icon.png", 256), ("icon@2x.png", 512)):
+        data = (INTEGRATION_DIR / "brand" / name).read_bytes()
+        assert data[:8] == b"\x89PNG\r\n\x1a\n", name
+        width, height, _depth, color_type = struct.unpack(">IIBB", data[16:26])
+        assert (width, height) == (side, side), name
+        assert color_type == 6, f"{name} has no alpha channel (RGBA)"
 
 
 def test_min_ha_version_is_consistent_across_the_repo() -> None:
@@ -185,7 +200,7 @@ def _rule_status(entry: Any) -> tuple[Any, Any]:
 
 
 def test_quality_scale_tracks_every_bronze_and_silver_rule() -> None:
-    """Bronze is met but for `brands`; every Silver rule is stated with a status.
+    """Bronze is met; every Silver rule is stated with a status.
 
     Each `exempt` or `todo` must say why or what remains, so a later reader
     can tell a decision from an oversight.
