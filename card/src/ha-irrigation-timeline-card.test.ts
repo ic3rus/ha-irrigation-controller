@@ -339,7 +339,115 @@ describe("ha-irrigation-timeline-card", () => {
     }
     expect(() =>
       card.setConfig({ type: CARD_TYPE, entry_id: 7 } as unknown as IrrigationTimelineCardConfig),
-    ).toThrow(/entry_id/);
+    ).toThrow(/invalid configuration \(entry_id must be a string\)/);
+    expect(() =>
+      card.setConfig({ type: CARD_TYPE, show_title: 1 } as unknown as IrrigationTimelineCardConfig),
+    ).toThrow(/invalid configuration \(show_title must be a boolean\)/);
+    expect(() =>
+      card.setConfig({ type: CARD_TYPE, show_history: "yes" } as unknown as IrrigationTimelineCardConfig),
+    ).toThrow(/invalid configuration \(show_history must be a boolean\)/);
+    expect(() =>
+      card.setConfig({ type: CARD_TYPE, show_health: "no" } as unknown as IrrigationTimelineCardConfig),
+    ).toThrow(/invalid configuration \(show_health must be a boolean\)/);
+    // A refused config leaves the card unconfigured: nothing rendered.
+    expect(card.shadowRoot?.querySelector("ha-card")).toBeNull();
+  });
+
+  // ------------------------------------------------------- editor and picker
+
+  it("exposes a schema-only visual editor: getConfigForm lists every option with a label and a helper", () => {
+    const form = HaIrrigationTimelineCard.getConfigForm();
+    expect(form.schema.map((item) => item.name)).toEqual([
+      "title",
+      "entry_id",
+      "show_title",
+      "show_history",
+      "show_health",
+    ]);
+    expect(form.schema.map((item) => Object.keys(item.selector))).toEqual([
+      ["text"],
+      ["config_entry"],
+      ["boolean"],
+      ["boolean"],
+      ["boolean"],
+    ]);
+    expect(form.schema[1]?.selector).toEqual({ config_entry: { integration: "ha_irrigation_controller" } });
+    expect(form.schema.slice(2).map((item) => item.default)).toEqual([true, true, true]);
+    expect(form.schema.every((item) => item.required === undefined)).toBe(true);
+    for (const item of form.schema) {
+      expect(form.computeLabel?.(item)).toBeTruthy();
+      expect(form.computeHelper?.(item)).toBeTruthy();
+    }
+    expect(form.computeLabel?.({ name: "unknown", selector: {} })).toBeUndefined();
+    // No editor element of its own: HA's hui-form-editor owns ha-form.
+    expect("getConfigElement" in HaIrrigationTimelineCard).toBe(false);
+  });
+
+  it("validates in the editor with the very messages setConfig throws", () => {
+    const card = createCard();
+    const form = HaIrrigationTimelineCard.getConfigForm();
+    const bad = [
+      { type: CARD_TYPE, entry_id: 7 },
+      { type: CARD_TYPE, show_title: 1 },
+      { type: CARD_TYPE, show_history: 1 },
+      { type: CARD_TYPE, show_health: "no" },
+    ];
+    for (const config of bad) {
+      const messageOf = (run: () => void): string => {
+        try {
+          run();
+        } catch (err) {
+          return (err as Error).message;
+        }
+        throw new Error("did not throw");
+      };
+      const fromEditor = messageOf(() => form.assertConfig?.(config as unknown as IrrigationTimelineCardConfig));
+      const fromCard = messageOf(() => card.setConfig(config as unknown as IrrigationTimelineCardConfig));
+      expect(fromEditor).toMatch(/invalid configuration \(\w+ must be a (string|boolean)\)/);
+      expect(fromCard).toBe(fromEditor);
+    }
+    expect(() => form.assertConfig?.({ type: CARD_TYPE })).not.toThrow();
+  });
+
+  it("getStubConfig is {}: spread over {type}, the card renders the default header, chip, rows and strip and subscribes without entry_id", async () => {
+    expect(HaIrrigationTimelineCard.getStubConfig()).toEqual({});
+    const fake = createHass();
+    const card = createCard();
+    card.setConfig({ type: `custom:${CARD_TYPE}`, ...HaIrrigationTimelineCard.getStubConfig() });
+    card.hass = fake.hass;
+    await settle(card);
+    expect(fake.subscribeMessage).toHaveBeenCalledTimes(1);
+    expect(fake.subscribeMessage.mock.calls[0]?.[1]).toEqual({ type: WS_TYPE_STATE_SUBSCRIBE });
+
+    fake.push(stateView());
+    await card.updateComplete;
+    expect(title(card)).toBe("Irrigation");
+    expect(chip(card)?.getAttribute("data-state")).toBe("nominal");
+    expect(card.shadowRoot?.querySelectorAll("section.cycle")).toHaveLength(2);
+    expect(strip(card).querySelectorAll(".outcome")).toHaveLength(14);
+  });
+
+  it("previews the stub without a controller as the existing no-controller sentence", async () => {
+    vi.useFakeTimers();
+    const fake = createHass({ reject: { code: "not_found", message: "" } });
+    const card = createCard();
+    card.setConfig({ type: `custom:${CARD_TYPE}`, ...HaIrrigationTimelineCard.getStubConfig() });
+    card.hass = fake.hass;
+    await settle(card);
+
+    expect(card.shadowRoot?.querySelector(".message.error")?.textContent).toContain(
+      "No irrigation controller was found",
+    );
+    expect(title(card)).toBe("Irrigation");
+    await vi.advanceTimersByTimeAsync(RETRY_DELAY_MS);
+    expect(fake.subscribeMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("advertises a live preview and its documentation in window.customCards", () => {
+    const entry = (window.customCards ?? []).find((card) => card["type"] === CARD_TYPE);
+    expect(entry?.["preview"]).toBe(true);
+    expect(entry?.["documentationURL"]).toBe("https://github.com/ic3rus/ha-irrigation-controller#dashboard-card");
+    expect(entry?.["name"]).toBe("HA Irrigation Timeline Card");
   });
 
   it("reports a card size and grid options before any document", () => {
@@ -416,6 +524,53 @@ describe("ha-irrigation-timeline-card", () => {
       entry_id: "b",
     });
     expect(card.shadowRoot?.textContent).toContain("Connecting");
+  });
+
+  it("treats a cleared Controller (entry_id: \"\") as no controller: nothing on the wire, and the same as an absent key", async () => {
+    // The Controller picker writes "" when cleared. Sent as is, the backend
+    // would read it as an explicit id and answer not_found forever.
+    const fake = createHass();
+    const card = await connectedCard(fake, { entry_id: "" });
+    expect(fake.subscribeMessage).toHaveBeenCalledTimes(1);
+    expect(fake.subscribeMessage.mock.calls[0]?.[1]).toEqual({ type: WS_TYPE_STATE_SUBSCRIBE });
+    expect(fake.subscribeMessage.mock.calls[0]?.[1]).not.toHaveProperty("entry_id");
+    fake.push(stateView());
+    await card.updateComplete;
+    expect(title(card)).toBe("Irrigation");
+
+    // undefined → "" and back: the effective controller is unchanged, so nothing moves.
+    card.setConfig({ type: CARD_TYPE });
+    await settle(card);
+    card.setConfig({ type: CARD_TYPE, entry_id: "" });
+    await settle(card);
+    expect(fake.subscribeMessage).toHaveBeenCalledTimes(1);
+    expect(fake.unsubscribe).not.toHaveBeenCalled();
+    expect(card.shadowRoot?.querySelectorAll("section.cycle")).toHaveLength(2);
+
+    // "" → "a": another controller, asked for by id.
+    card.setConfig({ type: CARD_TYPE, entry_id: "a" });
+    await settle(card);
+    expect(fake.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(fake.subscribeMessage).toHaveBeenCalledTimes(2);
+    expect(fake.subscribeMessage.mock.calls[1]?.[1]).toEqual({ type: WS_TYPE_STATE_SUBSCRIBE, entry_id: "a" });
+
+    // "a" → "": back to auto-detection, without an entry_id on the wire.
+    card.setConfig({ type: CARD_TYPE, entry_id: "" });
+    await settle(card);
+    expect(fake.unsubscribe).toHaveBeenCalledTimes(2);
+    expect(fake.subscribeMessage).toHaveBeenCalledTimes(3);
+    expect(fake.subscribeMessage.mock.calls[2]?.[1]).toEqual({ type: WS_TYPE_STATE_SUBSCRIBE });
+    expect(fake.subscribeMessage.mock.calls[2]?.[1]).not.toHaveProperty("entry_id");
+
+    // The one-shot refetch on a visible tab goes the same way.
+    fake.push(stateView());
+    await card.updateComplete;
+    fake.callWS.mockResolvedValueOnce(stateView());
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    document.dispatchEvent(new Event("visibilitychange"));
+    await settle(card);
+    expect(fake.callWS).toHaveBeenCalledTimes(1);
+    expect(fake.callWS.mock.calls[0]?.[0]).toEqual({ type: WS_TYPE_STATE_GET });
   });
 
   // -------------------------------------------------------- in-flight races
@@ -1149,6 +1304,227 @@ describe("ha-irrigation-timeline-card", () => {
     await card.updateComplete;
     expect(card.getCardSize()).toBe(nominal.size);
     expect(card.getGridOptions().rows).toBe(nominal.rows);
+  });
+
+  // ---------------------------------------------------------------- options
+
+  it("reads Irrigation for a blank title — empty, whitespace or absent — with the header unchanged", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake, { title: "" });
+    fake.push(stateView());
+    await card.updateComplete;
+
+    expect(title(card)).toBe("Irrigation");
+    expect(chip(card)?.getAttribute("data-state")).toBe("nominal");
+    const nominal = { size: card.getCardSize(), rows: card.getGridOptions().rows };
+
+    card.setConfig({ type: CARD_TYPE, title: "   " });
+    await card.updateComplete;
+    expect(title(card)).toBe("Irrigation");
+
+    card.setConfig({ type: CARD_TYPE });
+    await card.updateComplete;
+    expect(title(card)).toBe("Irrigation");
+
+    card.setConfig({ type: CARD_TYPE, title: "Garden" });
+    await card.updateComplete;
+    expect(title(card)).toBe("Garden");
+    expect(card.getCardSize()).toBe(nominal.size);
+    expect(card.getGridOptions().rows).toBe(nominal.rows);
+  });
+
+  it("show_title: false drops the heading and keeps the chip and the announcer in the header, same size", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake, { show_title: false, title: "Garden" });
+    fake.push(stateView());
+    await card.updateComplete;
+
+    const header = card.shadowRoot?.querySelector("ha-card > .card-header");
+    expect(header).not.toBeNull();
+    expect(header?.querySelector("h1, .title")).toBeNull();
+    expect(header?.textContent).not.toContain("Garden");
+    expect(header?.textContent).not.toContain("Irrigation");
+    expect(chip(card)?.getAttribute("data-state")).toBe("nominal");
+    expect(header?.querySelector(".health-announcer")?.textContent).toBe("All is well");
+    expect(card.shadowRoot?.querySelector("[hidden]")).toBeNull();
+
+    // The header is still there, so the sizing hints do not move.
+    const titledFake = createHass();
+    const titledCard = await connectedCard(titledFake, { title: "Garden" });
+    titledFake.push(stateView());
+    await titledCard.updateComplete;
+    expect(titledCard.shadowRoot?.querySelector(".card-header h1")).not.toBeNull();
+    expect(card.getCardSize()).toBe(titledCard.getCardSize());
+    expect(card.getGridOptions()).toEqual(titledCard.getGridOptions());
+
+    // Switched back on: the heading returns with its title.
+    card.setConfig({ type: CARD_TYPE, show_title: true, title: "Garden" });
+    await card.updateComplete;
+    expect(title(card)).toBe("Garden");
+  });
+
+  it("show_health: false hides the chip, the banner and the announcer, with two anomalies open, and sizes as the nominal card", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(stateView());
+    await card.updateComplete;
+    const nominal = { size: card.getCardSize(), rows: card.getGridOptions().rows };
+
+    card.setConfig({ type: CARD_TYPE, show_health: false });
+    fake.push(
+      stateView({
+        health: open(anomaly("missed_cycle"), anomaly("pump_on_unconfirmed", { entity_id: "switch.pump" })),
+      }),
+    );
+    await card.updateComplete;
+
+    expect(title(card)).toBe("Irrigation");
+    expect(chip(card)).toBeNull();
+    expect(banner(card)).toBeNull();
+    expect(card.shadowRoot?.querySelector(".health-announcer")).toBeNull();
+    expect(card.shadowRoot?.querySelector("[hidden], [role=status]")).toBeNull();
+    expect(card.shadowRoot?.textContent).not.toContain("did not run");
+    expect(card.shadowRoot?.textContent).not.toContain("issue");
+    // Rows and strip are untouched.
+    expect(card.shadowRoot?.querySelectorAll("section.cycle")).toHaveLength(2);
+    expect(strip(card).querySelectorAll(".outcome")).toHaveLength(14);
+    expect(card.getCardSize()).toBe(nominal.size);
+    expect(card.getGridOptions().rows).toBe(nominal.rows);
+
+    // Switched back on against the same document: chip and banner return.
+    card.setConfig({ type: CARD_TYPE, show_health: true });
+    await card.updateComplete;
+    expect(chip(card)?.getAttribute("data-state")).toBe("anomaly");
+    expect(text(chip(card))).toBe("2 issues");
+    expect(banner(card)?.querySelectorAll("li[data-anomaly]")).toHaveLength(2);
+    expect(card.getCardSize()).toBe(nominal.size + Math.ceil((ANOMALY_HEADER_PX + 2 * ANOMALY_ROW_PX) / 50));
+  });
+
+  it("show_history: false drops the strip, and its pixel budget from both sizing hints", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(stateView({ history: fullWeek() }));
+    await card.updateComplete;
+    const both = { size: card.getCardSize(), rows: card.getGridOptions().rows };
+
+    card.setConfig({ type: CARD_TYPE, show_history: false });
+    await card.updateComplete;
+
+    expect(card.shadowRoot?.querySelector("section.history")).toBeNull();
+    expect(card.shadowRoot?.textContent).not.toContain("Last 7 days");
+    expect(card.shadowRoot?.querySelectorAll("section.cycle")).toHaveLength(2);
+    expect(chip(card)).not.toBeNull();
+    const stripPx = HISTORY_HEADER_PX + 2 * HISTORY_ROW_PX;
+    expect(card.getCardSize()).toBe(both.size - Math.ceil(stripPx / 50));
+    expect(card.getCardSize()).toBe(1 + 2 * (1 + Math.ceil((2 * LANE_HEIGHT) / 50)));
+    expect(card.getGridOptions().rows).toBe(Math.ceil((56 + 2 * (40 + 2 * LANE_HEIGHT)) / 64));
+    expect(card.getGridOptions().rows).toBeLessThan(both.rows);
+  });
+
+  it("omits the header altogether with the title and health off, dropping its unit and its 56 px", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(stateView());
+    await card.updateComplete;
+    const nominal = { size: card.getCardSize(), rows: card.getGridOptions().rows };
+
+    card.setConfig({ type: CARD_TYPE, show_title: false, show_health: false });
+    await card.updateComplete;
+
+    expect(card.shadowRoot?.querySelector(".card-header")).toBeNull();
+    expect(card.shadowRoot?.querySelector(".health-announcer")).toBeNull();
+    const haCard = card.shadowRoot?.querySelector("ha-card");
+    expect([...(haCard?.children ?? [])].map((el) => el.className)).toEqual(["content"]);
+    expect(card.shadowRoot?.querySelectorAll("section.cycle")).toHaveLength(2);
+    expect(strip(card)).not.toBeNull();
+    expect(card.getCardSize()).toBe(nominal.size - 1);
+    const stripPx = HISTORY_HEADER_PX + 2 * HISTORY_ROW_PX;
+    expect(card.getGridOptions().rows).toBe(Math.ceil((2 * (40 + 2 * LANE_HEIGHT) + stripPx) / 64));
+    expect(card.getGridOptions().rows).toBe(nominal.rows - 1);
+  });
+
+  it("renders no header with the title and health off before any document either: while connecting and on an error", async () => {
+    // A header band with neither heading nor chip must not appear while
+    // the body says "Connecting", nor above a persistent error message.
+    const fake = createHass({ deferred: true });
+    const card = await connectedCard(fake, { show_title: false, show_health: false, title: "Garden" });
+    expect(card.shadowRoot?.textContent).toContain("Connecting");
+    expect(card.shadowRoot?.querySelector(".card-header")).toBeNull();
+    expect(card.shadowRoot?.querySelector(".health-announcer")).toBeNull();
+    expect(card.getCardSize()).toBe(2);
+
+    fake.rejectSubscribe({ code: "not_found", message: "" });
+    await settle(card);
+    expect(card.shadowRoot?.querySelector(".message.error")?.textContent).toContain(
+      "No irrigation controller was found",
+    );
+    expect(card.shadowRoot?.querySelector(".card-header")).toBeNull();
+    expect([...(card.shadowRoot?.querySelector("ha-card")?.children ?? [])].map((el) => el.className)).toEqual([
+      "content",
+    ]);
+  });
+
+  it("show_title: false alone renders no header until a document arrives: not while connecting, not on an error", async () => {
+    // Health is on, but the chip needs a document: until then the header
+    // would hold nothing but the announcer, an empty padded band.
+    const fake = createHass({ deferred: true });
+    const card = await connectedCard(fake, { show_title: false });
+    expect(card.shadowRoot?.textContent).toContain("Connecting");
+    expect(card.shadowRoot?.querySelector(".card-header")).toBeNull();
+    const bothOff = await connectedCard(createHass({ deferred: true }), { show_title: false, show_health: false });
+
+    fake.rejectSubscribe({ code: "not_found", message: "" });
+    await settle(card);
+    expect(card.shadowRoot?.querySelector(".message.error")).not.toBeNull();
+    expect(card.shadowRoot?.querySelector(".card-header")).toBeNull();
+    expect(card.getGridOptions().rows).toBe(bothOff.getGridOptions().rows);
+    expect(card.getCardSize()).toBe(bothOff.getCardSize());
+
+    // A document: the header comes with the chip and the announcer, no heading.
+    card.setConfig({ type: CARD_TYPE, show_title: false, entry_id: "a" });
+    await settle(card);
+    fake.resolveSubscribe();
+    await settle(card);
+    fake.push(stateView());
+    await card.updateComplete;
+    const header = card.shadowRoot?.querySelector(".card-header");
+    expect(header).not.toBeNull();
+    expect(header?.querySelector("h1")).toBeNull();
+    expect(chip(card)?.getAttribute("data-state")).toBe("nominal");
+    expect(header?.querySelector(".health-announcer")?.textContent).toBe("All is well");
+  });
+
+  it("flips a display option live through setConfig: re-rendered, document kept, subscription untouched", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake, { entry_id: "a" });
+    fake.push(stateView());
+    await card.updateComplete;
+    expect(strip(card)).not.toBeNull();
+    const render = renderSpy(card);
+
+    card.setConfig({ type: CARD_TYPE, entry_id: "a", show_history: false });
+    await settle(card);
+    expect(render).toHaveBeenCalledTimes(1);
+    expect(card.shadowRoot?.querySelector("section.history")).toBeNull();
+    // The document stays: no "Connecting", rows still drawn.
+    expect(card.shadowRoot?.querySelectorAll("section.cycle")).toHaveLength(2);
+    expect(card.shadowRoot?.textContent).not.toContain("Connecting");
+
+    card.setConfig({ type: CARD_TYPE, entry_id: "a", show_history: true, show_health: false, show_title: false });
+    await settle(card);
+    expect(render).toHaveBeenCalledTimes(2);
+    expect(strip(card)).not.toBeNull();
+    expect(card.shadowRoot?.querySelector(".card-header")).toBeNull();
+
+    card.setConfig({ type: CARD_TYPE, entry_id: "a", show_title: true, title: "Garden" });
+    await settle(card);
+    expect(render).toHaveBeenCalledTimes(3);
+    expect(title(card)).toBe("Garden");
+    expect(chip(card)).not.toBeNull();
+
+    expect(fake.subscribeMessage).toHaveBeenCalledTimes(1);
+    expect(fake.unsubscribe).not.toHaveBeenCalled();
+    expect(fake.callWS).not.toHaveBeenCalled();
   });
 
   // ------------------------------------------------------------ zone labels

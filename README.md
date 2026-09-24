@@ -87,8 +87,9 @@ Repairs, superseded, or cleared itself when the switch next confirmed — with
 nothing to click on the card: there is no acknowledge button and the card
 never calls a service. Because it is read over the same subscription as the
 rest, **non-admin household members see it too**, which matters: they cannot
-open Repairs, so this is their only health surface. The visual editor
-arrives in a later story.
+open Repairs, so this is their only health surface. Every option the card
+takes is set in the dashboard's visual editor — the title, the controller
+and three display switches — and none of them is needed to get started.
 
 The card reads the [state view](#state-view-and-websocket-api) over the
 `state_subscribe` WebSocket command and nothing else — no entity states, no
@@ -98,18 +99,53 @@ the house.
 
 ### Adding the card
 
-Pick **HA Irrigation Timeline Card** in the dashboard card picker, or add it in
-YAML:
+Open the dashboard editor, choose **Add card** and pick **HA Irrigation
+Timeline Card**. The picker shows a live preview — the real card when a
+controller is set up, its _No irrigation controller was found_ sentence when
+none is — and adds the card with no options at all: it finds the single
+controller by itself. **Edit** opens the visual editor with five fields:
+
+- **Title** — empty, the card says _Irrigation_. To hide the heading, use
+  **Show title** below.
+- **Controller** — lists at most the one controller (the integration allows
+  a single one). The field exists to pin it explicitly and can stay empty:
+  the card finds it by itself, and clearing the field goes back to that.
+- **Show title** — whether the heading is shown. On by default. Off, the
+  health chip keeps the header to itself, on the right.
+- **Show the last 7 days** — the history strip. On by default.
+- **Show health** — the header chip, the anomaly banner and the
+  screen-reader announcer. On by default. Turning it off hides the banner
+  as well as the chip, so a non-admin household member — who cannot open
+  Repairs — loses their only health surface: keep it on for their
+  dashboards.
+
+A hidden section is not rendered at all, and the card's size hints shrink
+with it; with both the title and health off there is no header at all. The
+same options in YAML:
 
 ```yaml
 type: custom:ha-irrigation-timeline-card
 title: Garden # optional; defaults to "Irrigation"
 entry_id: 01J... # optional; only needed with several controllers
+show_title: true # optional; default true
+show_history: true # optional; default true
+show_health: true # optional; default true
 ```
 
-With no options the card finds the single controller by itself. If no
-controller is set up, or it is reloading, the card says so in its body and
-retries on its own.
+If no controller is set up, or it is reloading, the card says so in its body
+and retries on its own.
+
+### Non-admin users
+
+Viewing the card needs no administrator rights: the bundle is served from an
+open static path (the browser fetches dashboard resources without a token),
+the dashboard's resource list is readable by every user, and the
+`state_subscribe` command the card reads over is not admin-gated — all three
+are covered by the integration's tests, the last two as a read-only user. A
+read-only household member's dashboard therefore shows the timeline, the
+history, the health and the live updates exactly as an administrator's does.
+Editing a dashboard — adding the card, opening its editor — is an
+administrator's job in Home Assistant, as it is for every card.
 
 ### The card resource
 
