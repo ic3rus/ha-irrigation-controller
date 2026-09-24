@@ -28,6 +28,8 @@ build/
 
 # --- Node / card build ---
 node_modules/
+# Screenshots of the card's visual harness (`npm run visual` in card/): looked at, never committed.
+card/visual/out/
 # NOTE: the built card bundle in custom_components/ha_irrigation_controller/frontend/
 # is COMMITTED on purpose (HACS ships it) — do not ignore it.
 

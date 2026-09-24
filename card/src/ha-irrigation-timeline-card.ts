@@ -6,6 +6,8 @@ import type { CSSResultGroup, PropertyValues, TemplateResult } from "lit";
 import { state } from "lit/decorators.js";
 
 import { estimateOffset, serverNow, tickPeriodFor, TRANSITION_MS } from "./clock";
+import type { HealthModel } from "./health";
+import { ALERT_ICON, buildHealth, chipLabel, healthSummary, itemLabel, NOMINAL } from "./health";
 import type { HistoryModel } from "./history";
 import {
   buildHistory,
@@ -18,7 +20,7 @@ import {
   OUTCOME_VISUALS,
   UNKNOWN_OUTCOME,
 } from "./history";
-import type { RowStatus, TimelineRow } from "./timeline";
+import type { RowStatus, SegmentStatus, TimelineRow } from "./timeline";
 import { buildTimeline, cursorAt, progressOf } from "./timeline";
 import type { CycleKind, Handshake, HistoryRow, StateView } from "./types";
 import type { UnsubscribeState } from "./ws";
@@ -53,6 +55,16 @@ export const HISTORY_HEADER_PX = 72;
 export const HISTORY_ROW_PX = 28;
 
 /**
+ * The anomaly banner's pixel budget, as the stylesheet implies: the top
+ * padding (12), the title line (20) and its margin (8), the bottom padding
+ * (12) and the banner's 16 px margin below make the fixed part; then one
+ * 24 px line per open item. Zero in the nominal state: there is no banner
+ * to size.
+ */
+export const ANOMALY_HEADER_PX = 68;
+export const ANOMALY_ROW_PX = 24;
+
+/**
  * The word a row's header carries once its run has reached a terminal
  * state. A planned, pending or running row says nothing: the fill and the
  * cursor already do. Only three terminal statuses can reach `runs.current`
@@ -66,6 +78,23 @@ const TERMINAL_LABELS: Partial<Record<RowStatus, string>> = {
   interrupted: "Interrupted",
 };
 
+/**
+ * The non-colour signal on a zone label whose run reached a terminal state
+ * (WCAG 1.4.1): a glyph before the name for `failed` and `completed`, and
+ * visually-hidden text after it for those two and for `skipped`, whose
+ * strikethrough is the visible cue. `pending`, `running` and `planned` say
+ * nothing: the fill and the cursor already do.
+ */
+const LABEL_GLYPHS: Partial<Record<SegmentStatus, string>> = {
+  failed: "mdi:alert-circle",
+  completed: "mdi:check",
+};
+const LABEL_SR_TEXT: Partial<Record<SegmentStatus, string>> = {
+  failed: "failed",
+  completed: "completed",
+  skipped: "skipped",
+};
+
 /** The row statuses "now" still means something for: the cursor is drawn on these only. */
 const LIVE_STATUSES: ReadonlySet<RowStatus> = new Set<RowStatus>(["planned", "pending", "running"]);
 
@@ -75,16 +104,17 @@ function liveCursor(row: TimelineRow, nowMs: number): number | undefined {
 }
 
 /**
- * The document memo: today's rows and the history strip's model are rebuilt
- * only when the document or the zone changes — never on a tick. The labels
- * the strip shows are formatted at render time from the locale, so nothing
- * locale-dependent is cached here.
+ * The document memo: today's rows, the history strip's model and the health
+ * model are rebuilt only when the document or the zone changes — never on
+ * a tick. The labels the strip shows are formatted at render time from the
+ * locale, so nothing locale-dependent is cached here.
  */
 interface TimelineMemo {
   view: StateView;
   timeZone: string | undefined;
   rows: TimelineRow[];
   history: HistoryModel;
+  health: HealthModel;
 }
 
 export interface IrrigationTimelineCardConfig extends LovelaceCardConfig {
@@ -107,7 +137,10 @@ export interface GridOptions {
  * segment per zone, labelled with the zone's name and planned start–end,
  * coloured by its engine status, with a live fill on the running zone and
  * a now-cursor across the row (Story 4.3); under it, the last seven days'
- * outcomes per cycle as a strip of glyphs (Story 4.4).
+ * outcomes per cycle as a strip of glyphs (Story 4.4); in its header a
+ * health chip and, while anomalies are open, a banner naming each one
+ * (Story 4.5) — the mirror of the open Repairs issues, read from the
+ * document and never acted on from here.
  *
  * The card reads the engine's state view over Story 4.1's `state_subscribe`
  * channel and nothing else, and it renders only when a document arrives
@@ -247,11 +280,13 @@ export class HaIrrigationTimelineCard extends LitElement {
     if (model === undefined) {
       return 2;
     }
-    // One unit (~50 px) for the header, then per cycle: its header line plus
-    // its lanes; then the history strip on the same pixel budget as
-    // `getGridOptions`: its header plus one line per kind row.
+    // One unit (~50 px) for the header, then the anomaly banner when there
+    // is one, then per cycle: its header line plus its lanes; then the
+    // history strip on the same pixel budget as `getGridOptions`: its
+    // header plus one line per kind row.
     return (
       1 +
+      Math.ceil(anomalyPx(model.health) / 50) +
       model.rows.reduce(
         (total, row) => total + 1 + Math.ceil((Math.max(1, row.segments.length) * LANE_HEIGHT) / 50),
         0,
@@ -266,7 +301,9 @@ export class HaIrrigationTimelineCard extends LitElement {
     const px =
       56 +
       rows.reduce((total, row) => total + 40 + Math.max(1, row.segments.length) * LANE_HEIGHT, 0) +
-      (model === undefined ? 0 : HISTORY_HEADER_PX + model.history.kinds.length * HISTORY_ROW_PX);
+      (model === undefined
+        ? 0
+        : anomalyPx(model.health) + HISTORY_HEADER_PX + model.history.kinds.length * HISTORY_ROW_PX);
     return {
       rows: Math.max(2, Math.ceil(px / GRID_ROW_PX)),
       min_rows: 2,
@@ -301,21 +338,41 @@ export class HaIrrigationTimelineCard extends LitElement {
     );
   }
 
+  /**
+   * The card draws its own header rather than passing `ha-card`'s `header`
+   * string: a `.card-header` child is styled by `ha-card`'s
+   * `::slotted(.card-header)` with the same typography as its own header,
+   * and it can hold the health chip beside the title. The chip is omitted
+   * while there is no document to read health from, and while a connection
+   * error is on screen — the body says what is wrong then.
+   */
   protected override render(): TemplateResult | typeof nothing {
     if (!this._config) {
       return nothing;
     }
+    const model = this._error === undefined ? this._model() : undefined;
+    // The announcer is always in the tree: a live region only announces
+    // changes inside a region that was already mounted, so a banner that
+    // appears with its content would be read neither on onset nor on
+    // clearance. Its text is the health summary, empty without a document.
     return html`
-      <ha-card .header=${this._config.title ?? "Irrigation"}>
+      <ha-card>
+        <div class="card-header">
+          <h1 class="title">${this._config.title ?? "Irrigation"}</h1>
+          ${model === undefined ? nothing : this._renderChip(model.health)}
+          <span class="sr-only health-announcer" role="status" aria-live="polite"
+            >${model === undefined ? "" : healthSummary(model.health.items.length)}</span
+          >
+        </div>
         <div class="content">${this._renderBody()}</div>
       </ha-card>
     `;
   }
 
   /**
-   * The rows and the history model of the current document, memoised on
-   * the document reference and the time zone: a tick never re-runs the
-   * geometry nor the week's lookup.
+   * The rows, the history model and the health model of the current
+   * document, memoised on the document reference and the time zone: a tick
+   * never re-runs the geometry, the week's lookup nor the anomaly list.
    */
   private _model(): TimelineMemo | undefined {
     const view = this._view;
@@ -329,6 +386,7 @@ export class HaIrrigationTimelineCard extends LitElement {
         timeZone,
         rows: buildTimeline(view, timeZone).rows,
         history: buildHistory(view),
+        health: buildHealth(view),
       };
     }
     return this._memo;
@@ -356,14 +414,82 @@ export class HaIrrigationTimelineCard extends LitElement {
     if (model === undefined) {
       return html`<p class="message">Connecting to the irrigation controller…</p>`;
     }
-    // The strip is independent of today's plan: a day without a cycle still
-    // has a week behind it.
+    // The banner first — it is what the card exists to make unmissable —
+    // then today's rows, then the strip, which is independent of today's
+    // plan: a day without a cycle still has a week behind it.
     return html`
+      ${this._renderAnomalies(model.health)}
       ${model.rows.length === 0
         ? html`<p class="message">No cycle is planned today.</p>`
         : model.rows.map((row) => this._renderRow(row))}
       ${this._renderHistory(model.history)}
     `;
+  }
+
+  /**
+   * The header chip (Story 4.5): a hollow check and "All is well" in the
+   * secondary text colour when nothing is open — calm, no animation — or
+   * an alert glyph and the count in the error colour. `role="img"` with the
+   * full sentence as its label, so a screen reader hears "2 issues need
+   * attention" rather than a glyph and a number.
+   */
+  private _renderChip(health: HealthModel): TemplateResult {
+    const count = health.items.length;
+    const icon = health.state === "nominal" ? NOMINAL.icon : ALERT_ICON;
+    return html`
+      <span class="health" data-state=${health.state} role="img" aria-label=${healthSummary(count)}>
+        <ha-icon icon=${icon}></ha-icon>
+        <span class="health-text">${chipLabel(count)}</span>
+      </span>
+    `;
+  }
+
+  /**
+   * The anomaly banner (FR28): nothing when nominal; otherwise a filled
+   * `role="status"` block — polite, not an alert: Epic 3 already notified,
+   * and this is a persistent surface — listing every open item once, in
+   * document order, with its kind's sentence (the Repairs title) and its
+   * subject. It disappears on the first push whose `open` is empty, whether
+   * the issue was dismissed, superseded or healed; the card asks nothing.
+   */
+  private _renderAnomalies(health: HealthModel): TemplateResult | typeof nothing {
+    if (health.state === "nominal") {
+      return nothing;
+    }
+    return html`
+      <section class="anomalies" role="status" aria-live="polite">
+        <header class="anomalies-header">
+          <ha-icon icon=${ALERT_ICON}></ha-icon>
+          <span>${healthSummary(health.items.length)}</span>
+        </header>
+        <ul class="anomaly-list">
+          ${health.items.map(
+            (item) => html`
+              <li class="anomaly" data-anomaly=${item.kind}>
+                <ha-icon icon=${item.visual.icon}></ha-icon>
+                <span class="anomaly-text"
+                  >${itemLabel(item)}${item.subject === null
+                    ? nothing
+                    : html` · <span class="anomaly-subject">${item.subject}</span>`}</span
+                >
+              </li>
+            `,
+          )}
+        </ul>
+      </section>
+    `;
+  }
+
+  /** The label's status glyph: an `ha-icon` for `failed` and `completed`, nothing otherwise. */
+  private _statusGlyph(status: SegmentStatus): TemplateResult | typeof nothing {
+    const icon = LABEL_GLYPHS[status];
+    return icon === undefined ? nothing : html`<ha-icon class="status-glyph" icon=${icon}></ha-icon>`;
+  }
+
+  /** The label's hidden status word for `failed`, `completed` and `skipped`; nothing otherwise. */
+  private _statusText(status: SegmentStatus): TemplateResult | typeof nothing {
+    const text = LABEL_SR_TEXT[status];
+    return text === undefined ? nothing : html`<span class="sr-only">${text}</span>`;
   }
 
   /**
@@ -468,7 +594,9 @@ export class HaIrrigationTimelineCard extends LitElement {
           ${segments.map(
             (segment) => html`
               <li class="label" data-status=${segment.status}>
+                ${this._statusGlyph(segment.status)}
                 <span class="zone">${segment.name}</span>
+                ${this._statusText(segment.status)}
                 <span class="times">${this._window(segment.start, segment.end)}</span>
               </li>
             `,
@@ -744,9 +872,122 @@ export class HaIrrigationTimelineCard extends LitElement {
         display: block;
         --hic-lane-height: ${LANE_HEIGHT}px;
       }
+      /* Slotted into ha-card, which gives .card-header its own header
+         typography and padding; only the layout is ours. */
+      .card-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      /* An h1 for the heading semantics ha-card's own header has; the
+         slotted typography is inherited from .card-header, not the UA's. */
+      .card-header .title {
+        font: inherit;
+        letter-spacing: inherit;
+        margin: 0;
+        min-width: 0;
+      }
+      /* The health chip: rem-sized so the 24 px header font does not scale it. */
+      .health {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        flex: none;
+        font-size: 0.875rem;
+        font-weight: 400;
+        line-height: normal;
+        letter-spacing: normal;
+        white-space: nowrap;
+        color: var(--hic-secondary-text-color, var(--secondary-text-color));
+        --mdc-icon-size: 18px;
+      }
+      .health ha-icon {
+        display: flex;
+        width: 18px;
+        height: 18px;
+        color: var(--hic-health-nominal-color, var(--hic-completed-color, var(--success-color, #43a047)));
+      }
+      .health[data-state="anomaly"],
+      .health[data-state="anomaly"] ha-icon {
+        color: var(--hic-health-anomaly-color, var(--hic-error-color, var(--error-color, #db4437)));
+      }
+      .health[data-state="anomaly"] {
+        font-weight: 500;
+      }
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        margin: -1px;
+        padding: 0;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        clip-path: inset(50%);
+        white-space: nowrap;
+        border: 0;
+      }
       .content {
         padding: 0 16px 16px;
         color: var(--hic-text-color, var(--primary-text-color));
+      }
+
+      /* --------------------------------------------------- anomaly banner */
+      /* The loudest thing on the card, and the only filled block besides the
+         history badges: the error colour as a bar and a tint, both read
+         through hooks with HA theme-var fallbacks and never defined here. */
+      .anomalies {
+        margin: 0 0 16px;
+        padding: 12px;
+        border-radius: 8px;
+        border-left: 4px solid var(--hic-health-anomaly-color, var(--hic-error-color, var(--error-color, #db4437)));
+        background: var(--hic-health-anomaly-bg, color-mix(in srgb, var(--hic-health-anomaly-color, var(--hic-error-color, var(--error-color, #db4437))) 15%, transparent));
+      }
+      .anomalies-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 8px;
+        line-height: 20px;
+        font-weight: 500;
+        color: var(--hic-health-anomaly-color, var(--hic-error-color, var(--error-color, #db4437)));
+        --mdc-icon-size: 20px;
+      }
+      .anomalies-header ha-icon {
+        display: flex;
+        width: 20px;
+        height: 20px;
+        color: inherit;
+      }
+      .anomaly-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+      }
+      .anomaly {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        min-height: ${ANOMALY_ROW_PX}px;
+        line-height: ${ANOMALY_ROW_PX}px;
+        font-size: 0.9em;
+        --mdc-icon-size: 18px;
+      }
+      .anomaly ha-icon {
+        display: flex;
+        flex: none;
+        /* Centred on the first 24 px line of a text that may wrap. */
+        margin-top: 3px;
+        width: 18px;
+        height: 18px;
+        color: var(--hic-health-anomaly-color, var(--hic-error-color, var(--error-color, #db4437)));
+      }
+      /* Wraps: on a narrow card the subject (which valve) must stay readable. */
+      .anomaly-text {
+        min-width: 0;
+      }
+      .anomaly-subject {
+        color: var(--hic-secondary-text-color, var(--secondary-text-color));
       }
       .message {
         margin: 0;
@@ -802,7 +1043,9 @@ export class HaIrrigationTimelineCard extends LitElement {
         min-width: 0;
       }
       .label {
+        position: relative;
         display: flex;
+        align-items: center;
         gap: 8px;
         height: var(--hic-lane-height);
         line-height: var(--hic-lane-height);
@@ -814,6 +1057,21 @@ export class HaIrrigationTimelineCard extends LitElement {
         overflow: hidden;
         text-overflow: ellipsis;
       }
+      /* The terminal-status glyph beside the zone name: colour is not the
+         only signal, and the glyph reads in the same hook as its bar. */
+      .label ha-icon {
+        display: flex;
+        flex: none;
+        width: 16px;
+        height: 16px;
+        --mdc-icon-size: 16px;
+      }
+      .label[data-status="completed"] ha-icon {
+        color: var(--hic-completed-color, var(--success-color, #43a047));
+      }
+      .label[data-status="failed"] ha-icon {
+        color: var(--hic-failed-color, var(--error-color, #db4437));
+      }
       .label .times {
         flex: none;
       }
@@ -822,7 +1080,7 @@ export class HaIrrigationTimelineCard extends LitElement {
         width: 100%;
         height: calc(var(--hic-lanes, 1) * var(--hic-lane-height));
         border-radius: 4px;
-        background: var(--hic-track-color, var(--divider-color, rgba(0, 0, 0, 0.12)));
+        background: var(--hic-track-color, var(--divider-color, color-mix(in srgb, currentColor 12%, transparent)));
       }
       .segment {
         fill: var(--hic-segment-color, var(--primary-color, #03a9f4));
@@ -856,8 +1114,14 @@ export class HaIrrigationTimelineCard extends LitElement {
         /* Slightly longer than the tick so the fill glides instead of stepping. */
         transition: transform ${TRANSITION_MS}ms linear;
       }
+      @media (prefers-reduced-motion: reduce) {
+        /* The fill steps once a second instead of gliding. */
+        .progress {
+          transition: none;
+        }
+      }
       .cursor {
-        stroke: var(--hic-cursor-color, var(--primary-text-color, #212121));
+        stroke: var(--hic-cursor-color, var(--primary-text-color, currentColor));
         stroke-width: 2px;
         /* preserveAspectRatio="none" would stretch the stroke with the axis. */
         vector-effect: non-scaling-stroke;
@@ -874,7 +1138,7 @@ export class HaIrrigationTimelineCard extends LitElement {
       .history {
         margin-top: 16px;
         padding-top: 12px;
-        border-top: 1px solid var(--hic-track-color, var(--divider-color, rgba(0, 0, 0, 0.12)));
+        border-top: 1px solid var(--hic-track-color, var(--divider-color, color-mix(in srgb, currentColor 12%, transparent)));
       }
       .history-header {
         margin-bottom: 6px;
@@ -924,7 +1188,7 @@ export class HaIrrigationTimelineCard extends LitElement {
         color: inherit;
       }
       .outcome[data-outcome="none"] {
-        color: var(--hic-history-empty-color, var(--hic-track-color, var(--divider-color, rgba(0, 0, 0, 0.12))));
+        color: var(--hic-history-empty-color, var(--hic-track-color, var(--divider-color, color-mix(in srgb, currentColor 12%, transparent))));
       }
       .outcome[data-outcome="ran"] {
         color: var(--hic-history-ran-color, var(--hic-completed-color, var(--success-color, #43a047)));
@@ -941,6 +1205,11 @@ export class HaIrrigationTimelineCard extends LitElement {
       }
     `;
   }
+}
+
+/** The anomaly banner's pixel height for the sizing hints: 0 when nominal. */
+function anomalyPx(health: HealthModel): number {
+  return health.state === "nominal" ? 0 : ANOMALY_HEADER_PX + health.items.length * ANOMALY_ROW_PX;
 }
 
 /** The card body's wording for a refused subscribe, by backend error code. */
@@ -978,7 +1247,7 @@ if (!window.customCards.some((card) => card["type"] === CARD_TYPE)) {
     type: CARD_TYPE,
     name: "HA Irrigation Timeline Card",
     description:
-      "Today's irrigation plan: each cycle's zones as a proportional timeline with planned times, live progress and outcomes, plus the last seven days at a glance.",
+      "Today's irrigation plan: each cycle's zones as a proportional timeline with planned times, live progress and outcomes, the last seven days at a glance, and the controller's health.",
   });
 }
 

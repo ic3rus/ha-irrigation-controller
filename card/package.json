@@ -14,7 +14,8 @@
     "watch": "rollup -c -w",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "visual": "node visual/snapshot.mjs"
   },
   "dependencies": {
     "lit": "^3.3.0"

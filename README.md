@@ -70,8 +70,25 @@ installed — is a hollow circle. Hover (or focus with a screen reader) any
 cell for the full story: date, cycle, outcome, minutes actually watered and
 the rain total, when the row has them. The card never derives an outcome
 itself: it reads `history` from the state view and maps each row's `outcome`
-to its visual, nothing more. The health indicator and the visual editor
-arrive in later stories.
+to its visual, nothing more.
+
+The card's header carries the controller's **health**. When nothing is open
+it is one calm line — a hollow check in the success colour and _All is well_
+in the secondary text colour, no banner, nothing that asks for attention. When anomalies are open
+the chip turns to the error colour and counts them (_2 issues_), and a
+banner under the header lists every open anomaly on its own line: the same
+sentence the Repairs issue carries (_Valve did not confirm opening_, _A
+scheduled cycle did not run_, …) followed by its subject — the zone's name,
+the entity id or the role, whichever the anomaly is about. The banner is the
+`health` section of the state view rendered as is: the mirror of the open
+Repairs issues, in their order, and nothing else. It clears on the first
+pushed document whose open list is empty — the issue was dismissed in
+Repairs, superseded, or cleared itself when the switch next confirmed — with
+nothing to click on the card: there is no acknowledge button and the card
+never calls a service. Because it is read over the same subscription as the
+rest, **non-admin household members see it too**, which matters: they cannot
+open Repairs, so this is their only health surface. The visual editor
+arrives in a later story.
 
 The card reads the [state view](#state-view-and-websocket-api) over the
 `state_subscribe` WebSocket command and nothing else — no entity states, no
@@ -118,6 +135,53 @@ lovelace:
     - url: /ha_irrigation_controller/ha-irrigation-timeline-card.js?v=0.1.0
       type: module
 ```
+
+### Theming
+
+The card takes its colours from Home Assistant's theme variables, so it
+follows your theme — light or dark — with nothing to configure. Every colour
+is read through a `--hic-*` hook first, so a theme can restyle one part of
+the card without touching the rest; the card defines none of these hooks
+itself. Each hook falls back along the chain below (the literal at the end
+only ever shows in a theme that defines none of the variables before it;
+`currentColor` follows the card's text colour, so the cursor and the track
+stay visible on a dark theme too).
+
+| Hook | Colours | Fallback chain |
+|------|---------|----------------|
+| `--hic-text-color` | the card body's text | `--primary-text-color` |
+| `--hic-secondary-text-color` | times, cycle windows, day and cycle labels, the nominal chip, anomaly subjects | `--secondary-text-color` |
+| `--hic-error-color` | the connection error message; the default of the anomaly hooks below | `--error-color` → `#db4437` |
+| `--hic-segment-color` | a planned zone's bar | `--primary-color` → `#03a9f4` |
+| `--hic-running-color` | the running zone's fill | `--hic-segment-color` → `--primary-color` → `#03a9f4` |
+| `--hic-completed-color` | a completed zone's bar and label glyph, the _Completed_ word | `--success-color` → `#43a047` |
+| `--hic-failed-color` | a failed zone's bar and label glyph, the _Cancelled_ / _Interrupted_ word | `--error-color` → `#db4437` |
+| `--hic-skipped-color` | a skipped zone's bar | `--disabled-text-color` → `#bdbdbd` |
+| `--hic-cursor-color` | the now-cursor | `--primary-text-color` → `currentColor` |
+| `--hic-track-color` | the row's track behind the bars, the strip's separator | `--divider-color` → 12 % of `currentColor` |
+| `--hic-history-nominal-color` | a strip cell with a nominal outcome (waived, cancelled) | `--hic-secondary-text-color` → `--secondary-text-color` → `#727272` |
+| `--hic-history-ran-color` | a _ran_ cell | `--hic-completed-color` → `--success-color` → `#43a047` |
+| `--hic-history-rain-color` | a _reduced by rain_ cell | `--info-color` → `#039be5` |
+| `--hic-history-anomaly-color` | a _missed_ or _recovered_ cell's glyph and border | `--hic-error-color` → `--error-color` → `#db4437` |
+| `--hic-history-anomaly-bg` | that cell's fill | 15 % of `--hic-history-anomaly-color` |
+| `--hic-history-empty-color` | a hollow _no record_ cell | `--hic-track-color` → `--divider-color` → 12 % of `currentColor` |
+| `--hic-health-nominal-color` | the nominal chip's check glyph | `--hic-completed-color` → `--success-color` → `#43a047` |
+| `--hic-health-anomaly-color` | the anomaly chip, the banner's text, glyphs and left bar | `--hic-error-color` → `--error-color` → `#db4437` |
+| `--hic-health-anomaly-bg` | the banner's fill | 15 % of `--hic-health-anomaly-color` |
+
+Set a hook in a theme like any other variable:
+
+```yaml
+themes:
+  my-theme:
+    hic-running-color: "#26a69a"
+    hic-failed-color: "#e53935"
+    hic-health-anomaly-bg: "rgba(229, 57, 53, 0.2)"
+```
+
+The card is checked in Home Assistant's default light and dark themes;
+`npm run visual` in `card/` (after `npm run build`, which it screenshots)
+renders both into `card/visual/out/`.
 
 Bump `v=` to the new version after each upgrade (the version is in
 `custom_components/ha_irrigation_controller/manifest.json`); browsers may keep
@@ -747,6 +811,10 @@ the timeline card receives:
   subject keys of each open anomaly (`zone_id`, `entity_id` or `role`);
 - `last_anomaly` — the most recent report, kind plus its full context; kept
   after it clears, so you can see what went wrong last.
+
+The [dashboard card](#dashboard-card) shows the same `open` list as its
+health chip and anomaly banner, for admins and non-admins alike; it never
+shows `last`.
 
 ### Bus events for automations
 
