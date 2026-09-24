@@ -39,6 +39,46 @@ in the same payload — no separate card install or download. The integration
 serves the bundle and registers the dashboard resource itself; see
 [Dashboard card](#dashboard-card).
 
+## Configuring zones and cycles
+
+Everything is configured on the controller itself, not in the dashboard card —
+the card only displays the plan and follows every change live. Open the
+controller's page at `/config/integrations/integration/ha_irrigation_controller`
+(for example `http://homeassistant.local:8123/config/integrations/integration/ha_irrigation_controller`).
+Nothing needs a Home Assistant restart.
+
+**Zones.** A new controller has none, so the card shows *"No zones are planned
+for this cycle."* Use **Add zone** on the controller's entry (under its **⋮**
+menu if it is not shown as a button), once per physical zone:
+
+| Field | Meaning |
+|-------|---------|
+| Zone name | How the zone appears everywhere: its device, the card, notifications. |
+| Valve switch | The switch that opens this zone's valve — its own, never the pump switch. |
+| Morning duration / Evening duration | Minutes this zone waters in each cycle (default 10). |
+| Exposed to rain | Off for sheltered zones (greenhouse, covered beds), which are never rain-reduced. |
+| Rain factor | Minutes credited per mm of rain, exposed zones only (default 1 min/mm; see [Calibrating the rain factor](#calibrating-the-rain-factor)). |
+
+Zones water one at a time, in the order they were added. To change a zone
+later, use **Reconfigure zone** on it; to remove one, delete it from the same
+place.
+
+**Cycles and controller settings.** Use **Configure** on the controller's
+entry. The same form as at setup:
+
+| Field | Meaning |
+|-------|---------|
+| Pump switch / Rain sensor | The pump feeding the valves; the accumulated-precipitation sensor (mm). |
+| Run a morning cycle | Off by default; the evening cycle always runs. |
+| Morning start time / Evening start time | Local start times (defaults 07:00 and 20:00). |
+| Actuation timeout | Seconds a pump or valve may take to confirm a command before an anomaly is raised. |
+| Manual valve safety timeout | See [The safety timeout](#the-safety-timeout). |
+| Notify target | See [Notify target](#notify-target). |
+| Temperature / Humidity sensor | Optional; stored for future use, not used in this version. |
+
+A change made while a cycle runs is applied without interrupting it; see
+[Configuration changes and running cycles](#configuration-changes-and-running-cycles).
+
 ## Dashboard card
 
 The integration bundles a Lovelace card, `ha-irrigation-timeline-card`, that
