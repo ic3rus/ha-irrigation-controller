@@ -3,6 +3,7 @@ import { formatTime } from "custom-card-helpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { FAST_TICK_MS, SLOW_TICK_MS, TRANSITION_MS } from "./clock";
+import { CARD_VERSION } from "./editor";
 import {
   anomaly,
   completedEveningRun,
@@ -26,6 +27,7 @@ import {
   type IrrigationTimelineCardConfig,
   LANE_HEIGHT,
   RETRY_DELAY_MS,
+  STALE_HINT_PX,
 } from "./ha-irrigation-timeline-card";
 import * as health from "./health";
 import * as history from "./history";
@@ -2196,7 +2198,129 @@ describe("ha-irrigation-timeline-card", () => {
     expect(card.handshake).toBeUndefined();
     fake.push(stateView());
 
-    expect(card.handshake).toEqual({ schema_version: 1, version: "0.1.0" });
+    expect(card.handshake).toEqual({ schema_version: 1, version: CARD_VERSION });
+  });
+
+  // ------------------------------------------------------ stale bundle (4.7)
+
+  // Never hardcode the card's version: "999.0.0" is an integration newer
+  // than the card, "0.0.0" an older one (the card is the newer side).
+  const NEWER_INTEGRATION = "999.0.0";
+  const OLDER_INTEGRATION = "0.0.0";
+  const STALE_TAIL = "Reload the page — in the companion app, reset the frontend cache.";
+  const RESTART_TAIL = "Restart Home Assistant to finish the update.";
+
+  function staleHintEl(card: HaIrrigationTimelineCard): HTMLElement | null {
+    return card.shadowRoot?.querySelector<HTMLElement>(".content .message.stale") ?? null;
+  }
+
+  it("shows no stale hint when the pushed document matches the bundle", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(stateView());
+    await card.updateComplete;
+
+    expect(staleHintEl(card)).toBeNull();
+  });
+
+  it("shows the stale hint above the document when the integration version differs", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push({ ...stateView(), version: NEWER_INTEGRATION });
+    await card.updateComplete;
+
+    const hint = staleHintEl(card);
+    expect(hint).not.toBeNull();
+    expect(hint?.getAttribute("role")).toBe("status");
+    expect(text(hint)).toBe(
+      `This card (${CARD_VERSION}) does not match the installed integration (${NEWER_INTEGRATION}). ${STALE_TAIL}`,
+    );
+    // Display-only: the rows and the strip still render, under the hint.
+    expect(card.shadowRoot?.querySelectorAll("section.cycle")).toHaveLength(2);
+    expect(card.shadowRoot?.querySelector("section.history")).not.toBeNull();
+    const content = card.shadowRoot?.querySelector(".content");
+    expect(content?.firstElementChild).toBe(hint);
+  });
+
+  it("tells the reader to restart Home Assistant when the card is newer than the integration", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push({ ...stateView(), version: OLDER_INTEGRATION });
+    await card.updateComplete;
+
+    const hint = staleHintEl(card);
+    expect(hint?.getAttribute("role")).toBe("status");
+    expect(text(hint)).toBe(
+      `This card (${CARD_VERSION}) does not match the installed integration (${OLDER_INTEGRATION}). ${RESTART_TAIL}`,
+    );
+    expect(card.shadowRoot?.querySelectorAll("section.cycle")).toHaveLength(2);
+    expect(card.shadowRoot?.querySelector("section.history")).not.toBeNull();
+  });
+
+  it("tells the reader to restart when only the card's schema is higher", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push({ ...stateView(), schema_version: 0 });
+    await card.updateComplete;
+
+    expect(text(staleHintEl(card))).toBe(
+      `This card (${CARD_VERSION}, schema 1) does not match the installed integration (${CARD_VERSION}, schema 0). ${RESTART_TAIL}`,
+    );
+  });
+
+  it("shows the stale hint above the anomaly banner", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push({ ...stateView({ health: open(anomaly("missed_cycle")) }), version: NEWER_INTEGRATION });
+    await card.updateComplete;
+
+    const hint = staleHintEl(card);
+    const found = banner(card);
+    expect(hint).not.toBeNull();
+    expect(found).not.toBeNull();
+    expect(hint!.compareDocumentPosition(found!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("names both schemas in the stale hint when the schema differs", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push({ ...stateView(), schema_version: 2 });
+    await card.updateComplete;
+
+    expect(text(staleHintEl(card))).toBe(
+      `This card (${CARD_VERSION}, schema 1) does not match the installed integration (${CARD_VERSION}, schema 2). ${STALE_TAIL}`,
+    );
+    expect(card.shadowRoot?.querySelectorAll("section.cycle")).toHaveLength(2);
+  });
+
+  it("grows its sizing hints by the stale hint's budget", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(stateView());
+    await card.updateComplete;
+    const nominal = { size: card.getCardSize(), rows: card.getGridOptions().rows };
+
+    fake.push({ ...stateView(), version: NEWER_INTEGRATION });
+    await card.updateComplete;
+
+    const stripPx = HISTORY_HEADER_PX + 2 * HISTORY_ROW_PX;
+    expect(card.getCardSize()).toBe(nominal.size + Math.ceil(STALE_HINT_PX / 50));
+    expect(card.getGridOptions().rows).toBe(
+      Math.ceil((56 + STALE_HINT_PX + 2 * (40 + 2 * LANE_HEIGHT) + stripPx) / 64),
+    );
+    expect(card.getGridOptions().rows).toBeGreaterThan(nominal.rows);
+  });
+
+  it("clears the stale hint on a following matching push", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push({ ...stateView(), version: NEWER_INTEGRATION });
+    await card.updateComplete;
+    expect(staleHintEl(card)).not.toBeNull();
+
+    fake.push(stateView());
+    await card.updateComplete;
+    expect(staleHintEl(card)).toBeNull();
   });
 
   // ------------------------------------------------------------ evaluation

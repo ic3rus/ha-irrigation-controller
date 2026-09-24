@@ -32,6 +32,46 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 INTEGRATION_DIR = REPO_ROOT / "custom_components" / "ha_irrigation_controller"
 # The card's contract module (`editor.ts`) owns CARD_VERSION (Story 4.6).
 CARD_CONTRACT_SRC = REPO_ROOT / "card" / "src" / "editor.ts"
+# The card's stale-bundle handshake owns its STATE_SCHEMA_VERSION mirror (4.7).
+CARD_HANDSHAKE_SRC = REPO_ROOT / "card" / "src" / "handshake.ts"
+ENGINE_VIEW_SRC = INTEGRATION_DIR / "engine" / "view.py"
+
+# The integration quality scale's rules, as hassfest names them.
+BRONZE_RULES: tuple[str, ...] = (
+    "action-setup",
+    "appropriate-polling",
+    "brands",
+    "common-modules",
+    "config-flow",
+    "config-flow-test-coverage",
+    "dependency-transparency",
+    "docs-actions",
+    "docs-high-level-description",
+    "docs-installation-instructions",
+    "docs-removal-instructions",
+    "entity-event-setup",
+    "entity-unique-id",
+    "has-entity-name",
+    "runtime-data",
+    "test-before-configure",
+    "test-before-setup",
+    "unique-config-entry",
+)
+SILVER_RULES: tuple[str, ...] = (
+    "action-exceptions",
+    "config-entry-unloading",
+    "docs-configuration-parameters",
+    "docs-installation-parameters",
+    "entity-unavailable",
+    "integration-owner",
+    "log-when-unavailable",
+    "parallel-updates",
+    "reauthentication-flow",
+    "test-coverage",
+)
+# The one Bronze rule still open: an external home-assistant/brands submission.
+BRONZE_TODO_ALLOWED = frozenset({"brands"})
+RULE_STATUSES = frozenset({"done", "exempt", "todo"})
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -71,6 +111,9 @@ def test_min_ha_version_is_consistent_across_the_repo() -> None:
     """hacs.json and the README agree with const.MIN_HA_VERSION."""
     hacs = _load_json(REPO_ROOT / "hacs.json")
     assert hacs["homeassistant"] == MIN_HA_VERSION
+    # Release-based distribution: the README in the store, releases only (never main).
+    assert hacs["render_readme"] is True
+    assert hacs["hide_default_branch"] is True
 
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     assert MIN_HA_VERSION in readme
@@ -95,6 +138,69 @@ def test_version_is_consistent_across_the_repo() -> None:
         "CARD_VERSION not found in the card contract source"
     )
     assert card_version.group(1) == manifest_version
+
+    # The YAML-mode resource snippet cache-busts with the release version.
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    resource_versions = re.findall(
+        r"ha-irrigation-timeline-card\.js\?v=([0-9A-Za-z.+-]+)", readme
+    )
+    assert resource_versions, (
+        "no ha-irrigation-timeline-card.js?v= snippet in README.md"
+    )
+    assert all(version == manifest_version for version in resource_versions), (
+        resource_versions
+    )
+
+
+def test_state_schema_version_is_shared_by_engine_and_card() -> None:
+    """The card's stale-bundle check compares against the engine's schema."""
+    engine = re.search(
+        r"STATE_SCHEMA_VERSION: Final = (\d+)",
+        ENGINE_VIEW_SRC.read_text(encoding="utf-8"),
+    )
+    card = re.search(
+        r"STATE_SCHEMA_VERSION = (\d+)",
+        CARD_HANDSHAKE_SRC.read_text(encoding="utf-8"),
+    )
+    assert engine is not None, "STATE_SCHEMA_VERSION not found in engine/view.py"
+    assert card is not None, "STATE_SCHEMA_VERSION not found in card/src/handshake.ts"
+    assert card.group(1) == engine.group(1)
+
+
+def _rule_status(entry: Any) -> tuple[Any, Any]:
+    """Split a rule into (status, comment): bare string or mapping form."""
+    if isinstance(entry, str):
+        return entry, None
+    assert isinstance(entry, dict)
+    return entry.get("status"), entry.get("comment")
+
+
+def test_quality_scale_tracks_every_bronze_and_silver_rule() -> None:
+    """Bronze is met but for `brands`; every Silver rule is stated with a status.
+
+    Each `exempt` or `todo` must say why or what remains, so a later reader
+    can tell a decision from an oversight.
+    """
+    loaded = parse_yaml(
+        (INTEGRATION_DIR / "quality_scale.yaml").read_text(encoding="utf-8"),
+    )
+    assert isinstance(loaded, dict)
+    rules: dict[str, Any] = loaded["rules"]
+
+    for name in (*BRONZE_RULES, *SILVER_RULES):
+        assert name in rules, f"quality_scale.yaml does not state {name}"
+        status, comment = _rule_status(rules[name])
+        assert status in RULE_STATUSES, f"{name}: unknown status {status!r}"
+        if status in {"exempt", "todo"}:
+            assert isinstance(comment, str), f"{name}: {status} without a comment"
+            assert comment.strip(), f"{name}: {status} without a comment"
+
+    open_bronze = {
+        name for name in BRONZE_RULES if _rule_status(rules[name])[0] == "todo"
+    }
+    assert open_bronze <= BRONZE_TODO_ALLOWED, (
+        f"Bronze rules still todo: {sorted(open_bronze - BRONZE_TODO_ALLOWED)}"
+    )
 
 
 def _load_services_yaml() -> dict[str, Any]:

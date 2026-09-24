@@ -1,0 +1,54 @@
+name: Release
+
+# A SemVer tag (vX.Y.Z) pushed to a commit on main publishes the GitHub
+# release HACS installs from. HACS reads manifest.json `version`; the tag is
+# the release name, so the one check here is tag == manifest. The other four
+# copies of the version (pyproject.toml, card/package.json, CARD_VERSION, the
+# README `?v=`) are tied to the manifest by tests/test_manifest.py on every PR.
+on:
+  push:
+    tags: ["v[0-9]*"]
+
+# Creating a release needs contents:write; nothing else is granted.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish the GitHub release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v7
+        with:
+          # Full history, so the tagged commit can be checked against main.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Tagged commit is on main
+        shell: bash
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag ${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on main. Push release tags on the merged main only: delete the tag, merge the PR, re-tag."
+            exit 1
+          fi
+
+      - name: Tag matches manifest.json version
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          manifest_version="$(python3 -c "import json; print(json.load(open('custom_components/ha_irrigation_controller/manifest.json'))['version'])")"
+          echo "tag: ${GITHUB_REF_NAME} (version ${tag_version}); manifest.json version: ${manifest_version}"
+          if [[ "${tag_version}" != "${manifest_version}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match manifest.json version ${manifest_version}. Delete the tag, bump the version, re-tag."
+            exit 1
+          fi
+
+      - name: Create the release with generated notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"

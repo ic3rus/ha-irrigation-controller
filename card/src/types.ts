@@ -8,9 +8,6 @@
  * enums as their string values, the zone subentry id as the zone key.
  */
 
-/** The state-view schema this bundle was built against (`STATE_SCHEMA_VERSION`). */
-export const STATE_SCHEMA_VERSION = 1;
-
 /** `engine/plan.py` `CycleKind`. */
 export type CycleKind = "morning" | "evening";
 

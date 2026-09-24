@@ -61,7 +61,18 @@ jobs:
       - name: Report the Home Assistant version under test
         run: python3 -c "from homeassistant.const import __version__ as v; print('Home Assistant', v)"
 
+      # The stable leg is the gate, so it alone carries the coverage floor
+      # (quality_scale.yaml `test-coverage`); the beta leg is early warning.
+      - name: Run tests with the coverage gate
+        if: matrix.ha-channel == 'stable'
+        run: >-
+          python3 -m pytest tests/ -p no:sugar
+          --cov=custom_components/ha_irrigation_controller
+          --cov-report=term-missing:skip-covered
+          --cov-fail-under=95
+
       - name: Run tests
+        if: matrix.ha-channel != 'stable'
         run: python3 -m pytest tests/ -p no:sugar
 
   engine-hass-free:

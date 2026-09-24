@@ -8,8 +8,10 @@ rules:
     comment: iot_class is calculated — the integration does not poll.
   brands:
     status: todo
+    comment: Follow-up is an external submission to home-assistant/brands under custom_integrations/ha_irrigation_controller (icon and logo); until it lands, validate.yml keeps ignoring brands in the HACS action.
   common-modules:
-    status: todo
+    status: done
+    comment: The shared entity bases live in entities/entity.py (controller and zone bases, device info, unique ids, the dispatcher subscription). There is no coordinator by design — the engine pushes its state over the dispatcher signal rather than being polled.
   config-flow: done
   config-flow-test-coverage:
     status: done
@@ -24,7 +26,8 @@ rules:
   docs-installation-instructions:
     status: done
   docs-removal-instructions:
-    status: todo
+    status: done
+    comment: README "Removing the integration" — delete the helper, what async_remove_entry deletes (the journal .storage file, every Repairs issue) and does not (the dashboard resource), then remove the repository in HACS and restart.
   entity-event-setup:
     status: done
     comment: The sensor projections subscribe to the engine-state dispatcher signal in async_added_to_hass and release it through async_on_remove; no subscription exists outside that pair.
@@ -45,6 +48,34 @@ rules:
   action-exceptions:
     status: done
     comment: Every failure path of the four actions raises a translated ServiceValidationError (no_cycle_running, cycle_already_running, no_zones, unknown_zone, invalid_duration, cycles_overlap); the "no entry"/"not loaded"/"multiple entries" cases come already translated from async_get_config_entry. Range and identity checks live in the handlers rather than the voluptuous schemas, so a bad value never surfaces as an untranslated vol.Invalid.
+
+  config-entry-unloading:
+    status: done
+    comment: async_unload_entry (__init__.py) suspends a running cycle (valve and pump commanded off) and unloads the platforms; timers, the tracker and the journal flush are released through entry.async_on_unload.
+  docs-configuration-parameters:
+    status: todo
+    comment: The options are described where they matter in the README (Rain credit, Notify target, Manual control), not yet in one consolidated reference table of every option.
+  docs-installation-parameters:
+    status: todo
+    comment: The setup fields (pump switch, rain, temperature and humidity sensors, the morning and evening cycles, notify target) are described in the README sections where they matter, not yet in one consolidated reference table.
+  entity-unavailable:
+    status: exempt
+    comment: Local calculated helper — there is no device or service connection to lose; the entities are projections of the in-process engine state.
+  integration-owner:
+    status: done
+    comment: manifest.json codeowners names the maintainer.
+  log-when-unavailable:
+    status: exempt
+    comment: Local calculated helper — there is no device or service connection that can become unavailable, so there is nothing to log once on loss and recovery.
+  parallel-updates:
+    status: done
+    comment: PARALLEL_UPDATES = 0 in sensor.py, binary_sensor.py and switch.py — the entities are push-only projections with no update calls to throttle.
+  reauthentication-flow:
+    status: exempt
+    comment: No credentials — the integration authenticates against nothing.
+  test-coverage:
+    status: done
+    comment: The HA-stable pytest leg in test.yml runs with --cov-fail-under=95 over custom_components/ha_irrigation_controller.
 
   # Gold
   repair-issues:

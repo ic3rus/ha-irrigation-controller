@@ -4,6 +4,7 @@
 [![Test](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/test.yml/badge.svg)](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/test.yml)
 [![Lint](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/lint.yml/badge.svg)](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/lint.yml)
 [![Card](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/card.yml/badge.svg)](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/card.yml)
+[![Release](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/release.yml/badge.svg)](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/release.yml)
 
 A Home Assistant custom integration for deterministic irrigation scheduling — a
 hass-free sequencer engine driving your valves, plus a bundled Lovelace timeline
@@ -25,6 +26,13 @@ older versions).
 > it under **Helpers** — it does *not* appear in the "Add integration" dialog.
 
 Only one controller can be configured (`single_config_entry`).
+
+**Updating.** HACS installs the **latest release** (a SemVer GitHub release,
+`vX.Y.Z`) — never whatever the `main` branch holds — and shows new releases as
+updates like any other repository. Integration and card are one payload, so
+updating is one action in HACS for both, followed by a Home Assistant restart.
+If the card then says it does not match the installed integration, see
+[Stale bundle](#stale-bundle).
 
 The built card ships inside `custom_components/`, so a HACS install delivers it
 in the same payload — no separate card install or download. The integration
@@ -172,6 +180,37 @@ lovelace:
       type: module
 ```
 
+Bump `?v=` to the new version after each upgrade (the version is in
+`custom_components/ha_irrigation_controller/manifest.json`). Neither mode stops
+the integration from starting — the bundle is served regardless, and a Home
+Assistant without Lovelace at all simply gets no resource (one debug-level
+line).
+
+### Stale bundle
+
+After an update, a browser — or the companion app, which caches the frontend
+aggressively — may keep running the **old card bundle** against the new
+integration. The card notices: every pushed document carries the integration's
+version and state-view schema (see [Handshake](#handshake)), and when either
+differs from the ones the bundle was built with, the card shows a one-line
+hint above the timeline — *"This card (0.1.0) does not match the installed
+integration (0.2.0). Reload the page — in the companion app, reset the
+frontend cache."* The hint never hides anything: the timeline, the history
+strip and the health banner keep rendering under it, since an older bundle
+usually still reads a newer document correctly.
+
+To clear it, reload the page (a hard refresh: Ctrl+Shift+R / Cmd+Shift+R). In
+the companion app, use **Settings → Companion app → Troubleshooting → Reset
+frontend cache**. In YAML resource mode also bump `?v=` as above. The hint
+disappears on the first document pushed to the fresh bundle.
+
+The reverse can happen too: right after a HACS update and **before the
+restart**, a hard refresh can already load the newer card against the
+integration that is still running. Reloading cannot fix that, so the hint then
+ends differently — *"This card (0.2.0) does not match the installed
+integration (0.1.0). Restart Home Assistant to finish the update."* Restart
+Home Assistant; the hint clears on the first document after the restart.
+
 ### Theming
 
 The card takes its colours from Home Assistant's theme variables, so it
@@ -218,12 +257,6 @@ themes:
 The card is checked in Home Assistant's default light and dark themes;
 `npm run visual` in `card/` (after `npm run build`, which it screenshots)
 renders both into `card/visual/out/`.
-
-Bump `v=` to the new version after each upgrade (the version is in
-`custom_components/ha_irrigation_controller/manifest.json`); browsers may keep
-the old bundle otherwise. Neither case stops the integration from starting —
-the bundle is served regardless, and a Home Assistant without Lovelace at all
-simply gets no resource (one debug-level line).
 
 ## Services
 
@@ -448,6 +481,24 @@ quoted is what counts, so rain that reaches the sensor late — including rain
 that fell before a cycle quoted during the gap — is credited to the *next*
 cycle in full. A watering that already happened is never undone or re-filed:
 its history record and the baselines it banked stand.
+
+### Calibrating the rain factor
+
+The default of **1 min/mm** is deliberately conservative: a 10 mm downpour
+takes only 10 minutes off an exposed zone. The factor accepts 0 to 10 min/mm
+per zone, set when the zone is added and changed by reconfiguring that zone
+on the controller helper. Calibrate it by observation across the season,
+not by calculation: after a rainy day, look at the exposed zones — if they are
+still wet when the next cycle waters them, raise their factor a step; if they
+dry out between rain and watering, lower it. Zones differ (soil, slope,
+canopy), so tune each on its own.
+
+Erring low is the safe side while tuning: too small a factor only over-waters a
+little after rain, which the garden tolerates — the same wet-leaning bias as
+[water debt](#water-debt). Too large a factor under-waters, and rain-reduced
+time is never booked as a deficit, so nothing makes it up later. Precision is
+not the goal; a factor that keeps wet zones from being watered after real rain
+is.
 
 `run_now` is rain-reduced like any other cycle: it runs the *current* effective
 durations. A run-now fired after rain that covers every zone completes at once
@@ -874,6 +925,20 @@ zone_id: 01J...
 open); `anomaly_cleared` fires when the engine confirms the subject healthy
 again, not when you acknowledge an issue by hand.
 
+## Removing the integration
+
+1. Go to **Settings → Devices & services → Helpers**, open **HA Irrigation
+   Controller** and delete it.
+2. The integration then deletes what it owns: its journal (the
+   `.storage/ha_irrigation_controller.journal` file — history, water debt, rain
+   baselines) and every Repairs issue it raised.
+3. The **dashboard resource is not removed**. Delete any timeline card from your
+   dashboards, then remove the `/ha_irrigation_controller/ha-irrigation-timeline-card.js`
+   entry under **Settings → Dashboards → ⋮ → Resources** (storage mode), or
+   from your `lovelace:` YAML (YAML mode).
+4. In HACS, open **HA Irrigation Controller** and choose **Remove**, then
+   restart Home Assistant.
+
 ## State view and WebSocket API
 
 Everything the integration knows about the controller — the plan, the running
@@ -932,9 +997,10 @@ The subscribe result is `{"schema_version": 1, "version": "<manifest version>"}`
 and the same two keys sit at the top of every document, next to
 `generated_at`, the UTC instant it was composed. `schema_version` is
 the document's schema (bumped when a key changes meaning or disappears —
-additions do not bump it); `version` is the integration release. A card that
-was built against another version can tell from these that its bundle is
-stale.
+additions do not bump it); `version` is the integration release. The bundled
+card compares both with the versions it was built with on every document and,
+when either differs, shows the [stale-bundle hint](#stale-bundle) above the
+timeline.
 
 ### The document
 
@@ -1055,6 +1121,27 @@ cd card && npm run build     # rebuild the committed card bundle
 > mistakes for a second integration and then crashes on. CI is unaffected — the
 > hassfest job checks out the repo without installing card dependencies.
 
+### Releasing
+
+HACS installs from GitHub releases, and a release is published by the
+**Release** workflow when a `vX.Y.Z` tag is pushed:
+
+1. On a branch, bump the version in all five places:
+   `custom_components/ha_irrigation_controller/manifest.json` (what HACS reads),
+   `pyproject.toml`, `card/package.json`, `CARD_VERSION` in
+   `card/src/editor.ts`, and the `?v=` in this README's YAML resource snippet
+   (`tests/test_manifest.py` fails on any drift).
+2. `cd card && npm run build`, and commit the rebuilt bundle with the bump.
+3. Merge the PR.
+4. On the merged `main`: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+The workflow checks that the tagged commit is on `main` and that the tag
+(without its `v`) equals `manifest.json` `version`, and fails without
+publishing when either does not hold — delete the tag, fix the bump or merge
+the PR, re-tag. On a match it publishes the release with notes generated from
+the merged pull requests. A tag without the leading `v` (`0.1.0`,
+`release-1`) does not trigger it at all.
+
 ### Layout
 
 ```text
@@ -1080,6 +1167,11 @@ gate), and the card build + vitest in headless Chromium. A nightly cron re-runs
 all four workflows to catch Home Assistant's monthly breakage early;
 `filterwarnings = ["error"]` means a `DeprecationWarning` fails the build while
 the removal is still months away.
+
+Pushing a `vX.Y.Z` tag runs the **Release** workflow, which verifies the tag
+against `manifest.json` and publishes the GitHub release HACS installs from
+(see [Releasing](#releasing)). The HA stable pytest leg also enforces a 95 %
+coverage floor.
 
 The HA beta leg is `continue-on-error`: it is an early-warning signal, not a
 merge gate. Dependency bumps arrive as grouped dependabot PRs — note that
