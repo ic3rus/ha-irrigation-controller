@@ -6,6 +6,11 @@
 [![Card](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/card.yml/badge.svg)](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/card.yml)
 [![Release](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/release.yml/badge.svg)](https://github.com/ic3rus/ha-irrigation-controller/actions/workflows/release.yml)
 
+<!-- Absolute URL: HACS renders this README outside GitHub, where a relative path would not resolve. -->
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ic3rus/ha-irrigation-controller/main/custom_components/ha_irrigation_controller/brand/icon@2x.png" alt="HA Irrigation Controller icon" width="256">
+</p>
+
 A Home Assistant custom integration for deterministic irrigation scheduling — a
 hass-free sequencer engine driving your valves, plus a bundled Lovelace timeline
 card (`ha-irrigation-timeline-card`) delivered in the same install.
@@ -217,7 +222,7 @@ resource yourself:
 lovelace:
   mode: yaml
   resources:
-    - url: /ha_irrigation_controller/ha-irrigation-timeline-card.js?v=0.1.1
+    - url: /ha_irrigation_controller/ha-irrigation-timeline-card.js?v=0.1.2
       type: module
 ```
 

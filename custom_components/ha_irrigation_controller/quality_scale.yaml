@@ -7,8 +7,8 @@ rules:
     status: exempt
     comment: iot_class is calculated — the integration does not poll.
   brands:
-    status: todo
-    comment: Follow-up is an external submission to home-assistant/brands under custom_integrations/ha_irrigation_controller (icon and logo); until it lands, validate.yml keeps ignoring brands in the HACS action.
+    status: done
+    comment: brand/icon.png (256 px) and brand/icon@2x.png (512 px) ship inside the integration; HA 2026.3+ serves them ahead of the brands CDN, so no home-assistant/brands submission is needed.
   common-modules:
     status: done
     comment: The shared entity bases live in entities/entity.py (controller and zone bases, device info, unique ids, the dispatcher subscription). There is no coordinator by design — the engine pushes its state over the dispatcher signal rather than being polled.
