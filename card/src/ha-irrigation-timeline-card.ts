@@ -35,6 +35,7 @@ import {
 } from "./history";
 import type { RowStatus, SegmentStatus, TimelineRow } from "./timeline";
 import { buildTimeline, cursorAt, progressOf } from "./timeline";
+import { isStale, staleHint } from "./handshake";
 import type { CycleKind, Handshake, HistoryRow, StateView } from "./types";
 import type { UnsubscribeState } from "./ws";
 import { asWsError, ERR_NOT_FOUND, ERR_NOT_LOADED, fetchState, subscribeState } from "./ws";
@@ -81,6 +82,14 @@ export const HISTORY_ROW_PX = 28;
  */
 export const ANOMALY_HEADER_PX = 68;
 export const ANOMALY_ROW_PX = 24;
+
+/**
+ * The stale-bundle hint's pixel budget (Story 4.7): one `.message` of up to
+ * three wrapped lines (~20 each — the ~150-character schema variant wraps to
+ * three in a narrow one-column card) plus its 8 px padding top and bottom,
+ * rounded. Zero while the bundle matches the pushed document.
+ */
+export const STALE_HINT_PX = 76;
 
 /**
  * The word a row's header carries once its run has reached a terminal
@@ -228,7 +237,10 @@ export class HaIrrigationTimelineCard extends LitElement {
     this._ensureSubscribed();
   }
 
-  /** The stale-bundle handshake as last pushed; stored for Story 4.7, unused here. */
+  /**
+   * The stale-bundle handshake as last pushed. Kept for tests and
+   * diagnostics; the hint itself derives from `_view` (Story 4.7).
+   */
   public get handshake(): Handshake | undefined {
     return this._handshake;
   }
@@ -310,6 +322,7 @@ export class HaIrrigationTimelineCard extends LitElement {
     const config = this._config;
     return (
       (headerShown(config, model) ? 1 : 0) +
+      Math.ceil(stalePx(model.view) / 50) +
       (showHealth(config) ? Math.ceil(anomalyPx(model.health) / 50) : 0) +
       model.rows.reduce(
         (total, row) => total + 1 + Math.ceil((Math.max(1, row.segments.length) * LANE_HEIGHT) / 50),
@@ -328,7 +341,8 @@ export class HaIrrigationTimelineCard extends LitElement {
       rows.reduce((total, row) => total + 40 + Math.max(1, row.segments.length) * LANE_HEIGHT, 0) +
       (model === undefined
         ? 0
-        : (showHealth(config) ? anomalyPx(model.health) : 0) +
+        : stalePx(model.view) +
+          (showHealth(config) ? anomalyPx(model.health) : 0) +
           (showHistory(config) ? historyPx(model.history) : 0));
     return {
       rows: Math.max(2, Math.ceil(px / GRID_ROW_PX)),
@@ -458,8 +472,12 @@ export class HaIrrigationTimelineCard extends LitElement {
     // The banner first — it is what the card exists to make unmissable —
     // then today's rows, then the strip, which is independent of today's
     // plan: a day without a cycle still has a week behind it. A section
-    // switched off in the config is not rendered at all.
+    // switched off in the config is not rendered at all. Above everything,
+    // the stale-bundle hint (Story 4.7) when this bundle does not match the
+    // pushed document — display-only: the document renders under it.
+    const view = model.view;
     return html`
+      ${isStale(view) ? html`<p class="message stale" role="status">${staleHint(view)}</p>` : nothing}
       ${showHealth(this._config) ? this._renderAnomalies(model.health) : nothing}
       ${model.rows.length === 0
         ? html`<p class="message">No cycle is planned today.</p>`
@@ -1043,6 +1061,13 @@ export class HaIrrigationTimelineCard extends LitElement {
       .message.error {
         color: var(--hic-error-color, var(--error-color, #db4437));
       }
+      .message.stale {
+        /* Warning orange is ~2:1 on a light card: border only, theme text colour. */
+        color: var(--primary-text-color);
+        border-left: 3px solid var(--hic-warning-color, var(--warning-color, #ffa600));
+        padding-left: 8px;
+        text-align: left;
+      }
       .cycle + .cycle {
         margin-top: 16px;
       }
@@ -1256,6 +1281,11 @@ export class HaIrrigationTimelineCard extends LitElement {
 /** The anomaly banner's pixel height for the sizing hints: 0 when nominal. */
 function anomalyPx(health: HealthModel): number {
   return health.state === "nominal" ? 0 : ANOMALY_HEADER_PX + health.items.length * ANOMALY_ROW_PX;
+}
+
+/** The stale-bundle hint's pixel height for the sizing hints: 0 when the bundle matches. */
+function stalePx(view: StateView): number {
+  return isStale(view) ? STALE_HINT_PX : 0;
 }
 
 /** The history strip's pixel height for the sizing hints: its header plus one line per kind row. */

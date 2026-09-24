@@ -9,6 +9,7 @@
  * evening cycle at 20:00 local is 18:00Z.
  */
 
+import { CARD_VERSION } from "./editor";
 import type {
   CycleKind,
   HealthView,
@@ -196,7 +197,7 @@ export function stateView(options: ViewOptions = {}): StateView {
   const cycles = options.cycles ?? (morningEnabled ? [MORNING, EVENING] : [EVENING]);
   return {
     schema_version: 1,
-    version: "0.1.0",
+    version: CARD_VERSION,
     generated_at: options.generatedAt ?? "2026-09-23T04:00:00+00:00",
     controller: {
       entry_id: "entry-1",
