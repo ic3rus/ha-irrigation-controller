@@ -13,9 +13,9 @@
     "websocket_api"
   ],
   "documentation": "https://github.com/ic3rus/ha-irrigation-controller",
-  "integration_type": "helper",
+  "integration_type": "hub",
   "iot_class": "calculated",
   "issue_tracker": "https://github.com/ic3rus/ha-irrigation-controller/issues",
   "single_config_entry": true,
-  "version": "0.1.0"
+  "version": "0.1.1"
 }

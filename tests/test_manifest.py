@@ -87,7 +87,7 @@ def test_manifest_declares_the_keys_ac2_requires() -> None:
 
     assert manifest["domain"] == DOMAIN
     assert manifest["iot_class"] == "calculated"
-    assert manifest["integration_type"] == "helper"
+    assert manifest["integration_type"] == "hub"
     assert manifest["config_flow"] is True
     # Custom integrations must carry a version; HACS validation needs both URLs.
     assert manifest["version"]
@@ -120,7 +120,7 @@ def test_min_ha_version_is_consistent_across_the_repo() -> None:
 
 
 def test_version_is_consistent_across_the_repo() -> None:
-    """The four places the release version is written agree with each other."""
+    """Every place the release version is written agrees with the manifest."""
     manifest_version = _load_json(INTEGRATION_DIR / "manifest.json")["version"]
 
     pyproject = tomllib.loads(
@@ -150,6 +150,15 @@ def test_version_is_consistent_across_the_repo() -> None:
     assert all(version == manifest_version for version in resource_versions), (
         resource_versions
     )
+
+    # The visual harness pushes a state view; a stale version there makes every
+    # screenshot render the stale-bundle hint.
+    harness = (REPO_ROOT / "card" / "visual" / "harness.html").read_text(
+        encoding="utf-8"
+    )
+    harness_version = re.search(r'\bversion:\s*"([^"]+)"', harness)
+    assert harness_version is not None, "no version in card/visual/harness.html"
+    assert harness_version.group(1) == manifest_version
 
 
 def test_state_schema_version_is_shared_by_engine_and_card() -> None:

@@ -19,11 +19,8 @@ older versions).
 2. Add `https://github.com/ic3rus/ha-irrigation-controller` with category
    **Integration**.
 3. Install **HA Irrigation Controller**, then restart Home Assistant.
-4. Go to **Settings → Devices & services → Helpers** and choose
-   **Create helper → HA Irrigation Controller**.
-
-> This integration declares `integration_type: helper`, so Home Assistant lists
-> it under **Helpers** — it does *not* appear in the "Add integration" dialog.
+4. Go to **Settings → Devices & services → Integrations**, press
+   **Add integration** and search for **HA Irrigation Controller**.
 
 Only one controller can be configured (`single_config_entry`).
 
@@ -33,6 +30,10 @@ updates like any other repository. Integration and card are one payload, so
 updating is one action in HACS for both, followed by a Home Assistant restart.
 If the card then says it does not match the installed integration, see
 [Stale bundle](#stale-bundle).
+
+Up to 0.1.0 the controller was listed under **Helpers**; from 0.1.1 it is
+listed under **Integrations**. The existing entry moves on its own — zones,
+entities and history are kept, and there is nothing to reconfigure.
 
 The built card ships inside `custom_components/`, so a HACS install delivers it
 in the same payload — no separate card install or download. The integration
@@ -216,7 +217,7 @@ resource yourself:
 lovelace:
   mode: yaml
   resources:
-    - url: /ha_irrigation_controller/ha-irrigation-timeline-card.js?v=0.1.0
+    - url: /ha_irrigation_controller/ha-irrigation-timeline-card.js?v=0.1.1
       type: module
 ```
 
@@ -527,7 +528,7 @@ its history record and the baselines it banked stand.
 The default of **1 min/mm** is deliberately conservative: a 10 mm downpour
 takes only 10 minutes off an exposed zone. The factor accepts 0 to 10 min/mm
 per zone, set when the zone is added and changed by reconfiguring that zone
-on the controller helper. Calibrate it by observation across the season,
+on the controller entry. Calibrate it by observation across the season,
 not by calculation: after a rainy day, look at the exposed zones — if they are
 still wet when the next cycle waters them, raise their factor a step; if they
 dry out between rain and watering, lower it. Zones differ (soil, slope,
@@ -967,7 +968,7 @@ again, not when you acknowledge an issue by hand.
 
 ## Removing the integration
 
-1. Go to **Settings → Devices & services → Helpers**, open **HA Irrigation
+1. Go to **Settings → Devices & services → Integrations**, open **HA Irrigation
    Controller** and delete it.
 2. The integration then deletes what it owns: its journal (the
    `.storage/ha_irrigation_controller.journal` file — history, water debt, rain
@@ -1166,10 +1167,11 @@ cd card && npm run build     # rebuild the committed card bundle
 HACS installs from GitHub releases, and a release is published by the
 **Release** workflow when a `vX.Y.Z` tag is pushed:
 
-1. On a branch, bump the version in all five places:
+1. On a branch, bump the version in all six places:
    `custom_components/ha_irrigation_controller/manifest.json` (what HACS reads),
    `pyproject.toml`, `card/package.json`, `CARD_VERSION` in
-   `card/src/editor.ts`, and the `?v=` in this README's YAML resource snippet
+   `card/src/editor.ts`, the `version` of the state view in
+   `card/visual/harness.html`, and the `?v=` in this README's YAML resource snippet
    (`tests/test_manifest.py` fails on any drift).
 2. `cd card && npm run build`, and commit the rebuilt bundle with the bump.
 3. Merge the PR.
