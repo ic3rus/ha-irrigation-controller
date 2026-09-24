@@ -2,9 +2,9 @@ name: Release
 
 # A SemVer tag (vX.Y.Z) pushed to a commit on main publishes the GitHub
 # release HACS installs from. HACS reads manifest.json `version`; the tag is
-# the release name, so the one check here is tag == manifest. The other four
+# the release name, so the one check here is tag == manifest. The other five
 # copies of the version (pyproject.toml, card/package.json, CARD_VERSION, the
-# README `?v=`) are tied to the manifest by tests/test_manifest.py on every PR.
+# visual harness, the README `?v=`) are tied to the manifest by tests/test_manifest.py on every PR.
 on:
   push:
     tags: ["v[0-9]*"]

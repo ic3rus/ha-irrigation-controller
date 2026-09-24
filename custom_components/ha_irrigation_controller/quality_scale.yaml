@@ -27,7 +27,7 @@ rules:
     status: done
   docs-removal-instructions:
     status: done
-    comment: README "Removing the integration" — delete the helper, what async_remove_entry deletes (the journal .storage file, every Repairs issue) and does not (the dashboard resource), then remove the repository in HACS and restart.
+    comment: README "Removing the integration" — delete the entry, what async_remove_entry deletes (the journal .storage file, every Repairs issue) and does not (the dashboard resource), then remove the repository in HACS and restart.
   entity-event-setup:
     status: done
     comment: The sensor projections subscribe to the engine-state dispatcher signal in async_added_to_hass and release it through async_on_remove; no subscription exists outside that pair.
@@ -40,7 +40,7 @@ rules:
   runtime-data: done
   test-before-configure:
     status: exempt
-    comment: No device/service connection to test — local calculated helper.
+    comment: No device/service connection to test — local calculated integration.
   test-before-setup: done
   unique-config-entry: done
 
@@ -60,13 +60,13 @@ rules:
     comment: The setup fields (pump switch, rain, temperature and humidity sensors, the morning and evening cycles, notify target) are described in the README sections where they matter, not yet in one consolidated reference table.
   entity-unavailable:
     status: exempt
-    comment: Local calculated helper — there is no device or service connection to lose; the entities are projections of the in-process engine state.
+    comment: Local calculated integration — there is no device or service connection to lose; the entities are projections of the in-process engine state.
   integration-owner:
     status: done
     comment: manifest.json codeowners names the maintainer.
   log-when-unavailable:
     status: exempt
-    comment: Local calculated helper — there is no device or service connection that can become unavailable, so there is nothing to log once on loss and recovery.
+    comment: Local calculated integration — there is no device or service connection that can become unavailable, so there is nothing to log once on loss and recovery.
   parallel-updates:
     status: done
     comment: PARALLEL_UPDATES = 0 in sensor.py, binary_sensor.py and switch.py — the entities are push-only projections with no update calls to throttle.
