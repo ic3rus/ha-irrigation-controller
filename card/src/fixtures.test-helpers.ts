@@ -9,7 +9,16 @@
  * evening cycle at 20:00 local is 18:00Z.
  */
 
-import type { CycleKind, HistoryRow, Outcome, RunView, ScheduleView, StateView, ZoneRunView } from "./types";
+import type {
+  CycleKind,
+  HealthView,
+  HistoryRow,
+  Outcome,
+  RunView,
+  ScheduleView,
+  StateView,
+  ZoneRunView,
+} from "./types";
 
 export const TIME_ZONE = "Europe/Paris";
 export const IRRIGATION_DAY = "2026-09-23";
@@ -168,6 +177,18 @@ export interface ViewOptions {
   history?: HistoryRow[];
   /** `plan.today.irrigation_day`; defaults to `IRRIGATION_DAY`. */
   irrigationDay?: string;
+  /** `health` on the wire: the open Repairs-mirrored anomalies; defaults to none open. */
+  health?: HealthView;
+}
+
+/**
+ * One entry of `health.open` as `state_view.health_view` shapes it: the
+ * kind plus the subject keys (`zone_id`, `entity_id` or `role`) and nothing
+ * else. `kind` is untyped on purpose so a test can push a kind this bundle
+ * does not know.
+ */
+export function anomaly(kind: string, subject: Record<string, unknown> = {}): Record<string, unknown> {
+  return { anomaly: kind, ...subject };
 }
 
 export function stateView(options: ViewOptions = {}): StateView {
@@ -222,6 +243,6 @@ export function stateView(options: ViewOptions = {}): StateView {
       zones: { z1: { deficit_s: 0, rain_baseline_mm: null }, z2: { deficit_s: 0, rain_baseline_mm: null } },
     },
     history: options.history ?? [],
-    health: { open: [], last: null },
+    health: options.health ?? { open: [], last: null },
   };
 }

@@ -1,0 +1,368 @@
+<!doctype html>
+<!--
+  Visual harness for the timeline card (Story 4.5) — a dev tool, not a test.
+
+  Loads the COMMITTED bundle (run `npm run build` first), stubs the two HA
+  elements the card slots into (`ha-card`, `ha-icon`), and renders four
+  scenarios twice: once under Home Assistant's default LIGHT theme variables
+  and once under its default DARK ones. `npm run visual` screenshots every
+  [data-theme] [data-scenario] block into visual/out/ (gitignored); the
+  pictures are the evidence behind "polished in both themes".
+
+  Opening this file by hand: Chromium refuses module scripts from file://
+  by default (CORS on an opaque origin) — pass --allow-file-access-from-files,
+  as snapshot.mjs does, or serve the repository root over HTTP.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>ha-irrigation-timeline-card — visual harness</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        font-family: Roboto, system-ui, sans-serif;
+      }
+      body {
+        display: grid;
+        grid-template-columns: repeat(2, max-content);
+        justify-content: start;
+        gap: 0;
+      }
+      [data-theme] {
+        padding: 24px;
+        background: var(--primary-background-color);
+        color: var(--primary-text-color);
+      }
+      [data-theme] h2 {
+        margin: 0 0 16px;
+        font-size: 14px;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--secondary-text-color);
+      }
+      [data-scenario] {
+        width: 480px;
+        padding: 8px;
+        box-sizing: border-box;
+        background: var(--primary-background-color);
+      }
+      [data-scenario] + [data-scenario] {
+        margin-top: 16px;
+      }
+
+      /* Home Assistant's default theme variables (frontend `ha-style` defaults). */
+      [data-theme="light"] {
+        --primary-color: #03a9f4;
+        --accent-color: #ff9800;
+        --primary-background-color: #fafafa;
+        --card-background-color: #ffffff;
+        --primary-text-color: #212121;
+        --secondary-text-color: #727272;
+        --disabled-text-color: #bdbdbd;
+        --divider-color: rgba(0, 0, 0, 0.12);
+        --error-color: #db4437;
+        --warning-color: #ffa600;
+        --success-color: #43a047;
+        --info-color: #039be5;
+        --ha-card-border-radius: 12px;
+        --ha-card-box-shadow: 0 2px 2px 0 rgba(0, 0, 0, 0.14), 0 1px 5px 0 rgba(0, 0, 0, 0.12),
+          0 3px 1px -2px rgba(0, 0, 0, 0.2);
+        color-scheme: light;
+      }
+      /* Home Assistant's built-in "Dark" theme. */
+      [data-theme="dark"] {
+        --primary-color: #03a9f4;
+        --accent-color: #ff9800;
+        --primary-background-color: #111111;
+        --card-background-color: #1c1c1c;
+        --primary-text-color: #e1e1e1;
+        --secondary-text-color: #9b9b9b;
+        --disabled-text-color: #6f6f6f;
+        --divider-color: rgba(225, 225, 225, 0.12);
+        --error-color: #db4437;
+        --warning-color: #ffa600;
+        --success-color: #43a047;
+        --info-color: #039be5;
+        --ha-card-border-radius: 12px;
+        --ha-card-box-shadow: none;
+        --ha-card-border-color: rgba(225, 225, 225, 0.12);
+        color-scheme: dark;
+      }
+    </style>
+  </head>
+  <body>
+    <script>
+      // --- ha-card stub: the slot and the slotted-header typography the real one applies.
+      class HaCardStub extends HTMLElement {
+        constructor() {
+          super();
+          this.attachShadow({ mode: "open" }).innerHTML = `
+            <style>
+              :host {
+                display: block;
+                position: relative;
+                background: var(--ha-card-background, var(--card-background-color, #fff));
+                border-radius: var(--ha-card-border-radius, 12px);
+                border: 1px solid var(--ha-card-border-color, transparent);
+                box-shadow: var(--ha-card-box-shadow, none);
+                color: var(--primary-text-color);
+                box-sizing: border-box;
+              }
+              h1.card-header, ::slotted(.card-header) {
+                color: var(--ha-card-header-color, var(--primary-text-color));
+                font-family: var(--ha-card-header-font-family, inherit);
+                font-size: var(--ha-card-header-font-size, 24px);
+                letter-spacing: -0.012em;
+                line-height: 48px;
+                padding: 12px 16px 16px;
+                display: block;
+                margin-block: 0;
+                font-weight: 400;
+              }
+            </style>
+            <h1 class="card-header" hidden></h1>
+            <slot></slot>`;
+        }
+        set header(value) {
+          const h1 = this.shadowRoot.querySelector("h1");
+          h1.textContent = value ?? "";
+          h1.hidden = !value;
+        }
+        get header() {
+          const h1 = this.shadowRoot.querySelector("h1");
+          return h1.hidden ? undefined : h1.textContent;
+        }
+      }
+      customElements.define("ha-card", HaCardStub);
+
+      // --- ha-icon stub: one filled circle in currentColor, sized by --mdc-icon-size.
+      class HaIconStub extends HTMLElement {
+        static get observedAttributes() {
+          return ["icon"];
+        }
+        constructor() {
+          super();
+          this.attachShadow({ mode: "open" }).innerHTML = `
+            <style>
+              :host { display: inline-flex; align-items: center; justify-content: center;
+                      width: var(--mdc-icon-size, 24px); height: var(--mdc-icon-size, 24px); }
+              svg { width: 100%; height: 100%; fill: currentColor; }
+            </style>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle></svg>`;
+        }
+        attributeChangedCallback(_name, _old, value) {
+          this.title = value ?? "";
+        }
+      }
+      customElements.define("ha-icon", HaIconStub);
+    </script>
+
+    <script type="module">
+      import "../../custom_components/ha_irrigation_controller/frontend/ha-irrigation-timeline-card.js";
+
+      // ------------------------------------------------------------ fixtures
+      // The same golden day the vitest fixtures use: 2026-09-23 in Europe/Paris,
+      // morning at 05:00Z (07:00 local), evening at 18:00Z (20:00 local).
+      const ZONES = [
+        { zone_id: "z1", name: "Front lawn", valve_entity_id: "switch.lawn", morning_duration_s: 600, evening_duration_s: 1200, rain_exposed: true, rain_factor: 1 },
+        { zone_id: "z2", name: "Beds", valve_entity_id: "switch.beds", morning_duration_s: 900, evening_duration_s: 900, rain_exposed: true, rain_factor: 0.5 },
+        { zone_id: "z3", name: "Orchard drip", valve_entity_id: "switch.orchard", morning_duration_s: 300, evening_duration_s: 600, rain_exposed: false, rain_factor: 0 },
+      ];
+      const MORNING = {
+        kind: "morning",
+        start: "2026-09-23T05:00:00+00:00",
+        end: "2026-09-23T05:30:00+00:00",
+        zones: [
+          { zone_id: "z1", start: "2026-09-23T05:00:00+00:00", end: "2026-09-23T05:10:00+00:00" },
+          { zone_id: "z2", start: "2026-09-23T05:10:00+00:00", end: "2026-09-23T05:25:00+00:00" },
+          { zone_id: "z3", start: "2026-09-23T05:25:00+00:00", end: "2026-09-23T05:30:00+00:00" },
+        ],
+      };
+      const EVENING = {
+        kind: "evening",
+        start: "2026-09-23T18:00:00+00:00",
+        end: "2026-09-23T18:45:00+00:00",
+        zones: [
+          { zone_id: "z1", start: "2026-09-23T18:00:00+00:00", end: "2026-09-23T18:20:00+00:00" },
+          { zone_id: "z2", start: "2026-09-23T18:20:00+00:00", end: "2026-09-23T18:35:00+00:00" },
+          { zone_id: "z3", start: "2026-09-23T18:35:00+00:00", end: "2026-09-23T18:45:00+00:00" },
+        ],
+      };
+
+      function zoneRun(zone, status, start, end, extra = {}) {
+        const duration = (Date.parse(end) - Date.parse(start)) / 1000;
+        return {
+          zone_id: zone.zone_id,
+          name: zone.name,
+          valve_entity_id: zone.valve_entity_id,
+          status,
+          planned_start: start,
+          planned_end: end,
+          duration_s: duration,
+          base_s: duration,
+          carried_s: 0,
+          rain_credit_s: 0,
+          actual_start: null,
+          actual_end: null,
+          effective_s: 0,
+          ...extra,
+        };
+      }
+
+      function eveningRun(status, zones, liveZoneId) {
+        return {
+          cycle_id: "2026-09-23-evening",
+          kind: "evening",
+          status,
+          manual: false,
+          late_rerun: false,
+          recovery: null,
+          configured_start: "2026-09-23T18:00:00+00:00",
+          scheduled_start: "2026-09-23T18:00:00+00:00",
+          pump_entity_id: "switch.pump",
+          rain_total_mm: 2.5,
+          live_zone_id: liveZoneId,
+          zones,
+        };
+      }
+
+      function row(day, kind, outcome, extra = {}) {
+        return {
+          irrigation_day: day,
+          kind,
+          outcome,
+          cycle_id: `${day}-${kind}`,
+          status: "completed",
+          manual: false,
+          waived_by: null,
+          recovery: null,
+          late_rerun: false,
+          runs: 1,
+          ended_at: null,
+          rain_total_mm: null,
+          planned_s: 2700,
+          carried_s: 0,
+          effective_s: 2700,
+          rain_credit_s: 0,
+          ...extra,
+        };
+      }
+
+      const WEEK = ["2026-09-17", "2026-09-18", "2026-09-19", "2026-09-20", "2026-09-21", "2026-09-22", "2026-09-23"];
+      const goodWeek = WEEK.slice(0, 6).flatMap((day) => [row(day, "morning", "ran"), row(day, "evening", "ran")]);
+      goodWeek[3] = row("2026-09-18", "evening", "reduced", { rain_total_mm: 4.2, effective_s: 1500 });
+      goodWeek[7] = row("2026-09-20", "evening", "waived", { status: "waived", waived_by: "run_now", effective_s: 0 });
+      const badWeek = [...goodWeek];
+      badWeek[5] = row("2026-09-19", "evening", "missed", { status: "missed", runs: 0, effective_s: 0 });
+      badWeek[8] = row("2026-09-21", "morning", "recovered", { recovery: "late_rerun", late_rerun: true });
+
+      function document_(generatedAt, { current = null, last = null, history = [], health = { open: [], last: null } }) {
+        return {
+          schema_version: 1,
+          version: "0.1.0",
+          generated_at: generatedAt,
+          controller: { entry_id: "entry-1", season_enabled: true, reconciled: true, manual_override: false, config_change_pending: false, deferred: [], next_wakeup: null },
+          plan: {
+            pump_entity_id: "switch.pump",
+            morning_enabled: true,
+            morning_start: "07:00:00",
+            evening_start: "20:00:00",
+            manual_timeout_s: 1800,
+            zones: ZONES,
+            today: { irrigation_day: "2026-09-23", cycles: [MORNING, EVENING] },
+          },
+          runs: { current, last },
+          ledger: { settled_cycle_id: null, day_credit: null, rain_source: null, zones: {} },
+          history: [...history, row("2026-09-23", "morning", "ran")],
+          health,
+        };
+      }
+
+      const SCENARIOS = {
+        // Midday, nothing running, a good week behind: the calm card.
+        idle: document_("2026-09-23T12:00:00+00:00", { history: goodWeek }),
+        // 18:05Z: the evening run five minutes in, Front lawn a quarter through.
+        running: document_("2026-09-23T18:05:00+00:00", {
+          current: eveningRun(
+            "running",
+            [
+              zoneRun(ZONES[0], "running", "2026-09-23T18:00:00+00:00", "2026-09-23T18:20:00+00:00", { actual_start: "2026-09-23T18:00:02+00:00" }),
+              zoneRun(ZONES[1], "pending", "2026-09-23T18:20:00+00:00", "2026-09-23T18:30:00+00:00", { base_s: 900, rain_credit_s: 300 }),
+              zoneRun(ZONES[2], "pending", "2026-09-23T18:30:00+00:00", "2026-09-23T18:40:00+00:00"),
+            ],
+            "z1",
+          ),
+          history: goodWeek,
+        }),
+        // The evening run finished with a failed valve; two anomalies open; a week with a missed day.
+        anomalies: document_("2026-09-23T19:00:00+00:00", {
+          last: eveningRun(
+            "completed",
+            [
+              zoneRun(ZONES[0], "failed", "2026-09-23T18:00:00+00:00", "2026-09-23T18:20:00+00:00"),
+              zoneRun(ZONES[1], "completed", "2026-09-23T18:20:00+00:00", "2026-09-23T18:35:00+00:00", { actual_start: "2026-09-23T18:20:00+00:00", actual_end: "2026-09-23T18:35:00+00:00", effective_s: 900 }),
+              zoneRun(ZONES[2], "skipped", "2026-09-23T18:35:00+00:00", "2026-09-23T18:35:00+00:00", { rain_credit_s: 600 }),
+            ],
+            null,
+          ),
+          history: badWeek,
+          health: {
+            open: [
+              { anomaly: "valve_open_unconfirmed", zone_id: "z1" },
+              { anomaly: "missed_cycle" },
+            ],
+            last: { anomaly: "missed_cycle", cycle_id: "2026-09-19-evening", kind: "evening" },
+          },
+        }),
+        // A fresh install: today's plan, nothing in the strip yet.
+        empty: { ...document_("2026-09-23T12:00:00+00:00", {}), history: [] },
+      };
+
+      // --------------------------------------------------------- fake hass
+      function fakeHass(view) {
+        return {
+          connection: {
+            subscribeMessage(callback) {
+              // Deliver on a microtask, as a socket would: the card is subscribed first.
+              Promise.resolve().then(() => callback(view));
+              return Promise.resolve(() => Promise.resolve());
+            },
+            addEventListener() {},
+            removeEventListener() {},
+          },
+          callWS: () => Promise.reject({ code: "unavailable", message: "harness" }),
+          locale: { language: "en", number_format: "language", time_format: "24" },
+          config: { time_zone: "Europe/Paris" },
+          states: {},
+        };
+      }
+
+      // ------------------------------------------------------------ mount
+      const TITLES = { idle: "Idle, all is well", running: "Evening cycle running", anomalies: "Two open anomalies", empty: "Fresh install, empty history" };
+      for (const theme of ["light", "dark"]) {
+        const wrapper = document.createElement("div");
+        wrapper.dataset.theme = theme;
+        wrapper.innerHTML = `<h2>${theme} theme</h2>`;
+        for (const [name, view] of Object.entries(SCENARIOS)) {
+          const block = document.createElement("div");
+          block.dataset.scenario = name;
+          const card = document.createElement("ha-irrigation-timeline-card");
+          card.setConfig({ type: "custom:ha-irrigation-timeline-card", title: TITLES[name] });
+          block.append(card);
+          wrapper.append(block);
+          card.hass = fakeHass(view);
+        }
+        document.body.append(wrapper);
+      }
+
+      // Signal snapshot.mjs once every card has drawn its document.
+      const cards = [...document.querySelectorAll("ha-irrigation-timeline-card")];
+      await Promise.all(cards.map((card) => card.updateComplete));
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      await Promise.all(cards.map((card) => card.updateComplete));
+      document.body.dataset.ready = String(cards.every((card) => card.shadowRoot.querySelector("section.cycle") !== null));
+    </script>
+  </body>
+</html>

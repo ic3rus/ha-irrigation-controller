@@ -2,8 +2,9 @@ import type { HomeAssistant } from "custom-card-helpers";
 import { formatTime } from "custom-card-helpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { FAST_TICK_MS, SLOW_TICK_MS } from "./clock";
+import { FAST_TICK_MS, SLOW_TICK_MS, TRANSITION_MS } from "./clock";
 import {
+  anomaly,
   completedEveningRun,
   EVENING,
   eveningRun,
@@ -17,6 +18,8 @@ import {
   zoneRun,
 } from "./fixtures.test-helpers";
 import {
+  ANOMALY_HEADER_PX,
+  ANOMALY_ROW_PX,
   HaIrrigationTimelineCard,
   HISTORY_HEADER_PX,
   HISTORY_ROW_PX,
@@ -24,16 +27,18 @@ import {
   LANE_HEIGHT,
   RETRY_DELAY_MS,
 } from "./ha-irrigation-timeline-card";
+import * as health from "./health";
 import * as history from "./history";
 import * as timeline from "./timeline";
-import type { CycleKind, Outcome, StateView } from "./types";
+import type { CycleKind, HealthView, Outcome, StateView } from "./types";
 import { WS_TYPE_STATE_GET, WS_TYPE_STATE_SUBSCRIBE } from "./ws";
 
-// The real geometry and history logic, wrapped in spies: the memo tests
-// below count the calls the card makes into them (ESM exports cannot be
-// spied on after the fact).
+// The real geometry, history and health logic, wrapped in spies: the memo
+// tests below count the calls the card makes into them (ESM exports cannot
+// be spied on after the fact).
 vi.mock("./timeline", { spy: true });
 vi.mock("./history", { spy: true });
+vi.mock("./health", { spy: true });
 
 const CARD_TYPE = "ha-irrigation-timeline-card";
 
@@ -220,6 +225,39 @@ function iconOf(el: Element): string | null {
   return el.querySelector("ha-icon")?.getAttribute("icon") ?? null;
 }
 
+function text(el: Element | null | undefined): string {
+  return el?.textContent?.replace(/\s+/g, " ").trim() ?? "";
+}
+
+function title(card: HaIrrigationTimelineCard): string {
+  return text(card.shadowRoot?.querySelector(".card-header .title"));
+}
+
+function chip(card: HaIrrigationTimelineCard): HTMLElement | null {
+  const found = card.shadowRoot?.querySelector(".card-header .health");
+  return found instanceof HTMLElement ? found : null;
+}
+
+function banner(card: HaIrrigationTimelineCard): HTMLElement | null {
+  const found = card.shadowRoot?.querySelector(".content .anomalies");
+  return found instanceof HTMLElement ? found : null;
+}
+
+function open(...items: Array<Record<string, unknown>>): HealthView {
+  return { open: items, last: null };
+}
+
+function labelOf(card: HaIrrigationTimelineCard, zoneId: string): HTMLElement {
+  const index = [...evening(card).querySelectorAll("rect.segment")].findIndex(
+    (rect) => rect.getAttribute("data-zone") === zoneId,
+  );
+  const li = evening(card).querySelectorAll("li.label")[index];
+  if (!(li instanceof HTMLElement)) {
+    throw new Error(`no label for ${zoneId}`);
+  }
+  return li;
+}
+
 /**
  * Fake timers with the browser clock parked at `iso` (UTC), so
  * `Date.now()` and every interval are under the test's control.
@@ -267,14 +305,18 @@ describe("ha-irrigation-timeline-card", () => {
     expect(card.shadowRoot?.querySelector("ha-card")).toBeNull();
   });
 
-  it("renders inside ha-card once configured and says it is connecting", async () => {
+  it("renders inside ha-card once configured, with its own header, and says it is connecting", async () => {
     const card = createCard();
     card.setConfig({ type: CARD_TYPE, title: "Garden" });
     await card.updateComplete;
 
     const haCard = card.shadowRoot?.querySelector("ha-card");
     expect(haCard).not.toBeNull();
-    expect((haCard as (HTMLElement & { header?: string }) | null)?.header).toBe("Garden");
+    // The title is a slotted .card-header (ha-card's own header typography),
+    // not ha-card's `header` string, so the chip can sit beside it.
+    expect((haCard as (HTMLElement & { header?: string }) | null)?.header).toBeUndefined();
+    expect(haCard?.querySelector(":scope > .card-header")).not.toBeNull();
+    expect(title(card)).toBe("Garden");
     expect(card.shadowRoot?.textContent).toContain("Connecting");
   });
 
@@ -283,8 +325,7 @@ describe("ha-irrigation-timeline-card", () => {
     card.setConfig({ type: CARD_TYPE });
     await card.updateComplete;
 
-    const haCard = card.shadowRoot?.querySelector("ha-card");
-    expect((haCard as (HTMLElement & { header?: string }) | null)?.header).toBe("Irrigation");
+    expect(title(card)).toBe("Irrigation");
   });
 
   it("throws on an invalid configuration instead of rendering blank", () => {
@@ -845,6 +886,375 @@ describe("ha-irrigation-timeline-card", () => {
     expect(render).toHaveBeenCalledTimes(2);
     expect(build).toHaveBeenCalledTimes(2);
     expect(build.mock.results[1]?.value).not.toBe(model);
+  });
+
+  // ---------------------------------------------------------------- health
+
+  it("shows a quiet nominal chip in the header and no banner when nothing is open", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(stateView());
+    await card.updateComplete;
+
+    const el = chip(card);
+    expect(el).not.toBeNull();
+    expect(el?.getAttribute("data-state")).toBe("nominal");
+    expect(el?.getAttribute("role")).toBe("img");
+    expect(el?.getAttribute("aria-label")).toBe("All is well");
+    expect(text(el)).toBe("All is well");
+    expect(iconOf(el!)).toBe("mdi:check-circle-outline");
+    expect(banner(card)).toBeNull();
+    // Nothing on the card is in the error colour: no anomaly cell, no failed zone.
+    expect(card.shadowRoot?.querySelector('[data-anomaly="true"]')).toBeNull();
+    expect(card.shadowRoot?.querySelector('[data-status="failed"]')).toBeNull();
+    expect(card.shadowRoot?.querySelector(".message.error")).toBeNull();
+  });
+
+  it("lists every open item once, in document order, with its sentence and subject, under a role=status banner", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(
+      stateView({
+        health: open(anomaly("missed_cycle"), anomaly("pump_on_unconfirmed", { entity_id: "switch.pump" })),
+      }),
+    );
+    await card.updateComplete;
+
+    const el = chip(card);
+    expect(el?.getAttribute("data-state")).toBe("anomaly");
+    expect(text(el)).toBe("2 issues");
+    expect(el?.getAttribute("aria-label")).toBe("2 issues need attention");
+    expect(iconOf(el!)).toBe("mdi:alert");
+
+    const section = banner(card);
+    expect(section).not.toBeNull();
+    expect(section?.getAttribute("role")).toBe("status");
+    expect(section?.getAttribute("aria-live")).toBe("polite");
+    expect(text(section?.querySelector(".anomalies-header"))).toBe("2 issues need attention");
+    // First in the body: above today's rows and the strip.
+    const body = card.shadowRoot?.querySelector(".content");
+    expect(body?.firstElementChild?.classList.contains("anomalies")).toBe(true);
+
+    const items = [...(section?.querySelectorAll("li[data-anomaly]") ?? [])];
+    expect(items.map((li) => li.getAttribute("data-anomaly"))).toEqual(["missed_cycle", "pump_on_unconfirmed"]);
+    expect(items.map((li) => text(li))).toEqual([
+      "A scheduled cycle did not run",
+      "Pump did not confirm turning on · switch.pump",
+    ]);
+    expect(items.map((li) => iconOf(li))).toEqual(["mdi:alert-circle", "mdi:water-pump-off"]);
+    // Display only: no button, nothing to click, no service call.
+    expect(section?.querySelector("button, a, ha-button, mwc-button")).toBeNull();
+    expect(fake.callWS).not.toHaveBeenCalled();
+  });
+
+  it("names a zone anomaly's subject from plan.zones, and shows an unknown zone id raw", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(
+      stateView({
+        health: open(
+          anomaly("valve_open_unconfirmed", { zone_id: "z1" }),
+          anomaly("valve_close_unconfirmed", { zone_id: "zone-9" }),
+        ),
+      }),
+    );
+    await card.updateComplete;
+
+    const items = [...(banner(card)?.querySelectorAll("li[data-anomaly]") ?? [])];
+    expect(items.map((li) => text(li))).toEqual([
+      "Valve did not confirm opening · Lawn",
+      "Valve did not confirm closing · zone-9",
+    ]);
+    expect(text(chip(card))).toBe("2 issues");
+  });
+
+  it("reads 1 issue, singular, for one open item", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(stateView({ health: open(anomaly("valve_open_unconfirmed", { zone_id: "z1" })) }));
+    await card.updateComplete;
+
+    expect(text(chip(card))).toBe("1 issue");
+    expect(chip(card)?.getAttribute("aria-label")).toBe("1 issue needs attention");
+    expect(text(banner(card)?.querySelector(".anomalies-header"))).toBe("1 issue needs attention");
+    expect(banner(card)?.querySelectorAll("li[data-anomaly]")).toHaveLength(1);
+  });
+
+  it("counts a kind this bundle does not know as an unknown anomaly carrying the raw kind, and drops a malformed item", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    expect(() => {
+      fake.push(stateView({ health: open(anomaly("solar_flare"), { zone_id: "z1" }) }));
+    }).not.toThrow();
+    await card.updateComplete;
+
+    expect(text(chip(card))).toBe("1 issue");
+    const items = [...(banner(card)?.querySelectorAll("li[data-anomaly]") ?? [])];
+    expect(items).toHaveLength(1);
+    expect(items[0]?.getAttribute("data-anomaly")).toBe("solar_flare");
+    expect(iconOf(items[0]!)).toBe("mdi:help-circle");
+    expect(text(items[0])).toBe("Unknown anomaly (solar_flare)");
+
+    // Nothing well-formed left: nominal, no banner.
+    fake.push(stateView({ health: open({ zone_id: "z1" }) }));
+    await card.updateComplete;
+    expect(chip(card)?.getAttribute("data-state")).toBe("nominal");
+    expect(banner(card)).toBeNull();
+  });
+
+  it("clears the banner and the chip on the next push whose open is empty, never showing health.last", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(stateView({ health: open(anomaly("missed_cycle")) }));
+    await card.updateComplete;
+    expect(banner(card)).not.toBeNull();
+    expect(chip(card)?.getAttribute("data-state")).toBe("anomaly");
+
+    fake.push(
+      stateView({
+        health: { open: [], last: { anomaly: "missed_cycle", cycle_id: "2026-09-23-morning", kind: "morning" } },
+      }),
+    );
+    await card.updateComplete;
+
+    expect(banner(card)).toBeNull();
+    expect(chip(card)?.getAttribute("data-state")).toBe("nominal");
+    expect(text(chip(card))).toBe("All is well");
+    expect(card.shadowRoot?.textContent).not.toContain("2026-09-23-morning");
+    expect(card.shadowRoot?.textContent).not.toContain("did not run");
+    // The card asked nothing of the backend to get there.
+    expect(fake.callWS).not.toHaveBeenCalled();
+  });
+
+  it("shows the title alone — no chip — while connecting and while an error is on screen", async () => {
+    vi.useFakeTimers();
+    const fake = createHass();
+    fake.subscribeMessage.mockRejectedValueOnce({ code: "not_loaded", message: "" });
+    const card = await connectedCard(fake, { title: "Garden" });
+    expect(title(card)).toBe("Garden");
+    expect(chip(card)).toBeNull();
+    expect(card.shadowRoot?.querySelector(".message.error")).not.toBeNull();
+
+    await vi.advanceTimersByTimeAsync(RETRY_DELAY_MS);
+    // Subscribed, no document yet: the error stays until one arrives, still no chip.
+    expect(card.shadowRoot?.querySelector(".message.error")).not.toBeNull();
+    expect(chip(card)).toBeNull();
+
+    // A card that never failed is merely connecting: title alone as well.
+    const quiet = await connectedCard(createHass(), { title: "Quiet" });
+    expect(quiet.shadowRoot?.textContent).toContain("Connecting");
+    expect(title(quiet)).toBe("Quiet");
+    expect(chip(quiet)).toBeNull();
+
+    fake.push(stateView({ health: open(anomaly("missed_cycle")) }));
+    await card.updateComplete;
+    expect(chip(card)?.getAttribute("data-state")).toBe("anomaly");
+
+    // A re-subscribe refused after a reconnect: the body shows the error and
+    // the header drops the chip with it, rather than asserting health it
+    // cannot refresh.
+    fake.subscribeMessage.mockRejectedValueOnce({ code: "not_loaded", message: "" });
+    fake.fire("disconnected");
+    fake.fire("ready");
+    await settle(card);
+    expect(card.shadowRoot?.querySelector(".message.error")).not.toBeNull();
+    expect(title(card)).toBe("Garden");
+    expect(chip(card)).toBeNull();
+  });
+
+  it("keeps one always-mounted live announcer in the header that reads the health summary", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    const announcer = card.shadowRoot?.querySelector(".card-header .health-announcer");
+    expect(announcer).not.toBeNull();
+    expect(announcer?.getAttribute("role")).toBe("status");
+    expect(announcer?.getAttribute("aria-live")).toBe("polite");
+    expect(announcer?.classList.contains("sr-only")).toBe(true);
+    expect(text(announcer)).toBe("");
+    expect(chip(card)).toBeNull();
+
+    fake.push(stateView());
+    await card.updateComplete;
+    expect(card.shadowRoot?.querySelector(".card-header .health-announcer")).toBe(announcer);
+    expect(text(announcer)).toBe("All is well");
+    expect(banner(card)).toBeNull();
+
+    fake.push(
+      stateView({
+        health: open(anomaly("missed_cycle"), anomaly("pump_on_unconfirmed", { entity_id: "switch.pump" })),
+      }),
+    );
+    await card.updateComplete;
+    expect(card.shadowRoot?.querySelector(".card-header .health-announcer")).toBe(announcer);
+    expect(text(announcer)).toBe("2 issues need attention");
+
+    fake.push(stateView());
+    await card.updateComplete;
+    expect(card.shadowRoot?.querySelector(".card-header .health-announcer")).toBe(announcer);
+    expect(text(announcer)).toBe("All is well");
+  });
+
+  it("renders once per push and reuses the health model across sixty idle ticks", async () => {
+    clockAt("2026-09-23T12:00:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    const build = vi.mocked(health.buildHealth);
+    build.mockClear();
+    const render = renderSpy(card);
+    pushNow(fake, { health: open(anomaly("missed_cycle")) });
+    await card.updateComplete;
+    expect(render).toHaveBeenCalledTimes(1);
+    expect(build).toHaveBeenCalledTimes(1);
+    const model = build.mock.results[0]?.value as health.HealthModel;
+    expect(model.state).toBe("anomaly");
+
+    await vi.advanceTimersByTimeAsync(SLOW_TICK_MS * 60);
+    card.getCardSize();
+    card.getGridOptions();
+    await card.updateComplete;
+    expect(render).toHaveBeenCalledTimes(1);
+    expect(build).toHaveBeenCalledTimes(1);
+
+    pushNow(fake);
+    await card.updateComplete;
+    expect(render).toHaveBeenCalledTimes(2);
+    expect(build).toHaveBeenCalledTimes(2);
+    expect(build.mock.results[1]?.value).not.toBe(model);
+    expect(banner(card)).toBeNull();
+  });
+
+  it("grows its sizing hints by the banner's header and one line per open item", async () => {
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    fake.push(stateView());
+    await card.updateComplete;
+    const nominal = { size: card.getCardSize(), rows: card.getGridOptions().rows };
+
+    fake.push(
+      stateView({
+        health: open(anomaly("missed_cycle"), anomaly("pump_on_unconfirmed", { entity_id: "switch.pump" })),
+      }),
+    );
+    await card.updateComplete;
+
+    const bannerPx = ANOMALY_HEADER_PX + 2 * ANOMALY_ROW_PX;
+    const stripPx = HISTORY_HEADER_PX + 2 * HISTORY_ROW_PX;
+    expect(card.getCardSize()).toBe(nominal.size + Math.ceil(bannerPx / 50));
+    expect(card.getGridOptions().rows).toBe(
+      Math.ceil((56 + bannerPx + 2 * (40 + 2 * LANE_HEIGHT) + stripPx) / 64),
+    );
+    expect(card.getGridOptions().rows).toBeGreaterThan(nominal.rows);
+
+    fake.push(stateView());
+    await card.updateComplete;
+    expect(card.getCardSize()).toBe(nominal.size);
+    expect(card.getGridOptions().rows).toBe(nominal.rows);
+  });
+
+  // ------------------------------------------------------------ zone labels
+
+  it("marks failed, completed and skipped zone labels by more than colour: a glyph and hidden text", async () => {
+    clockAt("2026-09-23T18:40:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    const zones = eveningRun().zones;
+    pushNow(fake, {
+      current: null,
+      last: eveningRun({
+        status: "completed",
+        live_zone_id: null,
+        zones: [
+          { ...zones[0]!, status: "failed", effective_s: 0 },
+          { ...zones[1]!, status: "completed", actual_start: zones[1]!.planned_start, actual_end: zones[1]!.planned_end, effective_s: 600 },
+        ],
+      }),
+    });
+    await card.updateComplete;
+
+    const failed = labelOf(card, "z1");
+    expect(failed.getAttribute("data-status")).toBe("failed");
+    expect(iconOf(failed)).toBe("mdi:alert-circle");
+    expect(failed.querySelector(".sr-only")?.textContent).toBe("failed");
+    expect(text(failed.querySelector(".zone"))).toBe("Lawn");
+    expect(text(failed)).toContain("Lawn");
+
+    const completed = labelOf(card, "z2");
+    expect(completed.getAttribute("data-status")).toBe("completed");
+    expect(iconOf(completed)).toBe("mdi:check");
+    expect(completed.querySelector(".sr-only")?.textContent).toBe("completed");
+
+    pushNow(fake, {
+      current: null,
+      last: eveningRun({
+        status: "completed",
+        live_zone_id: null,
+        zones: [
+          { ...zones[0]!, status: "skipped" },
+          { ...zones[1]!, status: "completed" },
+        ],
+      }),
+    });
+    await card.updateComplete;
+    const skipped = labelOf(card, "z1");
+    expect(skipped.getAttribute("data-status")).toBe("skipped");
+    // The strikethrough is the visible cue; the hidden word is the spoken one.
+    expect(skipped.querySelector("ha-icon")).toBeNull();
+    expect(skipped.querySelector(".sr-only")?.textContent).toBe("skipped");
+  });
+
+  it("leaves pending, running and planned labels without a glyph or hidden text", async () => {
+    clockAt("2026-09-23T18:05:00+00:00");
+    const fake = createHass();
+    const card = await connectedCard(fake);
+    pushNow(fake, { current: eveningRun() });
+    await card.updateComplete;
+
+    const running = labelOf(card, "z1");
+    expect(running.getAttribute("data-status")).toBe("running");
+    expect(running.querySelector("ha-icon")).toBeNull();
+    expect(running.querySelector(".sr-only")).toBeNull();
+    const pending = labelOf(card, "z2");
+    expect(pending.getAttribute("data-status")).toBe("pending");
+    expect(pending.querySelector("ha-icon")).toBeNull();
+    expect(pending.querySelector(".sr-only")).toBeNull();
+
+    const morning = card.shadowRoot?.querySelector('section.cycle[data-kind="morning"]');
+    const planned = [...(morning?.querySelectorAll("li.label") ?? [])];
+    expect(planned.every((li) => li.getAttribute("data-status") === "planned")).toBe(true);
+    expect(planned.every((li) => li.querySelector("ha-icon") === null && li.querySelector(".sr-only") === null)).toBe(
+      true,
+    );
+  });
+
+  // ------------------------------------------------------------- stylesheet
+
+  /** The card's stylesheet as one string, whatever shape `styles` takes. */
+  function stylesheet(): string {
+    const styles = HaIrrigationTimelineCard.styles;
+    const list = Array.isArray(styles) ? styles : [styles];
+    return list.map((entry) => (entry as { cssText?: string }).cssText ?? String(entry)).join("\n");
+  }
+
+  it("disables the progress transition under prefers-reduced-motion: reduce", () => {
+    const css = stylesheet();
+    const media = css.match(/@media \(prefers-reduced-motion: reduce\)\s*\{([\s\S]*?)\}\s*\}/);
+    expect(media).not.toBeNull();
+    expect(media?.[1]).toMatch(/\.progress\s*\{[^}]*transition:\s*none/);
+    // Outside that media query the fill still glides.
+    expect(css).toMatch(new RegExp(`\\.progress\\s*\\{[^}]*transition: transform ${TRANSITION_MS}ms linear`));
+  });
+
+  it("carries no light-only literal: every colour fallback holds in a dark theme", () => {
+    const css = stylesheet();
+    // The cursor and the track used to end in #212121 / rgba(0,0,0,.12), both
+    // invisible on a dark card; they now follow currentColor.
+    expect(css).not.toMatch(/#212121/i);
+    expect(css).not.toMatch(/rgba\(\s*0\s*,\s*0\s*,\s*0/);
+    expect(css).toMatch(/\.cursor\s*\{[^}]*stroke: var\(--hic-cursor-color, var\(--primary-text-color, currentColor\)\)/);
+    expect(css).toMatch(/color-mix\(in srgb, currentColor 12%, transparent\)/);
+    // The card reads its hooks and defines none of them.
+    expect(css).not.toMatch(/^\s*--hic-[a-z-]*color[a-z-]*\s*:/m);
+    expect(css).not.toMatch(/--hic-health-anomaly-bg\s*:/);
   });
 
   // ------------------------------------------------------------------ gate
