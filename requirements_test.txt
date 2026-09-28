@@ -4,7 +4,7 @@
 # this leg on HA stable. Pinning HA here makes the resolver pick the matching
 # PHCC release, and dependabot bumps this one line (it skips prereleases while
 # the current pin is not one), so "stable" stays stable.
-homeassistant==2026.9.2
-pytest-homeassistant-custom-component>=0.13.365,<0.14
+homeassistant==2026.9.3
+pytest-homeassistant-custom-component>=0.13.366,<0.14
 # Type checking needs the HA type stubs, so it lives with the test deps.
 mypy==2.3.0
