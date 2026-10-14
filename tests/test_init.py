@@ -306,7 +306,7 @@ async def test_setup_creates_the_controller_device(hass: HomeAssistant) -> None:
     assert device.entry_type is DeviceEntryType.SERVICE
     assert device.name == "Irrigation Controller"
     assert device.manufacturer == "ha-irrigation-controller"
-    assert entry.entry_id in device.config_entries
+    assert device.config_entry_id == entry.entry_id
 
 
 def _entry_with_zones(*zones: Any) -> MockConfigEntry:
