@@ -749,9 +749,8 @@ async def test_zone_device_links_via_device_to_controller(
     assert zone_device.via_device_id == controller_device.id
     assert zone_device.name == "Front Lawn"
     assert zone_device.manufacturer == "ha-irrigation-controller"
-    assert zone_device.config_entries_subentries[entry.entry_id] == {
-        zone.subentry_id,
-    }
+    assert zone_device.config_entry_id == entry.entry_id
+    assert zone_device.config_subentry_id == zone.subentry_id
 
 
 async def test_add_zone_reloads_entry_without_restart(hass: HomeAssistant) -> None:

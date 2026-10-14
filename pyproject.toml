@@ -18,6 +18,7 @@ ignore = [
     "D203",   # no-blank-line-before-class (incompatible with formatter)
     "D213",   # multi-line-summary-second-line (HA core style: summary on first line)
     "COM812", # incompatible with formatter
+    "CPY001", # no per-file copyright headers; the LICENSE file covers the repo
     "ISC001", # incompatible with formatter
 ]
 
@@ -27,6 +28,9 @@ ignore = [
     "S603",    # subprocess call in the hass-free import proof is intentional
     "ARG001",  # pytest fixture dependency injection looks like unused arguments
     "PLR2004", # magic values in assertions are fine in tests
+]
+"tests/engine/common.py" = [
+    "PLR0917", # paris() mirrors the datetime constructor's positional fields
 ]
 
 [tool.ruff.lint.isort]
