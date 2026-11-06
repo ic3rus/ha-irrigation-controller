@@ -50,6 +50,11 @@ max-complexity = 25
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Explicit so pytest-asyncio stops warning that the option is unset: with
+# `filterwarnings = ["error"]`, pytest >= 9.2 turns that configure-time
+# warning into a session INTERNALERROR. "function" is the value pytest-asyncio
+# will default to and the one Home Assistant core itself sets.
+asyncio_default_fixture_loop_scope = "function"
 # Home Assistant announces removals via DeprecationWarning months before they
 # become fatal. Turning warnings into errors is what lets the nightly cron catch
 # breakage while it is still a warning, which is the whole point of that cron.
