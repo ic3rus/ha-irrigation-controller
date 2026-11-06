@@ -18,10 +18,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Final
 
-from homeassistant.components.binary_sensor import (
-    BinarySensorDeviceClass,
-    BinarySensorEntity,
-)
+from homeassistant.components.binary_sensor import BinarySensorEntity
+from homeassistant.components.binary_sensor.const import BinarySensorDeviceClass
 
 from ..state_view import current_view  # noqa: TID252
 from .entity import HaIrrigationControllerEntity

@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Final, cast
 
-import voluptuous as vol
+import probatio as vol
 from homeassistant.components.websocket_api import async_register_command
 from homeassistant.components.websocket_api.const import ERR_NOT_FOUND
 from homeassistant.components.websocket_api.decorators import websocket_command

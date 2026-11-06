@@ -10,8 +10,10 @@ DOMAIN = "ha_irrigation_controller"
 # Single source of truth: tests/test_manifest.py asserts hacs.json agrees with this.
 # Policy: the floor is the month release of the stack pinned in
 # requirements_test.txt, raised when older releases stop being supported
-# (2026-09: 2026.9 — the 2026.9 device-registry API is used directly).
-MIN_HA_VERSION = "2026.9.0"
+# (2026-09: 2026.9 — the 2026.9 device-registry API is used directly;
+#  2026-10: 2026.10 — SwitchDeviceClass / BinarySensorDeviceClass are imported
+#  from the components' `const` modules, which only exist from 2026.10).
+MIN_HA_VERSION = "2026.10.0"
 
 # Derived (major, minor) for the setup guard. Comparing on month-release
 # granularity rather than the full string accepts HA prereleases of the minimum

@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, Any
 
-import voluptuous as vol
+import probatio as vol
 from homeassistant.config_entries import (
     ConfigFlow,
     ConfigFlowResult,
