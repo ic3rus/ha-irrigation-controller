@@ -222,7 +222,7 @@ resource yourself:
 lovelace:
   mode: yaml
   resources:
-    - url: /ha_irrigation_controller/ha-irrigation-timeline-card.js?v=0.1.3
+    - url: /ha_irrigation_controller/ha-irrigation-timeline-card.js?v=0.1.4
       type: module
 ```
 
